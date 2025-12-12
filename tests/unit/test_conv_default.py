@@ -20,6 +20,7 @@ from fvdb.utils.tests.convolution_utils import (
     assert_coords_equal,
     compute_conv_grid_topology_ground_truth,
     conv_ground_truth_stride_1,
+    conv_ground_truth_strided,
     disable_tf32,
     sort_coords_by_ijk,
 )
@@ -539,3 +540,237 @@ class TestConvDefault(unittest.TestCase):
         assert dense_kernel_grad is not None and sparse_kernel_grad is not None
 
         torch.testing.assert_close(sparse_kernel_grad, dense_kernel_grad, rtol=1e-5, atol=1e-6)
+
+    # =========================================================================
+    # Strided Convolution Tests (Forward + Backward)
+    # =========================================================================
+
+    def _test_strided_conv_forward_backward(
+        self,
+        device: DeviceIdentifier,
+        dtype: torch.dtype,
+        stride: tuple[int, int, int],
+        cluster_coords: torch.Tensor,
+        in_channels: int = 2,
+        out_channels: int = 3,
+    ):
+        """
+        Core test for strided convolution forward and backward passes.
+
+        Tests that:
+        1. Forward pass matches dense PyTorch ground truth
+        2. Backward pass produces correct input gradients
+        3. Backward pass produces correct kernel gradients
+
+        Args:
+            device: Device identifier
+            dtype: Data type
+            stride: Stride tuple (s0, s1, s2)
+            cluster_coords: Input coordinates
+            in_channels: Number of input channels
+            out_channels: Number of output channels
+        """
+        device = resolve_device(device)
+        cluster_coords = cluster_coords.to(device=device)
+
+        # Create grid and destination grid
+        grid_batch = create_grid_from_coords(cluster_coords, device)
+        dst_grid_batch = grid_batch.conv_grid(kernel_size=self.KERNEL_SIZE, stride=stride)
+        dst_coords = dst_grid_batch.ijk.jdata
+
+        num_voxels = len(cluster_coords)
+        num_dst_voxels = len(dst_coords)
+
+        # Create features with gradient tracking
+        features_data = torch.randn((num_voxels, in_channels), device=device, dtype=dtype, requires_grad=True)
+        features = JaggedTensor(features_data)
+
+        # Create anti-symmetric kernel with gradient tracking
+        kernel_3d = fourier_anti_symmetric_kernel(self.KERNEL_SIZE, dtype=dtype, device=device)
+        self.assertFalse(has_any_symmetry(kernel_3d))
+
+        # Expand to multi-channel
+        kernel_5d = kernel_3d.unsqueeze(0).unsqueeze(0).expand(out_channels, in_channels, -1, -1, -1)
+        kernel_5d = kernel_5d.clone().requires_grad_(True)
+
+        # === Sparse Forward ===
+        conv_plan = ConvolutionPlan.from_grid_batch(
+            kernel_size=self.KERNEL_SIZE,
+            stride=stride,
+            source_grid=grid_batch,
+            target_grid=dst_grid_batch,
+        )
+        sparse_output = conv_plan.execute(features, kernel_5d)
+
+        # === Dense Ground Truth Forward ===
+        dense_features = features_data.detach().clone().requires_grad_(True)
+        dense_kernel = kernel_5d.detach().clone().requires_grad_(True)
+
+        dense_output_full, dense_output_at_dst = conv_ground_truth_strided(
+            src_grid=grid_batch,
+            dst_grid=dst_grid_batch,
+            activation=JaggedTensor(dense_features),
+            weights=dense_kernel,
+            stride=stride,
+            allow_tf32=False,
+        )
+
+        # Verify forward pass matches
+        sparse_values_sorted, sparse_perm = sort_coords_by_ijk(dst_coords)
+        dst_sorted, _ = sort_coords_by_ijk(dst_coords)
+
+        sparse_out_sorted = sparse_output.jdata[sparse_perm]
+        dense_out_sorted = dense_output_at_dst[sparse_perm]
+
+        torch.testing.assert_close(
+            sparse_out_sorted,
+            dense_out_sorted,
+            rtol=1e-4,
+            atol=1e-5,
+            msg=f"Forward mismatch for stride={stride}",
+        )
+
+        # === Backward Pass ===
+        # Create output gradient (random for thorough gradient testing)
+        output_grad = torch.randn_like(sparse_output.jdata)
+
+        # Sparse backward
+        sparse_output.jdata.backward(output_grad)
+        sparse_input_grad = features_data.grad
+        sparse_kernel_grad = kernel_5d.grad
+
+        # Dense backward
+        # Need to create gradient at the dense output coordinates
+        dense_grad_at_dst = output_grad.clone()
+
+        # Backprop through the extraction of values at dst coords
+        # This requires computing the gradient w.r.t dense_output_full
+        dense_output_full.retain_grad()
+
+        # We need to manually accumulate gradients at dst coordinates
+        # Re-run the ground truth with gradient tracking
+        dense_features2 = features_data.detach().clone().requires_grad_(True)
+        dense_kernel2 = kernel_5d.detach().clone().requires_grad_(True)
+
+        # Manually build dense input and run conv
+        src_coords = grid_batch.ijk.jdata
+        kernel_size = dense_kernel2.shape[2:]
+        kernel_half = tuple(k // 2 for k in kernel_size)
+
+        dst_min = dst_coords.min(dim=0).values.tolist()
+        dst_max = dst_coords.max(dim=0).values.tolist()
+        src_min = src_coords.min(dim=0).values.tolist()
+        src_max = src_coords.max(dim=0).values.tolist()
+
+        input_min_needed = tuple(dst_min[i] * stride[i] - kernel_half[i] for i in range(3))
+        input_max_needed = tuple(dst_max[i] * stride[i] + kernel_half[i] for i in range(3))
+
+        dense_min = tuple(min(input_min_needed[i], src_min[i]) for i in range(3))
+        dense_max = tuple(max(input_max_needed[i], src_max[i]) for i in range(3))
+        dense_shape = tuple(dense_max[i] - dense_min[i] + 1 for i in range(3))
+
+        dense_input = torch.zeros((1, in_channels) + dense_shape, device=device, dtype=dtype, requires_grad=True)
+
+        # Scatter features into dense (need differentiable path)
+        dense_input_data = dense_input.clone()
+        for idx, coord in enumerate(src_coords):
+            local_idx = tuple(coord[i].item() - dense_min[i] for i in range(3))
+            dense_input_data[0, :, local_idx[0], local_idx[1], local_idx[2]] = dense_features2[idx]
+
+        with disable_tf32():
+            dense_output2 = torch.nn.functional.conv3d(
+                input=dense_input_data, weight=dense_kernel2, padding=kernel_half, stride=stride
+            )
+
+        # Compute output offset
+        output_offset = tuple(dense_min[i] // stride[i] for i in range(3))
+        # More precise: use floor division
+        import math as _math
+
+        output_offset = tuple(_math.floor(dense_min[i] / stride[i]) for i in range(3))
+
+        # Apply gradient at dst coordinates
+        loss = torch.tensor(0.0, device=device, dtype=dtype)
+        for idx, coord in enumerate(dst_coords):
+            out_idx = tuple(coord[i].item() - output_offset[i] for i in range(3))
+            if all(0 <= out_idx[i] < dense_output2.shape[i + 2] for i in range(3)):
+                loss = loss + (dense_output2[0, :, out_idx[0], out_idx[1], out_idx[2]] * output_grad[idx]).sum()
+
+        loss.backward()
+
+        dense_input_grad = dense_features2.grad
+        dense_kernel_grad = dense_kernel2.grad
+
+        # Compare input gradients
+        assert sparse_input_grad is not None, "Sparse input grad is None"
+        assert dense_input_grad is not None, "Dense input grad is None"
+
+        torch.testing.assert_close(
+            sparse_input_grad,
+            dense_input_grad,
+            rtol=1e-4,
+            atol=1e-5,
+            msg=f"Input gradient mismatch for stride={stride}",
+        )
+
+        # Compare kernel gradients
+        assert sparse_kernel_grad is not None, "Sparse kernel grad is None"
+        assert dense_kernel_grad is not None, "Dense kernel grad is None"
+
+        torch.testing.assert_close(
+            sparse_kernel_grad,
+            dense_kernel_grad,
+            rtol=1e-4,
+            atol=1e-5,
+            msg=f"Kernel gradient mismatch for stride={stride}",
+        )
+
+    @parameterized.expand(REDUCED_DEVICE_DTYPE_COMBOS)
+    def test_strided_conv_uniform_forward_backward(self, device: DeviceIdentifier, dtype: torch.dtype):
+        """Test forward and backward for uniform stride (2,2,2)."""
+        device_resolved = resolve_device(device)
+        cluster_coords = get_cluster_edge_aligned(self.KERNEL_SIZE, device_resolved)
+        self._test_strided_conv_forward_backward(
+            device,
+            dtype,
+            stride=(2, 2, 2),
+            cluster_coords=cluster_coords,
+        )
+
+    @parameterized.expand(REDUCED_DEVICE_DTYPE_COMBOS)
+    def test_strided_conv_nonuniform_forward_backward(self, device: DeviceIdentifier, dtype: torch.dtype):
+        """Test forward and backward for non-uniform stride (1,2,3)."""
+        device_resolved = resolve_device(device)
+        cluster_coords = get_cluster_edge_aligned(self.KERNEL_SIZE, device_resolved)
+        self._test_strided_conv_forward_backward(
+            device,
+            dtype,
+            stride=(1, 2, 3),
+            cluster_coords=cluster_coords,
+        )
+
+    @parameterized.expand(ALL_DEVICE_DTYPE_COMBOS)
+    def test_strided_conv_large_stride_forward_backward(self, device: DeviceIdentifier, dtype: torch.dtype):
+        """Test forward and backward for larger stride (3,3,3) with full device/dtype coverage."""
+        device_resolved = resolve_device(device)
+        # Use a larger cluster to have meaningful output
+        cluster_coords = torch.tensor(
+            [
+                [3, 3, 4],  # Base position (offset to ensure positive outputs)
+                [6, 3, 4],
+                [3, 6, 4],
+                [3, 3, 7],
+                [6, 6, 7],
+                [9, 6, 10],
+                [6, 9, 7],
+                [9, 9, 10],
+            ],
+            device=device_resolved,
+            dtype=torch.int32,
+        )
+        self._test_strided_conv_forward_backward(
+            device,
+            dtype,
+            stride=(3, 3, 3),
+            cluster_coords=cluster_coords,
+        )

@@ -237,6 +237,108 @@ def compute_conv_grid_topology_ground_truth(
 # =============================================================================
 
 
+def conv_ground_truth_strided(
+    src_grid: GridBatch,
+    dst_grid: GridBatch,
+    activation: JaggedTensor,
+    weights: torch.Tensor,
+    stride: tuple[int, int, int],
+    *,
+    allow_tf32: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute ground truth 3D convolution with arbitrary stride using dense PyTorch operations.
+
+    This function:
+    1. Densifies the sparse input activation based on the source grid coordinates
+    2. Runs PyTorch's strided conv3d
+    3. Returns the dense output and the values at the destination grid coordinates
+
+    Args:
+        src_grid: Source GridBatch containing input voxel coordinates
+        dst_grid: Destination GridBatch containing expected output voxel coordinates
+        activation: Sparse input features as JaggedTensor
+        weights: Convolution kernel weights, shape (out_channels, in_channels, k0, k1, k2)
+        stride: Stride tuple (s0, s1, s2)
+        allow_tf32: If True, enables TF32 for faster but less precise computation
+
+    Returns:
+        Tuple of:
+        - dense_output: Full dense output tensor from conv3d
+        - sparse_output_values: Values at the destination grid coordinates,
+          shape (num_dst_voxels, out_channels)
+    """
+    src_coords = src_grid.ijk.jdata
+    dst_coords = dst_grid.ijk.jdata
+
+    kernel_size = weights.shape[2:]
+    kernel_half = tuple(k // 2 for k in kernel_size)
+
+    device = activation.jdata.device
+    dtype = activation.jdata.dtype
+    in_channels = weights.shape[1]
+    out_channels = weights.shape[0]
+
+    # Compute the input coordinate ranges needed to cover all output coordinates
+    # For output coord o, we need input coords in [o*stride - kernel_half, o*stride + kernel_half]
+    dst_min = dst_coords.min(dim=0).values.tolist()
+    dst_max = dst_coords.max(dim=0).values.tolist()
+
+    # Input range needed for these outputs
+    input_min_needed = tuple(dst_min[i] * stride[i] - kernel_half[i] for i in range(3))
+    input_max_needed = tuple(dst_max[i] * stride[i] + kernel_half[i] for i in range(3))
+
+    # Also include actual source coordinates in case they extend beyond
+    src_min = src_coords.min(dim=0).values.tolist()
+    src_max = src_coords.max(dim=0).values.tolist()
+
+    dense_min = tuple(min(input_min_needed[i], src_min[i]) for i in range(3))
+    dense_max = tuple(max(input_max_needed[i], src_max[i]) for i in range(3))
+    dense_shape = tuple(dense_max[i] - dense_min[i] + 1 for i in range(3))
+
+    # Create dense input
+    dense_input = torch.zeros((1, in_channels) + dense_shape, device=device, dtype=dtype)
+    for idx, coord in enumerate(src_coords):
+        local_idx = tuple(coord[i].item() - dense_min[i] for i in range(3))
+        dense_input[0, :, local_idx[0], local_idx[1], local_idx[2]] = activation.jdata[idx]
+
+    # Compute padding to get outputs at the right coordinates
+    # PyTorch strided conv: output_size = floor((input_size + 2*padding - kernel_size) / stride) + 1
+    # We want output coord o to correspond to input region starting at o*stride - kernel_half
+    # Padding = kernel_half ensures the first output sees input starting at -kernel_half
+    padding = kernel_half
+
+    # Run convolution
+    if allow_tf32:
+        dense_output = torch.nn.functional.conv3d(input=dense_input, weight=weights, padding=padding, stride=stride)
+    else:
+        with disable_tf32():
+            dense_output = torch.nn.functional.conv3d(input=dense_input, weight=weights, padding=padding, stride=stride)
+
+    # Compute output coordinate offset
+    # With padding=kernel_half, output[0,0,0] corresponds to input centered at (0,0,0)
+    # So output[o] corresponds to input centered at o*stride
+    # Output coord in dense_output is: (dst_coord - (dense_min / stride rounded appropriately))
+    # Actually simpler: output index = (input_center_coord - dense_min) / stride
+    # where input_center_coord for output o is o*stride (in original coords)
+
+    # The dense output has shape based on the padded input
+    # output index for dst_coord d: ((d * stride) - dense_min) / stride = d - (dense_min / stride)
+    # But we need to account for non-integer division
+    # More precisely: output_index = d - floor(dense_min / stride)
+    output_offset = tuple(math.floor(dense_min[i] / stride[i]) for i in range(3))
+
+    # Extract values at destination coordinates
+    sparse_output_values = torch.zeros((len(dst_coords), out_channels), device=device, dtype=dtype)
+    for idx, coord in enumerate(dst_coords):
+        out_idx = tuple(coord[i].item() - output_offset[i] for i in range(3))
+        # Check bounds
+        if all(0 <= out_idx[i] < dense_output.shape[i + 2] for i in range(3)):
+            sparse_output_values[idx] = dense_output[0, :, out_idx[0], out_idx[1], out_idx[2]]
+
+    return dense_output, sparse_output_values
+
+
 def conv_ground_truth_stride_1(
     grid_batch: GridBatch,
     activation: JaggedTensor,
