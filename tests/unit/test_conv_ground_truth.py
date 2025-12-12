@@ -9,23 +9,16 @@ do what we expect them to do, and establish a set of baseline demonstrations of
 convolution properties.
 """
 
-import io
-import sys
-import time
 import unittest
 
-import pytest
 import torch
 from fvdb.types import DeviceIdentifier, resolve_device
 from fvdb.utils.tests import (
-    ScopedTimer,
     fourier_anti_symmetric_kernel,
-    generate_chebyshev_spaced_ijk,
-    generate_chebyshev_spaced_ijk_batch,
     generate_hermit_impulses_dense,
-    generate_hermit_impulses_dense_batch,
     has_any_symmetry,
 )
+from fvdb.utils.tests.convolution_utils import disable_tf32
 from parameterized import parameterized
 
 all_device_dtype_combos = [
@@ -134,12 +127,9 @@ class TestConvGroundTruth(unittest.TestCase):
         kernel_with_channels = kernel.reshape(1, 1, *self.KERNEL_SIZE)
 
         # Do a single convolution
-        _backend_setting = torch.backends.cudnn.allow_tf32
-        # Disable TF32 for consistent precision across CPU and CUDA
-        torch.backends.cudnn.allow_tf32 = False
-        convolved = torch.nn.functional.conv3d(input=impulse_field, weight=kernel_with_channels, padding="same")
+        with disable_tf32():
+            convolved = torch.nn.functional.conv3d(input=impulse_field, weight=kernel_with_channels, padding="same")
         self.assertEqual(impulse_field.shape, convolved.shape)
-        torch.backends.cudnn.allow_tf32 = _backend_setting
 
         # We know where the impulse coordinate is, so we should be able to test that the
         # convolution matches the kernel. Even though PyTorch calls it conv3d, it's actually a
@@ -205,9 +195,6 @@ class TestConvGroundTruth(unittest.TestCase):
                     )
                     got_output_coord = tuple(nonzero_coords[0].tolist())
                     self.assertEqual(got_output_coord, expected_output_coord)
-                    # print(
-                    #     f"Kernel offset: {(k0, k1, k2)}, Nonzero coords: {nonzero_coords}, expected: {expected_output_coord}"
-                    # )
 
     @parameterized.expand(all_device_dtype_combos)
     def test_multiple_impulses(self, device: DeviceIdentifier, dtype: torch.dtype):
@@ -241,14 +228,11 @@ class TestConvGroundTruth(unittest.TestCase):
         impulse_field_with_channel = impulse_field.reshape(1, *self.VOLUME_SHAPE)
         kernel_with_channels = kernel.reshape(1, 1, *self.KERNEL_SIZE)
 
-        _backend_setting = torch.backends.cudnn.allow_tf32
-        # Disable TF32 for consistent precision across CPU and CUDA
-        torch.backends.cudnn.allow_tf32 = False
-        convolved = torch.nn.functional.conv3d(
-            input=impulse_field_with_channel, weight=kernel_with_channels, padding="same"
-        )
+        with disable_tf32():
+            convolved = torch.nn.functional.conv3d(
+                input=impulse_field_with_channel, weight=kernel_with_channels, padding="same"
+            )
         self.assertEqual(impulse_field_with_channel.shape, convolved.shape)
-        torch.backends.cudnn.allow_tf32 = _backend_setting
 
         for i in range(num_impulses):
             impulse_coord = impulse_coords[i]
@@ -296,19 +280,16 @@ class TestConvGroundTruth(unittest.TestCase):
         self.assertFalse(has_any_symmetry(kernel))
         kernel_with_channels = kernel.reshape(1, 1, *self.KERNEL_SIZE)
 
-        _backend_setting = torch.backends.cudnn.allow_tf32
-        torch.backends.cudnn.allow_tf32 = False
+        with disable_tf32():
+            # Forward pass
+            output = torch.nn.functional.conv3d(input=impulse_field, weight=kernel_with_channels, padding="same")
 
-        # Forward pass
-        output = torch.nn.functional.conv3d(input=impulse_field, weight=kernel_with_channels, padding="same")
+            # Create output gradient with impulse at the same coord
+            output_grad = torch.zeros_like(output)
+            output_grad[0, coord[0], coord[1], coord[2]] = 1
 
-        # Create output gradient with impulse at the same coord
-        output_grad = torch.zeros_like(output)
-        output_grad[0, coord[0], coord[1], coord[2]] = 1
-
-        # Backward pass
-        output.backward(output_grad)
-        torch.backends.cudnn.allow_tf32 = _backend_setting
+            # Backward pass
+            output.backward(output_grad)
 
         input_grad = impulse_field.grad
         assert input_grad is not None
@@ -351,19 +332,16 @@ class TestConvGroundTruth(unittest.TestCase):
         kernel_with_channels = kernel.reshape(1, 1, *self.KERNEL_SIZE).clone()
         kernel_with_channels.requires_grad_(True)
 
-        _backend_setting = torch.backends.cudnn.allow_tf32
-        torch.backends.cudnn.allow_tf32 = False
+        with disable_tf32():
+            # Forward pass
+            output = torch.nn.functional.conv3d(input=impulse_field, weight=kernel_with_channels, padding="same")
 
-        # Forward pass
-        output = torch.nn.functional.conv3d(input=impulse_field, weight=kernel_with_channels, padding="same")
+            # Create output gradient with impulse at the same coord
+            output_grad = torch.zeros_like(output)
+            output_grad[0, coord[0], coord[1], coord[2]] = 1
 
-        # Create output gradient with impulse at the same coord
-        output_grad = torch.zeros_like(output)
-        output_grad[0, coord[0], coord[1], coord[2]] = 1
-
-        # Backward pass
-        output.backward(output_grad)
-        torch.backends.cudnn.allow_tf32 = _backend_setting
+            # Backward pass
+            output.backward(output_grad)
 
         weight_grad = kernel_with_channels.grad
         assert weight_grad is not None
@@ -419,16 +397,13 @@ class TestConvGroundTruth(unittest.TestCase):
                 int(coord_in[2].item()) + offset[2],
             )
 
-            _backend_setting = torch.backends.cudnn.allow_tf32
-            torch.backends.cudnn.allow_tf32 = False
+            with disable_tf32():
+                output = torch.nn.functional.conv3d(input=impulse_field, weight=kernel_with_channels, padding="same")
 
-            output = torch.nn.functional.conv3d(input=impulse_field, weight=kernel_with_channels, padding="same")
+                output_grad = torch.zeros_like(output)
+                output_grad[0, coord_out[0], coord_out[1], coord_out[2]] = 1
 
-            output_grad = torch.zeros_like(output)
-            output_grad[0, coord_out[0], coord_out[1], coord_out[2]] = 1
-
-            output.backward(output_grad)
-            torch.backends.cudnn.allow_tf32 = _backend_setting
+                output.backward(output_grad)
 
             weight_grad = kernel_with_channels.grad
             assert weight_grad is not None
@@ -475,23 +450,20 @@ class TestConvGroundTruth(unittest.TestCase):
         self.assertFalse(has_any_symmetry(kernel))
         kernel_with_channels = kernel.reshape(1, 1, *self.KERNEL_SIZE)
 
-        _backend_setting = torch.backends.cudnn.allow_tf32
-        torch.backends.cudnn.allow_tf32 = False
+        with disable_tf32():
+            # Forward pass
+            output = torch.nn.functional.conv3d(
+                input=impulse_field_with_channel, weight=kernel_with_channels, padding="same"
+            )
 
-        # Forward pass
-        output = torch.nn.functional.conv3d(
-            input=impulse_field_with_channel, weight=kernel_with_channels, padding="same"
-        )
+            # Create output gradient with impulses at the same coords as input
+            output_grad = torch.zeros_like(output)
+            for i in range(num_impulses):
+                c = impulse_coords[i]
+                output_grad[0, c[0], c[1], c[2]] = 1
 
-        # Create output gradient with impulses at the same coords as input
-        output_grad = torch.zeros_like(output)
-        for i in range(num_impulses):
-            c = impulse_coords[i]
-            output_grad[0, c[0], c[1], c[2]] = 1
-
-        # Backward pass
-        output.backward(output_grad)
-        torch.backends.cudnn.allow_tf32 = _backend_setting
+            # Backward pass
+            output.backward(output_grad)
 
         input_grad = impulse_field_with_channel.grad
         assert input_grad is not None
