@@ -23,6 +23,10 @@
 
 namespace fvdb {
 
+// =============================================================================
+// Legacy SparseConvPackInfo Implementation
+// =============================================================================
+
 SparseConvPackInfo::SparseConvPackInfo(Vec3iOrScalar kernelsize,
                                        Vec3iOrScalar stride,
                                        GridBatch srcGrid,
@@ -255,8 +259,18 @@ SparseConvPackInfo::sparseConv3d(const JaggedTensor &input,
                       "Input element count must match source grid total voxels");
 
     if (backend == ConvPackBackend::GATHER_SCATTER) {
+        detail::autograd::SparseConvolutionKernelMap::Topology topology = {
+            .neighborMap           = mGSNeighborMap.value(),
+            .neighborSizes         = mGSNeighborSizes.value(),
+            .sourceTotalVoxelCount = mSourceGrid.total_voxels(),
+            .targetTotalVoxelCount = mTargetGrid.total_voxels(),
+            .kernelSize            = nanovdb::Vec3i(mKernelSize.value()),
+            .stride                = nanovdb::Vec3i(mStride.value()),
+            .tranposed             = false,
+            .useME                 = mGSUseME,
+        };
         auto ret = detail::autograd::SparseConvolutionKernelMap::apply(
-            input.jdata(), weights, *this, false /* transposed */)[0];
+            input.jdata(), weights, topology)[0];
 
         return mTargetGrid.jagged_like(ret);
     } else if (backend == ConvPackBackend::IGEMM) {
@@ -313,8 +327,18 @@ SparseConvPackInfo::sparseTransposeConv3d(const JaggedTensor &input,
                       "Input element count must match target grid total voxels");
 
     if (backend == ConvPackBackend::GATHER_SCATTER) {
+        detail::autograd::SparseConvolutionKernelMap::Topology topology = {
+            .neighborMap           = mGSNeighborMap.value(),
+            .neighborSizes         = mGSNeighborSizes.value(),
+            .sourceTotalVoxelCount = mSourceGrid.total_voxels(),
+            .targetTotalVoxelCount = mTargetGrid.total_voxels(),
+            .kernelSize            = nanovdb::Vec3i(mKernelSize.value()),
+            .stride                = nanovdb::Vec3i(mStride.value()),
+            .tranposed             = true,
+            .useME                 = mGSUseME,
+        };
         auto ret = detail::autograd::SparseConvolutionKernelMap::apply(
-            input.jdata(), weights, *this, true /* transposed */)[0];
+            input.jdata(), weights, topology)[0];
 
         return mSourceGrid.jagged_like(ret);
     } else if (backend == ConvPackBackend::IGEMM) {

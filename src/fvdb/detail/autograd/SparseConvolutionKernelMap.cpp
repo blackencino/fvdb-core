@@ -19,16 +19,12 @@ SparseConvolutionKernelMap::variable_list
 SparseConvolutionKernelMap::forward(AutogradContext *ctx,
                                     Variable inFeatures,
                                     Variable kernels,
-                                    const SparseConvPackInfo &packInfo,
-                                    bool transposed) {
-    TORCH_CHECK(packInfo.neighborMap().has_value() && packInfo.neighborSizes().has_value(),
-                "Neighbor map must be built for sparse convolution");
-
-    torch::Tensor nbmaps          = packInfo.neighborMap().value();
-    torch::Tensor nbsizes         = packInfo.neighborSizes().value();
-    const std::vector<int> sizes  = {(int)packInfo.sourceGrid().total_voxels(),
-                                     (int)packInfo.targetGrid().total_voxels()};
-    const bool middleAcceleration = packInfo.stride().value() == Vec3iOrScalar(1).value();
+                                    Topology topology) {
+    torch::Tensor nbmaps             = topology.neighborMap;
+    torch::Tensor nbsizes            = topology.neighborSizes;
+    std::vector<int64_t> const sizes = {topology.sourceTotalVoxelCount,
+                                        topology.targetTotalVoxelCount};
+    bool const middleAcceleration    = topology.stride == nanovdb::Vec3i{1, 1, 1};
 
     // Check features
     TORCH_CHECK_VALUE(inFeatures.is_contiguous(), "features must be contiguous");
@@ -40,7 +36,7 @@ SparseConvolutionKernelMap::forward(AutogradContext *ctx,
 
     // Check kernels
     TORCH_CHECK_TYPE(kernels.is_floating_point(), "kernels must have a floating point type");
-    for (int i = 0; i < kernels.dim(); i += 1) {
+    for (int i = 0; i < kernels.dim(); ++i) {
         TORCH_CHECK_VALUE(kernels.size(i) != 0,
                           "kernels tensor has zero dimension (dim = " + std::to_string(i) + ")");
     }
@@ -56,7 +52,7 @@ SparseConvolutionKernelMap::forward(AutogradContext *ctx,
             3,
         },
         opt);
-    if (!transposed) {
+    if (!topology.tranposed) {
         TORCH_CHECK_VALUE(inFeatures.size(0) == sizes[0],
                           "The number of input features must match the number of voxels");
         TORCH_CHECK_VALUE(
@@ -92,23 +88,28 @@ SparseConvolutionKernelMap::forward(AutogradContext *ctx,
         kernels   = kernels.permute({2, 3, 4, 0, 1}).reshape({-1, inC, outC}).contiguous();
     }
 
+    TORCH_CHECK_VALUE(kWidth[0].item<int32_t>() == topology.kernelSize[0] &&
+                          kWidth[1].item<int32_t>() == topology.kernelSize[1] &&
+                          kWidth[2].item<int32_t>() == topology.kernelSize[2],
+                      "Kernel width must match kernel size");
+
     // Save for backward
     ctx->save_for_backward({inFeatures, kernels, nbmaps, nbsizes});
-    ctx->saved_data["transposed"]   = transposed;
+    ctx->saved_data["transposed"]   = topology.tranposed;
     ctx->saved_data["kernel_width"] = kWidth;
-    ctx->saved_data["use_me"]       = packInfo.useME();
+    ctx->saved_data["use_me"]       = topology.useME;
 
     torch::Tensor output;
-    if (packInfo.targetGrid().total_voxels() > 0) {
+    if (topology.targetTotalVoxelCount > 0) {
         auto opt = torch::TensorOptions().dtype(inFeatures.dtype()).device(inFeatures.device());
-        if (!transposed) {
+        if (!topology.tranposed) {
             output = torch::zeros({sizes[1], kernels.size(-1)}, opt);
         } else {
             output = torch::zeros({sizes[0], kernels.size(-1)}, opt);
         }
         // NOTE: Francis: We need .cpu().contiguous() here because we copied the convolution
         //       implementation from torch_sparse which runs std::max_element on a pointer
-        //       to this tensor D: which is fucking awful...
+        //       to this tensor D: which is awful...
         // TODO: Francis: Fix torch_sparse conv to be robust
         FVDB_DISPATCH_KERNEL_DEVICE(inFeatures.device(), [&]() {
             ops::dispatchSparseConvolutionKernelMap<DeviceTag>(inFeatures,
@@ -116,7 +117,7 @@ SparseConvolutionKernelMap::forward(AutogradContext *ctx,
                                                                kernels,
                                                                nbmaps,
                                                                nbsizes.cpu().contiguous(),
-                                                               transposed,
+                                                               topology.tranposed,
                                                                middleAcceleration);
         });
     } else {
@@ -169,25 +170,27 @@ SparseConvolutionKernelMap::backward(AutogradContext *ctx, variable_list grad_ou
     }
 
     const int outC = gradWeight.size(-1), inC = gradWeight.size(-2);
+    // The kernel map is built iterating k0 (slowest), k1, k2 (fastest) in ConvolutionKernelMap.cu,
+    // so the flat kernel index corresponds to (k0, k1, k2) in row-major order.
+    // We must reshape in the same order to correctly map gradients back to kernel positions.
     if (!transposed) {
         gradWeight = gradWeight
-                         .reshape({kWidth[2].item<int32_t>(),
+                         .reshape({kWidth[0].item<int32_t>(),
                                    kWidth[1].item<int32_t>(),
-                                   kWidth[0].item<int32_t>(),
+                                   kWidth[2].item<int32_t>(),
                                    inC,
                                    outC})
-                         .permute({4, 3, 2, 1, 0});
+                         .permute({4, 3, 0, 1, 2});
     } else {
         gradWeight = gradWeight
-                         .reshape({kWidth[2].item<int32_t>(),
+                         .reshape({kWidth[0].item<int32_t>(),
                                    kWidth[1].item<int32_t>(),
-                                   kWidth[0].item<int32_t>(),
+                                   kWidth[2].item<int32_t>(),
                                    inC,
                                    outC})
-                         .permute({3, 4, 2, 1, 0});
+                         .permute({3, 4, 0, 1, 2});
     }
-    return {
-        gradInput, gradWeight, torch::Tensor(), torch::Tensor(), torch::Tensor(), torch::Tensor()};
+    return {gradInput, gradWeight, torch::Tensor()};
 }
 
 } // namespace autograd

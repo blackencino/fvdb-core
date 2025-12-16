@@ -665,8 +665,11 @@ class TestConvDefault(unittest.TestCase):
         input_min_needed = tuple(dst_min[i] * stride[i] - kernel_half[i] for i in range(3))
         input_max_needed = tuple(dst_max[i] * stride[i] + kernel_half[i] for i in range(3))
 
-        dense_min = tuple(min(input_min_needed[i], src_min[i]) for i in range(3))
+        dense_min_raw = tuple(min(input_min_needed[i], src_min[i]) for i in range(3))
         dense_max = tuple(max(input_max_needed[i], src_max[i]) for i in range(3))
+
+        # Align dense_min to stride grid for correct coordinate mapping
+        dense_min = tuple((dense_min_raw[i] // stride[i]) * stride[i] for i in range(3))
         dense_shape = tuple(dense_max[i] - dense_min[i] + 1 for i in range(3))
 
         dense_input = torch.zeros((1, in_channels) + dense_shape, device=device, dtype=dtype, requires_grad=True)
@@ -682,12 +685,8 @@ class TestConvDefault(unittest.TestCase):
                 input=dense_input_data, weight=dense_kernel2, padding=kernel_half, stride=stride
             )
 
-        # Compute output offset
+        # Compute output offset (dense_min is now aligned to stride)
         output_offset = tuple(dense_min[i] // stride[i] for i in range(3))
-        # More precise: use floor division
-        import math as _math
-
-        output_offset = tuple(_math.floor(dense_min[i] / stride[i]) for i in range(3))
 
         # Apply gradient at dst coordinates
         loss = torch.tensor(0.0, device=device, dtype=dtype)

@@ -903,6 +903,11 @@ struct GridBatch : torch::CustomClassHolder {
                    const torch::Tensor &depthImages,
                    const std::optional<torch::Tensor> &weightImages) const;
 
+    auto const *
+    implRawPtr() const {
+        return mImpl.get();
+    }
+
   private:
     c10::intrusive_ptr<detail::GridBatchImpl> mImpl;
 };

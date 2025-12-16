@@ -5,6 +5,7 @@
 #define FVDB_DETAIL_AUTOGRAD_SPARSECONVOLUTIONKERNELMAP_H
 
 #include <fvdb/SparseConvPackInfo.h>
+#include <fvdb/detail/autograd/Common.h>
 
 #include <torch/autograd.h>
 
@@ -17,11 +18,19 @@ struct SparseConvolutionKernelMap : public torch::autograd::Function<SparseConvo
     using AutogradContext = torch::autograd::AutogradContext;
     using Variable        = torch::autograd::Variable;
 
-    static variable_list forward(AutogradContext *ctx,
-                                 Variable inFeatures,
-                                 Variable kernels,
-                                 const SparseConvPackInfo &packInfo,
-                                 bool transposed);
+    struct Topology {
+        torch::Tensor neighborMap;
+        torch::Tensor neighborSizes;
+        int64_t sourceTotalVoxelCount = 0;
+        int64_t targetTotalVoxelCount = 0;
+        nanovdb::Vec3i kernelSize     = nanovdb::Vec3i{1, 1, 1};
+        nanovdb::Vec3i stride         = nanovdb::Vec3i{1, 1, 1};
+        bool tranposed                = false;
+        bool useME                    = false;
+    };
+
+    static variable_list
+    forward(AutogradContext *ctx, Variable inFeatures, Variable kernels, Topology topology);
 
     static variable_list backward(AutogradContext *ctx, variable_list grad_output);
 };

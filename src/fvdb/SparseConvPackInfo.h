@@ -8,13 +8,20 @@
 #include <fvdb/JaggedTensor.h>
 #include <fvdb/Types.h>
 
+#include <nanovdb/math/Math.h>
+
 #include <torch/types.h>
 
+#include <memory>
 #include <optional>
 
 namespace fvdb {
 
 enum ConvPackBackend { GATHER_SCATTER, IGEMM, CUTLASS, LGGS, HALO, DENSE, MATMUL };
+
+// =============================================================================
+// Legacy SparseConvPackInfo (kept for backward compatibility)
+// =============================================================================
 
 class SparseConvPackInfo : torch::CustomClassHolder {
     // #IO: Number of input-output pairs

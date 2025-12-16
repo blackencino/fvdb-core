@@ -56,6 +56,7 @@ set(FVDB_CPP_FILES
     fvdb/detail/autograd/TransformPoints.cpp
     fvdb/detail/autograd/UpsampleGrid.cpp
     fvdb/detail/autograd/VolumeRender.cpp
+    fvdb/detail/autograd/convolution/ConvGatherScatterBackendAG.cpp
     fvdb/detail/io/GaussianPlyIO.cpp
     fvdb/detail/io/LoadNanovdb.cpp
     fvdb/detail/io/SaveNanoVDB.cpp

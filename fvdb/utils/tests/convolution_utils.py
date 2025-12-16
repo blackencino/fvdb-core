@@ -292,8 +292,22 @@ def conv_ground_truth_strided(
     src_min = src_coords.min(dim=0).values.tolist()
     src_max = src_coords.max(dim=0).values.tolist()
 
-    dense_min = tuple(min(input_min_needed[i], src_min[i]) for i in range(3))
+    dense_min_raw = tuple(min(input_min_needed[i], src_min[i]) for i in range(3))
     dense_max = tuple(max(input_max_needed[i], src_max[i]) for i in range(3))
+
+    # CRITICAL: Align dense_min to the stride grid to ensure correct coordinate mapping.
+    # The dense volume's origin must be at a coordinate that corresponds to output index 0
+    # in the local coordinate system. This means dense_min must be aligned such that
+    # local output index 0 corresponds to a known global output coordinate.
+    #
+    # With padding=kernel_half, local output[o] sees local input centered at o*stride.
+    # For global output O to map to local output o, we need:
+    #   O * stride = o * stride + dense_min
+    #   O = o + dense_min / stride
+    #
+    # For this mapping to work with integer indices, dense_min must be divisible by stride.
+    # We round DOWN to ensure we include all needed input coordinates.
+    dense_min = tuple((dense_min_raw[i] // stride[i]) * stride[i] for i in range(3))
     dense_shape = tuple(dense_max[i] - dense_min[i] + 1 for i in range(3))
 
     # Create dense input
@@ -316,17 +330,13 @@ def conv_ground_truth_strided(
             dense_output = torch.nn.functional.conv3d(input=dense_input, weight=weights, padding=padding, stride=stride)
 
     # Compute output coordinate offset
-    # With padding=kernel_half, output[0,0,0] corresponds to input centered at (0,0,0)
-    # So output[o] corresponds to input centered at o*stride
-    # Output coord in dense_output is: (dst_coord - (dense_min / stride rounded appropriately))
-    # Actually simpler: output index = (input_center_coord - dense_min) / stride
-    # where input_center_coord for output o is o*stride (in original coords)
-
-    # The dense output has shape based on the padded input
-    # output index for dst_coord d: ((d * stride) - dense_min) / stride = d - (dense_min / stride)
-    # But we need to account for non-integer division
-    # More precisely: output_index = d - floor(dense_min / stride)
-    output_offset = tuple(math.floor(dense_min[i] / stride[i]) for i in range(3))
+    # With padding=kernel_half and dense_min aligned to stride:
+    # Local output[o] has center at local input o*stride, which is global input o*stride + dense_min
+    # Global output O has center at global input O*stride
+    # So: O*stride = o*stride + dense_min
+    #     O = o + dense_min/stride
+    # Since dense_min is now aligned, dense_min/stride is an integer.
+    output_offset = tuple(dense_min[i] // stride[i] for i in range(3))
 
     # Extract values at destination coordinates
     sparse_output_values = torch.zeros((len(dst_coords), out_channels), device=device, dtype=dtype)
