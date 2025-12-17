@@ -4,9 +4,15 @@
 """
 Test the PyTorch ground truth for convolutions in 3D.
 
-The tests in this file will validate that the PyTorch dense versions of convolution
-do what we expect them to do, and establish a set of baseline demonstrations of
-convolution properties.
+These tests validate that PyTorch's dense conv3d behaves as we expect, establishing
+baseline understanding of:
+  - Cross-correlation semantics (conv3d is actually cross-correlation)
+  - Impulse response behavior (forward and backward)
+  - Strided convolution coordinate mapping
+  - Gradient computation for inputs and weights
+
+This file does NOT test fVDB sparse convolution - it validates our understanding
+of PyTorch semantics that we use as ground truth in test_conv_default.py.
 """
 
 import unittest
@@ -18,79 +24,75 @@ from fvdb.utils.tests import (
     generate_hermit_impulses_dense,
     has_any_symmetry,
 )
-from fvdb.utils.tests.convolution_utils import disable_tf32
+from fvdb.utils.tests.convolution_utils import (
+    ALL_DEVICE_DTYPE_COMBOS,
+    REDUCED_DEVICE_DTYPE_COMBOS,
+    disable_tf32,
+    get_tolerances,
+)
 from parameterized import parameterized
-
-all_device_dtype_combos = [
-    # ["cuda", torch.float16],
-    ["cpu", torch.float32],
-    ["cuda", torch.float32],
-    ["cpu", torch.float64],
-    ["cuda", torch.float64],
-]
 
 
 def _validate_impulse_convolution(
     impulse_coord: torch.Tensor,
     kernel: torch.Tensor,
     convolved: torch.Tensor,
-    kernel_size: tuple,
+    kernel_size: tuple[int, int, int],
     test_case: unittest.TestCase,
     check_bounds: bool,
 ) -> None:
     """
-    Validate that a convolution of an impulse at a specific coordinate produces the expected kernel.
+    Validate that convolving an impulse produces the expected kernel pattern.
 
-    This function extracts the region around the impulse coordinate from the convolution result,
-    flips it (since PyTorch conv3d performs cross-correlation), and compares it to the kernel.
+    Since PyTorch conv3d performs cross-correlation (not true convolution), the
+    output around an impulse is the flipped kernel. This function extracts that
+    region, flips it back, and compares to the original kernel.
 
     Args:
-        impulse_coord: The coordinate of the impulse as a torch.Tensor
-        kernel: The kernel used for convolution
-        convolved: The result of the convolution
-        kernel_size: The size of the kernel as a tuple
-        test_case: The unittest.TestCase instance for assertions
-        check_bounds: Whether to check that the bounds of the non-zero region exactly match the expected bounds
+        impulse_coord: Location of the impulse in the input volume
+        kernel: Original kernel used for convolution
+        convolved: Result of conv3d operation
+        kernel_size: Kernel dimensions (k0, k1, k2)
+        test_case: TestCase for assertions
+        check_bounds: If True, verify the non-zero region exactly matches expected bounds
     """
-    # Extract the region around the impulse coordinate where the kernel should appear
-    # The kernel is centered at the impulse coordinate
     kernel_half = tuple(k // 2 for k in kernel_size)
 
-    # Define the slice boundaries for extracting the kernel region
+    # Region where kernel response should appear
     start_coords = tuple(max(0, impulse_coord[i].item() - kernel_half[i]) for i in range(3))
     end_coords = tuple(min(convolved.shape[i + 1], impulse_coord[i].item() + kernel_half[i] + 1) for i in range(3))
 
     if check_bounds:
-        # The non-zero region of convolved should be exactly inside the bounds we just computed.
-        # Check that the bounds of the non-zero region exactly match the expected bounds
         non_zero_mask = convolved[0] != 0
         non_zero_coords = torch.nonzero(non_zero_mask)
 
         if non_zero_coords.shape[0] > 0:
-            # Find the actual bounds of the non-zero region
-            actual_start_coords = tuple(non_zero_coords[:, dim].min().item() for dim in range(3))
-            actual_end_coords = tuple(non_zero_coords[:, dim].max().item() + 1 for dim in range(3))
+            actual_start = tuple(non_zero_coords[:, dim].min().item() for dim in range(3))
+            actual_end = tuple(non_zero_coords[:, dim].max().item() + 1 for dim in range(3))
+            test_case.assertEqual(actual_start, start_coords)
+            test_case.assertEqual(actual_end, end_coords)
 
-            # The actual bounds should exactly match the expected bounds
-            test_case.assertEqual(actual_start_coords, start_coords)
-            test_case.assertEqual(actual_end_coords, end_coords)
-
-    # Extract the convolved region around the impulse
     convolved_region = convolved[
         0, start_coords[0] : end_coords[0], start_coords[1] : end_coords[1], start_coords[2] : end_coords[2]
     ]
-
     test_case.assertEqual(convolved_region.shape, kernel.shape)
 
-    # Since PyTorch conv3d performs cross-correlation, we need to flip to get the result to
-    # match the kernel.
+    # Flip to undo cross-correlation effect
     convolved_region = torch.flip(convolved_region, dims=[0, 1, 2])
 
-    # The flipped convolved region should match the kernel
-    torch.testing.assert_close(convolved_region, kernel, rtol=1e-5, atol=1e-6)
+    tols = get_tolerances(kernel.dtype)
+    torch.testing.assert_close(convolved_region, kernel, rtol=tols["forward"][0], atol=tols["forward"][1])
 
 
 class TestConvGroundTruth(unittest.TestCase):
+    """
+    Validate PyTorch conv3d behavior that we rely on as ground truth.
+
+    These tests verify our understanding of:
+    - Cross-correlation semantics (impulse → flipped kernel)
+    - Backward pass gradient computation
+    - Strided convolution coordinate mapping
+    """
 
     VOLUME_SHAPE = (71, 34, 58)
     KERNEL_SIZE = (3, 5, 7)
@@ -101,7 +103,11 @@ class TestConvGroundTruth(unittest.TestCase):
     def setUp(self):
         torch.random.manual_seed(2024)
 
-    @parameterized.expand(all_device_dtype_combos)
+    # =========================================================================
+    # Forward Pass Tests
+    # =========================================================================
+
+    @parameterized.expand(ALL_DEVICE_DTYPE_COMBOS)
     def test_single_impulse(self, device: DeviceIdentifier, dtype: torch.dtype):
         device = resolve_device(device)
 
@@ -147,7 +153,7 @@ class TestConvGroundTruth(unittest.TestCase):
             check_bounds=True,
         )
 
-    @parameterized.expand(all_device_dtype_combos)
+    @parameterized.expand(ALL_DEVICE_DTYPE_COMBOS)
     def test_single_impulse_activation_and_weights(self, device: DeviceIdentifier, dtype: torch.dtype):
         """
         This test iterates over each single weight location in the kernel space,
@@ -196,8 +202,9 @@ class TestConvGroundTruth(unittest.TestCase):
                     got_output_coord = tuple(nonzero_coords[0].tolist())
                     self.assertEqual(got_output_coord, expected_output_coord)
 
-    @parameterized.expand(all_device_dtype_combos)
+    @parameterized.expand(ALL_DEVICE_DTYPE_COMBOS)
     def test_multiple_impulses(self, device: DeviceIdentifier, dtype: torch.dtype):
+        """Test that non-overlapping impulses each produce independent kernel responses."""
         device = resolve_device(device)
 
         impulse_coords, impulse_field = generate_hermit_impulses_dense(
@@ -210,16 +217,9 @@ class TestConvGroundTruth(unittest.TestCase):
         )
 
         num_impulses = len(impulse_coords)
-        print(f"Number of generated impulses: {num_impulses}")
 
-        total_value = torch.sum(impulse_field).item()
-        print(f"Total sum of impulse_field: {total_value}")
-
-        # Test that the impulse field's shape matches the volume shape
         self.assertEqual(impulse_field.shape, self.VOLUME_SHAPE)
-
-        # Test that the total value of the impulse field matches the total number of impulses
-        self.assertEqual(round(total_value), num_impulses)
+        self.assertEqual(round(torch.sum(impulse_field).item()), num_impulses)
 
         # Get a kernel and convolve the impulse field with it
         kernel = fourier_anti_symmetric_kernel(self.KERNEL_SIZE, dtype=dtype, device=device)
@@ -245,20 +245,18 @@ class TestConvGroundTruth(unittest.TestCase):
                 check_bounds=False,
             )
 
-    # ==================================================================================
-    # Backward convolution tests
-    # ==================================================================================
+    # =========================================================================
+    # Backward Pass Tests
+    # =========================================================================
     #
-    # These tests verify that PyTorch's conv3d backward pass produces expected gradients.
-    # The backward pass computes:
-    #   - Gradient w.r.t. input: dy convolved with flipped weights (or conv_transpose(dy, w))
-    #   - Gradient w.r.t. weights: correlation of input with output gradient
+    # PyTorch conv3d backward computes:
+    #   - d/d(input): conv_transpose(dy, weights) = dy * flip(weights)
+    #   - d/d(weights): correlation of input with dy
     #
-    # For cross-correlation (which PyTorch conv3d implements), if an impulse in the output
-    # gradient at coord C produces input gradients, those gradients should form the original
-    # kernel centered at C (since backward effectively convolves dy with flip(flip(w)) = w).
+    # Since forward is cross-correlation (not true convolution), the input
+    # gradient pattern is the original kernel (not flipped).
 
-    @parameterized.expand(all_device_dtype_combos)
+    @parameterized.expand(ALL_DEVICE_DTYPE_COMBOS)
     def test_single_impulse_backward_input_grad(self, device: DeviceIdentifier, dtype: torch.dtype):
         """
         Test that backward pass w.r.t. input produces expected gradients.
@@ -305,12 +303,11 @@ class TestConvGroundTruth(unittest.TestCase):
 
         self.assertEqual(input_grad_region.shape, kernel.shape)
 
-        # For backward of cross-correlation, the input gradient should be the
-        # original kernel (not flipped). This is because backward involves
-        # conv_transpose which flips the kernel, canceling the forward flip.
-        torch.testing.assert_close(input_grad_region, kernel, rtol=1e-5, atol=1e-6)
+        # Input gradient should match the kernel (conv_transpose flips → unflips)
+        tols = get_tolerances(dtype)
+        torch.testing.assert_close(input_grad_region, kernel, rtol=tols["input_grad"][0], atol=tols["input_grad"][1])
 
-    @parameterized.expand(all_device_dtype_combos)
+    @parameterized.expand(ALL_DEVICE_DTYPE_COMBOS)
     def test_single_impulse_backward_weight_grad(self, device: DeviceIdentifier, dtype: torch.dtype):
         """
         Test that backward pass w.r.t. weights produces expected gradients.
@@ -354,9 +351,10 @@ class TestConvGroundTruth(unittest.TestCase):
         expected_grad = torch.zeros_like(weight_grad)
         expected_grad[0, 0, kernel_center[0], kernel_center[1], kernel_center[2]] = 1
 
-        torch.testing.assert_close(weight_grad, expected_grad, rtol=1e-5, atol=1e-6)
+        tols = get_tolerances(dtype)
+        torch.testing.assert_close(weight_grad, expected_grad, rtol=tols["kernel_grad"][0], atol=tols["kernel_grad"][1])
 
-    @parameterized.expand(all_device_dtype_combos)
+    @parameterized.expand(ALL_DEVICE_DTYPE_COMBOS)
     def test_single_impulse_backward_weight_grad_offset(self, device: DeviceIdentifier, dtype: torch.dtype):
         """
         Test weight gradient when input and output gradient impulses are at different coords.
@@ -420,15 +418,9 @@ class TestConvGroundTruth(unittest.TestCase):
             actual_pos = tuple(nonzero_coords[0].tolist())
             self.assertEqual(actual_pos, expected_kernel_pos, f"Wrong grad position for offset {offset}")
 
-    @parameterized.expand(all_device_dtype_combos)
+    @parameterized.expand(ALL_DEVICE_DTYPE_COMBOS)
     def test_multiple_impulses_backward(self, device: DeviceIdentifier, dtype: torch.dtype):
-        """
-        Test backward pass with multiple non-overlapping impulses.
-
-        Similar to test_multiple_impulses but for the backward pass. Each impulse
-        in the output gradient should independently produce a kernel in the input
-        gradient without interference.
-        """
+        """Test that non-overlapping impulse gradients produce independent kernel patterns."""
         device = resolve_device(device)
 
         impulse_coords, impulse_field = generate_hermit_impulses_dense(
@@ -441,7 +433,6 @@ class TestConvGroundTruth(unittest.TestCase):
         )
 
         num_impulses = len(impulse_coords)
-        print(f"Number of generated impulses for backward test: {num_impulses}")
 
         impulse_field_with_channel = impulse_field.reshape(1, *self.VOLUME_SHAPE)
         impulse_field_with_channel = impulse_field_with_channel.clone().requires_grad_(True)
@@ -486,45 +477,23 @@ class TestConvGroundTruth(unittest.TestCase):
             # Only check if the region is fully within bounds (no clipping)
             expected_shape = tuple(end_coords[j] - start_coords[j] for j in range(3))
             if expected_shape == self.KERNEL_SIZE:
-                torch.testing.assert_close(grad_region, kernel, rtol=1e-5, atol=1e-6)
+                tols = get_tolerances(dtype)
+                torch.testing.assert_close(grad_region, kernel, rtol=tols["input_grad"][0], atol=tols["input_grad"][1])
 
-    # ==================================================================================
+    # =========================================================================
     # Strided Convolution Tests
-    # ==================================================================================
-    #
-    # Strided convolution changes the relationship between input and output coordinates.
-    # Understanding this relationship is crucial for implementing sparse strided convolution.
+    # =========================================================================
     #
     # Key concepts for strided convolution (stride=S, kernel_size=K, padding=K//2):
     #
-    # 1. OUTPUT COORDINATE MAPPING:
-    #    For an input of size N with padding P and stride S:
-    #      output_size = floor((N + 2*P - K) / S) + 1
+    # OUTPUT COORDINATE MAPPING:
+    #   output[o] receives contributions from inputs in [o*S - K//2, o*S + K//2]
+    #   An input at c contributes to outputs in [ceil((c-K//2)/S), floor((c+K//2)/S)]
     #
-    #    With P = K//2 (half-padding), output[o] sees input centered at o*S.
-    #
-    # 2. WHICH INPUTS CONTRIBUTE TO WHICH OUTPUTS:
-    #    Output at coordinate o receives contributions from inputs in the range:
-    #      [o*S - K//2, o*S + K//2]
-    #
-    #    Conversely, an input at coordinate c contributes to outputs in the range:
-    #      [ceil((c - K//2) / S), floor((c + K//2) / S)]
-    #
-    # 3. DOWNSAMPLING EFFECT:
-    #    With stride S > 1, multiple input coordinates can map to the same output.
-    #    For example, with stride=2 and kernel_size=3:
-    #      - Input at c=0 contributes to output o=0 (since ceil((0-1)/2)=0, floor((0+1)/2)=0)
-    #      - Input at c=1 contributes to output o=0 and o=1
-    #      - Input at c=2 contributes to output o=1
-    #
-    # These tests validate these assumptions about PyTorch's strided conv3d.
+    # These tests validate our understanding of PyTorch's strided conv3d semantics.
+    # Reduced device/dtype coverage since behavior is device-independent.
 
-    # Reduced coverage for strided tests (behavior is dtype/device independent)
-    reduced_device_dtype_combos = [
-        ["cuda", torch.float32],
-    ]
-
-    @parameterized.expand(reduced_device_dtype_combos)
+    @parameterized.expand(REDUCED_DEVICE_DTYPE_COMBOS)
     def test_strided_impulse_output_location(self, device: DeviceIdentifier, dtype: torch.dtype):
         """
         Test that strided convolution produces output at the expected coordinates.
@@ -587,7 +556,7 @@ class TestConvGroundTruth(unittest.TestCase):
                     f"Actual outputs: {actual_outputs}",
                 )
 
-    @parameterized.expand(reduced_device_dtype_combos)
+    @parameterized.expand(REDUCED_DEVICE_DTYPE_COMBOS)
     def test_strided_activation_and_weights(self, device: DeviceIdentifier, dtype: torch.dtype):
         """
         Test the relationship between kernel position, stride, and output coordinate.
@@ -692,7 +661,7 @@ class TestConvGroundTruth(unittest.TestCase):
                             f"kernel_pos=({k0},{k1},{k2}): expected 0 outputs, got {len(nonzero_coords)}",
                         )
 
-    @parameterized.expand(reduced_device_dtype_combos)
+    @parameterized.expand(REDUCED_DEVICE_DTYPE_COMBOS)
     def test_strided_backward_input_grad(self, device: DeviceIdentifier, dtype: torch.dtype):
         """
         Test backward pass w.r.t. input for strided convolution.
@@ -756,13 +725,11 @@ class TestConvGroundTruth(unittest.TestCase):
 
         self.assertEqual(grad_region.shape, kernel_size)
 
-        # The gradient should match the kernel (not flipped)
-        # This is because backward of conv is conv_transpose, which flips the kernel,
-        # canceling the flip from the forward cross-correlation
-        torch.testing.assert_close(grad_region, kernel, rtol=1e-5, atol=1e-6)
+        # Gradient should match the kernel (conv_transpose flips → unflips)
+        tols = get_tolerances(dtype)
+        torch.testing.assert_close(grad_region, kernel, rtol=tols["input_grad"][0], atol=tols["input_grad"][1])
 
-        # Also verify that the gradient is zero outside this region
-        # (Create a mask for the expected region and check the rest is zero)
+        # Verify gradient is zero outside the kernel footprint
         mask = torch.zeros_like(input_grad, dtype=torch.bool)
         mask[
             0,
@@ -772,12 +739,9 @@ class TestConvGroundTruth(unittest.TestCase):
             expected_start[2] : expected_end[2],
         ] = True
         outside_region = input_grad[~mask]
-        self.assertTrue(
-            torch.all(outside_region == 0),
-            f"Expected zeros outside grad region, but found non-zeros",
-        )
+        self.assertTrue(torch.all(outside_region == 0), "Expected zeros outside grad region")
 
-    @parameterized.expand(reduced_device_dtype_combos)
+    @parameterized.expand(REDUCED_DEVICE_DTYPE_COMBOS)
     def test_strided_backward_weight_grad(self, device: DeviceIdentifier, dtype: torch.dtype):
         """
         Test backward pass w.r.t. weights for strided convolution.

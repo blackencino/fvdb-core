@@ -2,8 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 """
-Test the default sparse convolution.
+Test the fVDB sparse convolution implementation.
 
+These tests compare sparse convolution results against dense PyTorch ground truth
+to verify correctness of:
+  - Topology computation (conv_grid output coordinates)
+  - Forward pass values
+  - Backward pass gradients (input and kernel)
+  - Strided convolution behavior
+
+Ground truth computation uses utilities from convolution_utils.py.
 """
 
 import math
@@ -17,11 +25,14 @@ from fvdb.utils.tests import (
     has_any_symmetry,
 )
 from fvdb.utils.tests.convolution_utils import (
+    ALL_DEVICE_DTYPE_COMBOS,
+    REDUCED_DEVICE_DTYPE_COMBOS,
     assert_coords_equal,
     compute_conv_grid_topology_ground_truth,
     conv_ground_truth_stride_1,
     conv_ground_truth_strided,
     disable_tf32,
+    get_tolerances,
     sort_coords_by_ijk,
 )
 from parameterized import parameterized
@@ -29,25 +40,70 @@ from parameterized import parameterized
 from fvdb import ConvolutionPlan, GridBatch, JaggedTensor
 
 # =============================================================================
-# Test Configuration
-# =============================================================================
-
-ALL_DEVICE_DTYPE_COMBOS = [
-    ["cpu", torch.float32],
-    ["cuda", torch.float32],
-    ["cpu", torch.float64],
-    ["cuda", torch.float64],
-]
-
-# Reduced coverage for tests where device/dtype doesn't affect the property being tested
-REDUCED_DEVICE_DTYPE_COMBOS = [
-    ["cuda", torch.float32],
-]
-
-
-# =============================================================================
 # Test-Specific Helpers
 # =============================================================================
+
+
+def diagnose_tensor_mismatch(
+    name: str,
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    rtol: float,
+    atol: float,
+) -> str:
+    """
+    Generate diagnostic info for tensor mismatch (for debugging test failures).
+
+    Args:
+        name: Description of what's being compared
+        actual: Actual tensor from sparse convolution
+        expected: Expected tensor from dense ground truth
+        rtol: Relative tolerance used
+        atol: Absolute tolerance used
+
+    Returns:
+        Formatted string with error statistics and top mismatches
+    """
+    lines = [f"\n{'='*60}", f"TENSOR MISMATCH: {name}", f"{'='*60}"]
+
+    if actual.shape != expected.shape:
+        lines.append(f"SHAPE MISMATCH: actual={actual.shape}, expected={expected.shape}")
+        return "\n".join(lines)
+
+    lines.append(f"Shape: {actual.shape}, dtype: {actual.dtype}")
+
+    abs_diff = (actual - expected).abs()
+    max_abs = abs_diff.max().item()
+    mean_abs = abs_diff.mean().item()
+
+    lines.append(f"\nError Statistics:")
+    lines.append(f"  Max absolute error:  {max_abs:.6e}")
+    lines.append(f"  Mean absolute error: {mean_abs:.6e}")
+    lines.append(f"  Tolerance: rtol={rtol}, atol={atol}")
+
+    exceeds = abs_diff > (atol + rtol * expected.abs())
+    num_exceed = exceeds.sum().item()
+    total = actual.numel()
+    pct = 100 * num_exceed / total
+
+    lines.append(f"\nMismatched elements: {num_exceed}/{total} ({pct:.1f}%)")
+
+    if num_exceed > 0:
+        flat_abs_diff = abs_diff.flatten()
+        flat_actual = actual.flatten()
+        flat_expected = expected.flatten()
+        _, top_indices = flat_abs_diff.topk(min(5, int(num_exceed)))
+
+        lines.append(f"\nTop mismatches:")
+        for idx in top_indices:
+            i: int = int(idx.item())
+            a_val: float = flat_actual[i].item()
+            e_val: float = flat_expected[i].item()
+            diff: float = flat_abs_diff[i].item()
+            lines.append(f"  idx={i}: actual={a_val:.6f}, expected={e_val:.6f}, Δ={diff:.6e}")
+
+    lines.append(f"{'='*60}\n")
+    return "\n".join(lines)
 
 
 def create_grid_from_coords(
@@ -371,13 +427,14 @@ class TestConvDefault(unittest.TestCase):
         sparse_output_flat = sparse_output.jdata.flatten()
 
         # Verify sparse matches dense at output locations
+        tols = get_tolerances(dtype)
         dense_at_dst = dense_output[0, 0, dst_ijks[:, 0], dst_ijks[:, 1], dst_ijks[:, 2]]
-        torch.testing.assert_close(sparse_output_flat, dense_at_dst, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(sparse_output_flat, dense_at_dst, rtol=tols["forward"][0], atol=tols["forward"][1])
 
         # Verify sum matches kernel sum
         self.assertAlmostEqual(sparse_output_flat.sum().item(), kernel_sum, places=5)
 
-        # Also test the utility function
+        # Verify utility function also produces correct ground truth
         gt_activation, gt_convolved = conv_ground_truth_stride_1(
             grid_batch=grid_batch,
             activation=features,
@@ -386,7 +443,7 @@ class TestConvDefault(unittest.TestCase):
             ijk_min=(0, 0, 0),
             allow_tf32=False,
         )
-        torch.testing.assert_close(gt_convolved, dense_output, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(gt_convolved, dense_output, rtol=tols["forward"][0], atol=tols["forward"][1])
 
     @parameterized.expand(ALL_DEVICE_DTYPE_COMBOS)
     def test_multiple_impulses_forward(self, device: DeviceIdentifier, dtype: torch.dtype):
@@ -448,7 +505,10 @@ class TestConvDefault(unittest.TestCase):
         dense_values_sorted = dense_output[0, 0, dense_sorted[:, 0], dense_sorted[:, 1], dense_sorted[:, 2]]
         sparse_values_sorted = sparse_flat[dst_perm]
 
-        torch.testing.assert_close(sparse_values_sorted, dense_values_sorted, rtol=1e-5, atol=1e-6)
+        tols = get_tolerances(dtype)
+        torch.testing.assert_close(
+            sparse_values_sorted, dense_values_sorted, rtol=tols["forward"][0], atol=tols["forward"][1]
+        )
 
     # =========================================================================
     # Backward Pass Tests
@@ -502,8 +562,11 @@ class TestConvDefault(unittest.TestCase):
         sparse_output = conv_plan.execute(features, kernel_5d)
 
         # Verify forward match
+        tols = get_tolerances(dtype)
         dense_at_dst = dense_output[0, 0, dst_ijks[:, 0], dst_ijks[:, 1], dst_ijks[:, 2]]
-        torch.testing.assert_close(sparse_output.jdata.flatten(), dense_at_dst, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(
+            sparse_output.jdata.flatten(), dense_at_dst, rtol=tols["forward"][0], atol=tols["forward"][1]
+        )
 
         # === Backward ===
         # Create output gradient at center coordinate
@@ -530,8 +593,8 @@ class TestConvDefault(unittest.TestCase):
         torch.testing.assert_close(
             sparse_input_grad.flatten(),
             dense_grad_at_coord.unsqueeze(0),
-            rtol=1e-5,
-            atol=1e-6,
+            rtol=tols["input_grad"][0],
+            atol=tols["input_grad"][1],
         )
 
         # Compare kernel gradients
@@ -539,7 +602,9 @@ class TestConvDefault(unittest.TestCase):
         sparse_kernel_grad = kernel_5d.grad
         assert dense_kernel_grad is not None and sparse_kernel_grad is not None
 
-        torch.testing.assert_close(sparse_kernel_grad, dense_kernel_grad, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(
+            sparse_kernel_grad, dense_kernel_grad, rtol=tols["kernel_grad"][0], atol=tols["kernel_grad"][1]
+        )
 
     # =========================================================================
     # Strided Convolution Tests (Forward + Backward)
@@ -570,6 +635,11 @@ class TestConvDefault(unittest.TestCase):
             in_channels: Number of input channels
             out_channels: Number of output channels
         """
+        tols = get_tolerances(dtype)
+        fwd_rtol, fwd_atol = tols["forward"]
+        input_grad_rtol, input_grad_atol = tols["input_grad"]
+        kernel_grad_rtol, kernel_grad_atol = tols["kernel_grad"]
+
         device = resolve_device(device)
         cluster_coords = cluster_coords.to(device=device)
 
@@ -622,13 +692,17 @@ class TestConvDefault(unittest.TestCase):
         sparse_out_sorted = sparse_output.jdata[sparse_perm]
         dense_out_sorted = dense_output_at_dst[sparse_perm]
 
-        torch.testing.assert_close(
-            sparse_out_sorted,
-            dense_out_sorted,
-            rtol=1e-4,
-            atol=1e-5,
-            msg=f"Forward mismatch for stride={stride}",
-        )
+        try:
+            torch.testing.assert_close(sparse_out_sorted, dense_out_sorted, rtol=fwd_rtol, atol=fwd_atol)
+        except AssertionError:
+            diag = diagnose_tensor_mismatch(
+                f"Forward output (stride={stride}, dtype={dtype})",
+                sparse_out_sorted,
+                dense_out_sorted,
+                rtol=fwd_rtol,
+                atol=fwd_atol,
+            )
+            raise AssertionError(diag) from None
 
         # === Backward Pass ===
         # Create output gradient (random for thorough gradient testing)
@@ -704,25 +778,35 @@ class TestConvDefault(unittest.TestCase):
         assert sparse_input_grad is not None, "Sparse input grad is None"
         assert dense_input_grad is not None, "Dense input grad is None"
 
-        torch.testing.assert_close(
-            sparse_input_grad,
-            dense_input_grad,
-            rtol=1e-4,
-            atol=1e-5,
-            msg=f"Input gradient mismatch for stride={stride}",
-        )
+        try:
+            torch.testing.assert_close(sparse_input_grad, dense_input_grad, rtol=input_grad_rtol, atol=input_grad_atol)
+        except AssertionError:
+            diag = diagnose_tensor_mismatch(
+                f"Input gradient (stride={stride}, dtype={dtype})",
+                sparse_input_grad,
+                dense_input_grad,
+                rtol=input_grad_rtol,
+                atol=input_grad_atol,
+            )
+            raise AssertionError(diag) from None
 
         # Compare kernel gradients
         assert sparse_kernel_grad is not None, "Sparse kernel grad is None"
         assert dense_kernel_grad is not None, "Dense kernel grad is None"
 
-        torch.testing.assert_close(
-            sparse_kernel_grad,
-            dense_kernel_grad,
-            rtol=1e-4,
-            atol=1e-5,
-            msg=f"Kernel gradient mismatch for stride={stride}",
-        )
+        try:
+            torch.testing.assert_close(
+                sparse_kernel_grad, dense_kernel_grad, rtol=kernel_grad_rtol, atol=kernel_grad_atol
+            )
+        except AssertionError:
+            diag = diagnose_tensor_mismatch(
+                f"Kernel gradient (stride={stride}, dtype={dtype})",
+                sparse_kernel_grad,
+                dense_kernel_grad,
+                rtol=kernel_grad_rtol,
+                atol=kernel_grad_atol,
+            )
+            raise AssertionError(diag) from None
 
     @parameterized.expand(REDUCED_DEVICE_DTYPE_COMBOS)
     def test_strided_conv_uniform_forward_backward(self, device: DeviceIdentifier, dtype: torch.dtype):

@@ -8,6 +8,7 @@ This module provides:
 1. Baseline references for 3D convolution using PyTorch dense operations
 2. Helper functions for comparing sparse and dense convolution results
 3. Utilities for coordinate manipulation and comparison
+4. Standard test configuration (device/dtype combos, tolerances)
 
 fVDB uses the following order for tensors in convolution:
 
@@ -41,6 +42,75 @@ from fvdb.types import NumericMaxRank1, ValueConstraint, to_Vec3i
 from fvdb import GridBatch, JaggedTensor
 
 # =============================================================================
+# Test Configuration Constants
+# =============================================================================
+
+# Device and dtype combinations for parameterized tests
+ALL_DEVICE_DTYPE_COMBOS = [
+    ["cpu", torch.float32],
+    ["cuda", torch.float32],
+    ["cpu", torch.float64],
+    ["cuda", torch.float64],
+]
+
+# Reduced coverage for tests where device/dtype doesn't affect the property being tested
+# (e.g., topology tests, coordinate mapping tests)
+REDUCED_DEVICE_DTYPE_COMBOS = [
+    ["cuda", torch.float32],
+]
+
+
+# =============================================================================
+# Standard Tolerances
+# =============================================================================
+#
+# These tolerances are calibrated for comparing sparse convolution results
+# against dense PyTorch ground truth. The values account for:
+#   - Floating-point accumulation order differences between sparse and dense
+#   - Different internal algorithms (cuDNN vs custom kernels)
+#
+# TOLERANCE RATIONALE:
+#   float64: Near machine precision. Both sparse and dense use the same
+#            accumulation precision, so results should match very closely.
+#
+#   float32: Looser tolerances needed because:
+#     - cuDNN may use different accumulation strategies
+#     - Sparse ops may accumulate in different order than dense
+#     - TF32 is disabled but internal algorithms still differ
+#
+#   Kernel gradients: Accumulate contributions from ALL output voxels,
+#     leading to more floating-point error. For small gradient values,
+#     absolute tolerance dominates; for larger values, relative tolerance
+#     applies. The 5e-4 tolerances handle both cases reasonably.
+
+
+def get_tolerances(dtype: torch.dtype) -> dict[str, tuple[float, float]]:
+    """
+    Get standard (rtol, atol) tolerances for a given dtype.
+
+    Returns a dict with keys:
+        'forward': tolerances for forward pass comparison
+        'input_grad': tolerances for input gradient comparison
+        'kernel_grad': tolerances for kernel gradient comparison
+
+    These tolerances are validated to pass on both CPU and CUDA for
+    typical convolution sizes (kernel 3-7, feature counts 1-8).
+    """
+    if dtype == torch.float64:
+        return {
+            "forward": (1e-10, 1e-12),
+            "input_grad": (1e-10, 1e-12),
+            "kernel_grad": (1e-10, 1e-12),
+        }
+    else:  # float32
+        return {
+            "forward": (1e-5, 1e-6),
+            "input_grad": (1e-5, 1e-6),
+            # Kernel gradients accumulate over all outputs, allowing more error
+            "kernel_grad": (5e-4, 5e-4),
+        }
+
+# =============================================================================
 # TF32 Control
 # =============================================================================
 
@@ -53,16 +123,23 @@ def disable_tf32():
     TF32 (TensorFloat-32) can cause numerical differences between CPU and CUDA.
     Use this when comparing results across devices or when exact precision matters.
 
+    This disables TF32 for both:
+    - cuDNN operations (conv3d, etc.) via cudnn.allow_tf32
+    - cuBLAS operations (mm, matmul, etc.) via cuda.matmul.allow_tf32
+
     Example:
         with disable_tf32():
             output = torch.nn.functional.conv3d(input, weight, padding="same")
     """
-    old_setting = torch.backends.cudnn.allow_tf32
+    old_cudnn = torch.backends.cudnn.allow_tf32
+    old_matmul = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_tf32 = False
     try:
         yield
     finally:
-        torch.backends.cudnn.allow_tf32 = old_setting
+        torch.backends.cudnn.allow_tf32 = old_cudnn
+        torch.backends.cuda.matmul.allow_tf32 = old_matmul
 
 
 # =============================================================================
@@ -417,3 +494,21 @@ def conv_ground_truth_stride_1(
         )
 
     return dense_activation, convolved
+
+
+__all__ = [
+    # Test configuration
+    "ALL_DEVICE_DTYPE_COMBOS",
+    "REDUCED_DEVICE_DTYPE_COMBOS",
+    "get_tolerances",
+    # TF32 control
+    "disable_tf32",
+    # Coordinate utilities
+    "sort_coords_by_ijk",
+    "assert_coords_equal",
+    "normalize_stride",
+    # Ground truth computation
+    "compute_conv_grid_topology_ground_truth",
+    "conv_ground_truth_strided",
+    "conv_ground_truth_stride_1",
+]
