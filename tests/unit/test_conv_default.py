@@ -635,7 +635,7 @@ class TestConvDefault(unittest.TestCase):
             in_channels: Number of input channels
             out_channels: Number of output channels
         """
-        tols = get_tolerances(dtype)
+        tols = get_tolerances(dtype, kernel_size=self.KERNEL_SIZE)
         fwd_rtol, fwd_atol = tols["forward"]
         input_grad_rtol, input_grad_atol = tols["input_grad"]
         kernel_grad_rtol, kernel_grad_atol = tols["kernel_grad"]

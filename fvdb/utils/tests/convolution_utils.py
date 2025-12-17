@@ -84,9 +84,18 @@ REDUCED_DEVICE_DTYPE_COMBOS = [
 #     applies. The 5e-4 tolerances handle both cases reasonably.
 
 
-def get_tolerances(dtype: torch.dtype) -> dict[str, tuple[float, float]]:
+def get_tolerances(
+    dtype: torch.dtype,
+    kernel_size: tuple[int, int, int] | None = None,
+) -> dict[str, tuple[float, float]]:
     """
     Get standard (rtol, atol) tolerances for a given dtype.
+
+    Args:
+        dtype: Data type for the computation
+        kernel_size: Optional kernel size tuple. If provided and the kernel volume
+            exceeds 27 (3x3x3), kernel gradient tolerances are scaled up to account
+            for increased floating-point accumulation error.
 
     Returns a dict with keys:
         'forward': tolerances for forward pass comparison
@@ -103,12 +112,26 @@ def get_tolerances(dtype: torch.dtype) -> dict[str, tuple[float, float]]:
             "kernel_grad": (1e-10, 1e-12),
         }
     else:  # float32
+        # Base tolerances for small kernels
+        kernel_grad_tol = (5e-4, 5e-4)
+
+        # Scale kernel gradient tolerance for large kernels
+        # Larger kernels have more accumulation, leading to more FP error
+        if kernel_size is not None:
+            kernel_volume = kernel_size[0] * kernel_size[1] * kernel_size[2]
+            base_volume = 27  # 3x3x3 baseline
+            if kernel_volume > base_volume:
+                # Scale tolerance by sqrt of volume ratio (error grows sub-linearly)
+                scale = math.sqrt(kernel_volume / base_volume)
+                kernel_grad_tol = (5e-4 * scale, 5e-4 * scale)
+
         return {
             "forward": (1e-5, 1e-6),
             "input_grad": (1e-5, 1e-6),
             # Kernel gradients accumulate over all outputs, allowing more error
-            "kernel_grad": (5e-4, 5e-4),
+            "kernel_grad": kernel_grad_tol,
         }
+
 
 # =============================================================================
 # TF32 Control
