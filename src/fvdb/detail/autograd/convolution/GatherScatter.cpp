@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-#include <fvdb/detail/autograd/convolution/ConvGatherScatterBackendAG.h>
+#include <fvdb/detail/autograd/convolution/GatherScatter.h>
 #include <fvdb/detail/ops/convolution/backend/SparseConvolutionKernelMap.h>
 #include <fvdb/detail/ops/convolution/pack_info/ConvolutionKernelMap.h>
 #include <fvdb/detail/utils/Utils.h>
@@ -94,7 +94,7 @@ GatherScatterAutograd::topologyFromBackendConfig(BackendConfig config) -> Topolo
 
     c10::DeviceGuard guard{device};
 
-    auto const kernelVolume     = config.kernelSize[0] * config.kernelSize[1] * config.kernelSize[2];
+    auto const kernelVolume = config.kernelSize[0] * config.kernelSize[1] * config.kernelSize[2];
     auto const outputVoxelCount = config.targetGrid.total_voxels();
 
     // The kernel map is for each output voxel, kernel volume input indices, which may be -1.
@@ -103,8 +103,11 @@ GatherScatterAutograd::topologyFromBackendConfig(BackendConfig config) -> Topolo
                             -1,
                             torch::TensorOptions().dtype(torch::kInt32).device(device));
     FVDB_DISPATCH_KERNEL_DEVICE(device, [&]() {
-        detail::ops::dispatchConvolutionKernelMap<DeviceTag>(
-            *config.sourceGrid.implRawPtr(), *config.targetGrid.implRawPtr(), kmap, config.kernelSize, config.stride);
+        detail::ops::dispatchConvolutionKernelMap<DeviceTag>(*config.sourceGrid.implRawPtr(),
+                                                             *config.targetGrid.implRawPtr(),
+                                                             kmap,
+                                                             config.kernelSize,
+                                                             config.stride);
     });
     // SHAPE: [outputVoxelCount, kernelVolume]
 
@@ -181,9 +184,9 @@ GatherScatterAutograd::topologyFromBackendConfig(BackendConfig config) -> Topolo
 
 variable_list
 GatherScatterAutograd::forward(AutogradContext *ctx,
-                                    torch::Tensor inFeatures,
-                                    torch::Tensor kernels,
-                                    Topology topology) {
+                               torch::Tensor inFeatures,
+                               torch::Tensor kernels,
+                               Topology topology) {
     bool const middleAcceleration = topology.stride == nanovdb::Vec3i{1, 1, 1};
 
     _checkFeatures(inFeatures);
@@ -270,7 +273,6 @@ GatherScatterAutograd::backward(AutogradContext *ctx, variable_list grad_output)
 
     return {gradInput, gradWeight, torch::Tensor()};
 }
-
 
 } // namespace convolution
 } // namespace autograd

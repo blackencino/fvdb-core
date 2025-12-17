@@ -22,12 +22,13 @@ struct BackendConfig {
     nanovdb::Vec3i kernelSize;
     nanovdb::Vec3i stride;
 
-    BackendConfig to(torch::Device device) const {
+    BackendConfig
+    to(torch::Device device) const {
         return BackendConfig{
             .sourceGrid = sourceGrid.to(device),
             .targetGrid = targetGrid.to(device),
             .kernelSize = kernelSize,
-            .stride = stride,
+            .stride     = stride,
         };
     }
 };
@@ -36,6 +37,5 @@ struct BackendConfig {
 } // namespace autograd
 } // namespace detail
 } // namespace fvdb
-
 
 #endif // FVDB_DETAIL_AUTOGRAD_CONVOLUTION_BACKENDCONFIG_H

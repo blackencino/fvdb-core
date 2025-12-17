@@ -6,38 +6,39 @@
 
 namespace fvdb {
 
-using detail::autograd::convolution::BackendConfig;
-using detail::autograd::convolution::GatherScatterAutograd;
+using namespace detail::autograd::convolution;
 
-GatherScatterBackend GatherScatterBackend::create(GridBatch sourceGrid,
-    GridBatch targetGrid,
-    nanovdb::Vec3i kernelSize,
-    nanovdb::Vec3i stride,
-    std::map<std::string, std::string> const& expertConfig) {
-
+ConvBackendGatherScatter
+ConvBackendGatherScatter::create(GridBatch sourceGrid,
+                                 GridBatch targetGrid,
+                                 nanovdb::Vec3i kernelSize,
+                                 nanovdb::Vec3i stride,
+                                 std::map<std::string, std::string> const &expertConfig) {
     BackendConfig const config{
         .sourceGrid = sourceGrid,
         .targetGrid = targetGrid,
         .kernelSize = kernelSize,
-        .stride = stride,
+        .stride     = stride,
     };
 
     auto const topology = GatherScatterAutograd::topologyFromBackendConfig(config);
 
-    return GatherScatterBackend{
-        .config = config,
+    return ConvBackendGatherScatter{
+        .config   = config,
         .topology = topology,
     };
 }
 
-GatherScatterBackend GatherScatterBackend::to(torch::Device device) const {
-    return GatherScatterBackend{
-        .config = config.to(device),
+ConvBackendGatherScatter
+ConvBackendGatherScatter::to(torch::Device device) const {
+    return ConvBackendGatherScatter{
+        .config   = config.to(device),
         .topology = topology.to(device),
     };
 }
 
-JaggedTensor GatherScatterBackend::execute(JaggedTensor const& input, torch::Tensor weights) const {
+JaggedTensor
+ConvBackendGatherScatter::execute(JaggedTensor const &input, torch::Tensor weights) const {
     auto flat = GatherScatterAutograd::apply(input.jdata(), weights, topology)[0];
     return input.jagged_like(flat);
 }
