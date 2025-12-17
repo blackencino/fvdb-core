@@ -24,12 +24,19 @@ struct BackendConfig {
 
     BackendConfig
     to(torch::Device device) const {
-        return BackendConfig{
-            .sourceGrid = sourceGrid.to(device),
-            .targetGrid = targetGrid.to(device),
-            .kernelSize = kernelSize,
-            .stride     = stride,
-        };
+        BackendConfig ret;
+        ret.sourceGrid = sourceGrid.to(device);
+        // Make sure that if the target grid is aliasing the source grid, we preserve that
+        // relationship. This won't solve the problem of duplication of these grids if they're
+        // referenced externally, though.
+        if (sourceGrid.address() == targetGrid.address()) {
+            ret.targetGrid = ret.sourceGrid;
+        } else {
+            ret.targetGrid = targetGrid.to(device);
+        }
+        ret.kernelSize = kernelSize;
+        ret.stride = stride;
+        return ret;
     }
 };
 

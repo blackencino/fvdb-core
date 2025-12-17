@@ -31,6 +31,7 @@ struct ConvBackendGatherScatter {
     ConvBackendGatherScatter to(torch::Device device) const;
 
     JaggedTensor execute(JaggedTensor const &input, torch::Tensor weights) const;
+    torch::Tensor execute_flat(torch::Tensor input, torch::Tensor weights) const;
 };
 
 } // namespace fvdb

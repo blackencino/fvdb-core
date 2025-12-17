@@ -6,6 +6,8 @@
 
 #include <fvdb/ConvolutionBackends.h>
 
+#include <array>
+
 #include <torch/extension.h>
 
 void
@@ -51,16 +53,32 @@ bind_convolution(py::module &m) {
     py::class_<fvdb::ConvBackendGatherScatter>(m, "ConvBackendGatherScatter")
         .def_readonly("config", &fvdb::ConvBackendGatherScatter::config)
         .def_readonly("topology", &fvdb::ConvBackendGatherScatter::topology)
-        .def_static("create",
-                    &fvdb::ConvBackendGatherScatter::create,
-                    py::arg("source_grid"),
-                    py::arg("target_grid"),
-                    py::arg("kernel_size"),
-                    py::arg("stride"),
-                    py::arg("expert_config") = std::map<std::string, std::string>{})
+        .def_static(
+            "create",
+            [](fvdb::GridBatch sourceGrid,
+               fvdb::GridBatch targetGrid,
+               std::array<int, 3> kernelSize,
+               std::array<int, 3> stride,
+               std::map<std::string, std::string> const &expertConfig) {
+                return fvdb::ConvBackendGatherScatter::create(
+                    sourceGrid,
+                    targetGrid,
+                    nanovdb::Vec3i(kernelSize[0], kernelSize[1], kernelSize[2]),
+                    nanovdb::Vec3i(stride[0], stride[1], stride[2]),
+                    expertConfig);
+            },
+            py::arg("source_grid"),
+            py::arg("target_grid"),
+            py::arg("kernel_size"),
+            py::arg("stride"),
+            py::arg("expert_config") = std::map<std::string, std::string>{})
         .def("to", &fvdb::ConvBackendGatherScatter::to, py::arg("device"))
         .def("execute",
              &fvdb::ConvBackendGatherScatter::execute,
+             py::arg("input"),
+             py::arg("weights"))
+        .def("execute_flat",
+             &fvdb::ConvBackendGatherScatter::execute_flat,
              py::arg("input"),
              py::arg("weights"));
 }

@@ -37,10 +37,14 @@ ConvBackendGatherScatter::to(torch::Device device) const {
     };
 }
 
+torch::Tensor
+ConvBackendGatherScatter::execute_flat(torch::Tensor input, torch::Tensor weights) const {
+    return GatherScatterAutograd::apply(input, weights, topology)[0];
+}
+
 JaggedTensor
 ConvBackendGatherScatter::execute(JaggedTensor const &input, torch::Tensor weights) const {
-    auto flat = GatherScatterAutograd::apply(input.jdata(), weights, topology)[0];
-    return input.jagged_like(flat);
+    return config.targetGrid.jagged_like(execute_flat(input.jdata(), weights));
 }
 
 } // namespace fvdb

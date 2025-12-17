@@ -16,6 +16,7 @@ from fvdb.types import NumericMaxRank1, ValueConstraint, to_Vec3i
 
 from fvdb import Grid, GridBatch, JaggedTensor
 
+from ._fvdb_cpp import ConvBackendGatherScatter as ConvBackendGatherScatterCpp
 from ._fvdb_cpp import ConvPackBackend
 from ._fvdb_cpp import JaggedTensor as JaggedTensorCpp
 from ._fvdb_cpp import SparseConvPackInfo as SparseConvPackInfoCpp
@@ -127,6 +128,8 @@ class ConvolutionPlan:
     _expert_config: dict[str, Any]
     _backend: ConvPackBackend
 
+    _refactor_backend: ConvBackendGatherScatterCpp | None
+
     @classmethod
     def from_grid_batch(
         cls,
@@ -204,7 +207,13 @@ class ConvolutionPlan:
 
         transposed = False
         backend = cls._configure_backend(pack_info, channel_pairs, transposed, expert_config)
-        return cls(pack_info, channel_pairs, transposed, expert_config, backend)
+
+        kernel_size_tuple = (int(kernel_size[0].item()), int(kernel_size[1].item()), int(kernel_size[2].item()))
+        stride_tuple = (int(stride[0].item()), int(stride[1].item()), int(stride[2].item()))
+        refactor_backend = ConvBackendGatherScatterCpp.create(
+            source_grid._impl, target_grid._impl, kernel_size_tuple, stride_tuple, {}
+        )
+        return cls(pack_info, channel_pairs, transposed, expert_config, backend, refactor_backend)
 
     @classmethod
     def from_grid_batch_transposed(
@@ -286,7 +295,7 @@ class ConvolutionPlan:
 
         transposed = True
         backend = cls._configure_backend(pack_info, channel_pairs, transposed, expert_config)
-        return cls(pack_info, channel_pairs, transposed, expert_config, backend)
+        return cls(pack_info, channel_pairs, transposed, expert_config, backend, None)
 
     @classmethod
     def from_grid(
@@ -371,7 +380,13 @@ class ConvolutionPlan:
 
         transposed = False
         backend = cls._configure_backend(pack_info, channel_pairs, transposed, expert_config)
-        return cls(pack_info, channel_pairs, transposed, expert_config, backend)
+
+        kernel_size_tuple = (int(kernel_size[0].item()), int(kernel_size[1].item()), int(kernel_size[2].item()))
+        stride_tuple = (int(stride[0].item()), int(stride[1].item()), int(stride[2].item()))
+        refactor_backend = ConvBackendGatherScatterCpp.create(
+            source_grid._impl, target_grid._impl, kernel_size_tuple, stride_tuple, {}
+        )
+        return cls(pack_info, channel_pairs, transposed, expert_config, backend, refactor_backend)
 
     @classmethod
     def from_grid_transposed(
@@ -451,7 +466,7 @@ class ConvolutionPlan:
 
         transposed = True
         backend = cls._configure_backend(pack_info, channel_pairs, transposed, expert_config)
-        return cls(pack_info, channel_pairs, transposed, expert_config, backend)
+        return cls(pack_info, channel_pairs, transposed, expert_config, backend, None)
 
     @classmethod
     def from_plan_transposed(cls, plan: "ConvolutionPlan") -> "ConvolutionPlan":
@@ -499,7 +514,7 @@ class ConvolutionPlan:
 
         t_pack_info = SparseConvPackInfoCpp(kernel_size, stride, source_grid, target_grid)
         t_backend = cls._configure_backend(t_pack_info, channel_pairs, transposed, expert_config)
-        return cls(t_pack_info, channel_pairs, transposed, expert_config, t_backend)
+        return cls(t_pack_info, channel_pairs, transposed, expert_config, t_backend, None)
 
     def valid_usage(
         self,
@@ -627,7 +642,13 @@ class ConvolutionPlan:
             if self._transposed:
                 result = JaggedTensor(impl=self._pack_info.sparse_transpose_conv_3d(data._impl, weights, self._backend))
             else:
-                result = JaggedTensor(impl=self._pack_info.sparse_conv_3d(data._impl, weights, self._backend))
+                if self._refactor_backend is not None:
+                    print("Using refactor backend")
+                    print(f"Input data shape: {data.jdata.shape}")
+                    result = JaggedTensor(impl=self._refactor_backend.execute(data._impl, weights))
+                    print(f"Output data shape: {result.jdata.shape}")
+                else:
+                    result = JaggedTensor(impl=self._pack_info.sparse_conv_3d(data._impl, weights, self._backend))
 
         if is_flat:
             return result.jdata
