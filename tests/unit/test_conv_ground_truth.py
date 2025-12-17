@@ -89,7 +89,7 @@ class TestConvGroundTruth(unittest.TestCase):
     Validate PyTorch conv3d behavior that we rely on as ground truth.
 
     These tests verify our understanding of:
-    - Cross-correlation semantics (impulse → flipped kernel)
+    - Cross-correlation semantics (impulse -> flipped kernel)
     - Backward pass gradient computation
     - Strided convolution coordinate mapping
     """
@@ -303,7 +303,7 @@ class TestConvGroundTruth(unittest.TestCase):
 
         self.assertEqual(input_grad_region.shape, kernel.shape)
 
-        # Input gradient should match the kernel (conv_transpose flips → unflips)
+        # Input gradient should match the kernel (conv_transpose flips -> unflips)
         tols = get_tolerances(dtype)
         torch.testing.assert_close(input_grad_region, kernel, rtol=tols["input_grad"][0], atol=tols["input_grad"][1])
 
@@ -725,7 +725,7 @@ class TestConvGroundTruth(unittest.TestCase):
 
         self.assertEqual(grad_region.shape, kernel_size)
 
-        # Gradient should match the kernel (conv_transpose flips → unflips)
+        # Gradient should match the kernel (conv_transpose flips -> unflips)
         tols = get_tolerances(dtype)
         torch.testing.assert_close(grad_region, kernel, rtol=tols["input_grad"][0], atol=tols["input_grad"][1])
 

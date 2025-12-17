@@ -35,7 +35,7 @@ struct BackendConfig {
             ret.targetGrid = targetGrid.to(device);
         }
         ret.kernelSize = kernelSize;
-        ret.stride = stride;
+        ret.stride     = stride;
         return ret;
     }
 };

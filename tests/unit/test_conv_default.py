@@ -100,7 +100,7 @@ def diagnose_tensor_mismatch(
             a_val: float = flat_actual[i].item()
             e_val: float = flat_expected[i].item()
             diff: float = flat_abs_diff[i].item()
-            lines.append(f"  idx={i}: actual={a_val:.6f}, expected={e_val:.6f}, Δ={diff:.6e}")
+            lines.append(f"  idx={i}: actual={a_val:.6f}, expected={e_val:.6f}, diff={diff:.6e}")
 
     lines.append(f"{'='*60}\n")
     return "\n".join(lines)

@@ -2,3 +2,10 @@ You are working in a project that requires a specific Conda environment.
 ALWAYS activate the 'fvdb' environment before running any python commands or installation steps.
 Command to activate: `source ~/miniforge3/etc/profile.d/conda.sh && conda activate fvdb`
 
+rule("no-non-ascii") {
+    message = "Non-ASCII characters are not allowed in any generated or human-modifiable file (including code, build systems, documentation, readmes, etc). Only allow non-ASCII if the file type explicitly requires them."
+    pattern = /[^\x00-\x7F]+/
+    severity = "error"
+    applies_to = "all_human_editable"
+}
+

@@ -6,9 +6,9 @@
 
 #include <fvdb/ConvolutionBackends.h>
 
-#include <array>
-
 #include <torch/extension.h>
+
+#include <array>
 
 void
 bind_convolution(py::module &m) {
