@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+#include "fvdb/detail/autograd/Common.h"
+
 #include <fvdb/detail/autograd/convolution/GatherScatter.h>
 #include <fvdb/detail/ops/convolution/backend/SparseConvolutionKernelMap.h>
 #include <fvdb/detail/ops/convolution/pack_info/ConvolutionKernelMap.h>
@@ -273,6 +275,117 @@ GatherScatterAutograd::backward(AutogradContext *ctx, variable_list grad_output)
 
     return {gradInput, gradWeight, torch::Tensor()};
 }
+
+// =======================================================
+// Implementation of GatherScatterTransposedAutograd methods
+// =======================================================
+
+// auto
+// GatherScatterTransposedAutograd::topologyFromUntransposedTopology(Topology untransposedTopology)
+// -> Topology {
+//     return untransposedTopology;
+// }
+
+// auto
+// GatherScatterTransposedAutograd::topologyFromBackendConfig(BackendConfig config) -> Topology {
+//     return
+//     topologyFromUntransposedTopology(GatherScatterAutograd::topologyFromBackendConfig(config));
+// }
+
+// variable_list
+// GatherScatterTransposedAutograd::forward(
+//     AutogradContext *ctx,
+//     torch::Tensor inFeatures,
+//     torch::Tensor kernels,
+//     Topology topology)
+// {
+//     bool const middleAcceleration = topology.stride == nanovdb::Vec3i{1, 1, 1};
+
+//     _checkFeatures(inFeatures);
+//     auto const inC = inFeatures.size(1);
+
+//     auto const nbsizes_cpu_contiguous = topology.neighborSizes.cpu().contiguous();
+//     _checkTopology(topology.neighborMap, nbsizes_cpu_contiguous);
+
+//     // Reorder the memory, but don't erase dimensions
+//     auto const reshapedKernels = kernels.permute({2, 3, 4, 1, 0}).contiguous();
+//     _checkReshapedKernels(reshapedKernels, inC);
+//     auto const outC = reshapedKernels.size(4);
+
+//     // Save, which will preserve the various sizes, but also cache the work of making the
+//     // permutation contigous.
+//     ctx->save_for_backward({inFeatures, reshapedKernels});
+//     ctx->saved_data["nbmaps"]  = topology.neighborMap;
+//     ctx->saved_data["nbsizes"] = nbsizes_cpu_contiguous;
+
+//     torch::Tensor output;
+//     auto const opts = tensorOptionsFrom(inFeatures);
+//     if (topology.targetTotalVoxelCount > 0) {
+//         output = torch::zeros({topology.targetTotalVoxelCount, outC}, opts);
+
+//         FVDB_DISPATCH_KERNEL_DEVICE(inFeatures.device(), [&]() {
+//             ops::dispatchSparseConvolutionKernelMap<DeviceTag>(
+//                 inFeatures,
+//                 output,
+//                 reshapedKernels.reshape({-1, inC, outC}),
+//                 topology.neighborMap,
+//                 nbsizes_cpu_contiguous,
+//                 false,
+//                 middleAcceleration);
+//         });
+//     } else {
+//         output = torch::empty({0, outC}, opts);
+//     }
+
+//     return {output};
+// }
+
+// variable_list
+// GatherScatterTransposedAutograd::backward(
+//     AutogradContext *ctx,
+//     variable_list grad_output)
+// {
+//     // Use data saved in forward
+//     variable_list saved        = ctx->get_saved_variables();
+//     auto const inFeatures      = saved.at(0);
+//     auto const reshapedKernels = saved.at(1);
+//     auto const nbmaps          = ctx->saved_data["nbmaps"].toTensor();
+//     auto const nbsizes         = ctx->saved_data["nbsizes"].toTensor();
+//     auto const gradOut         = grad_output.at(0);
+
+//     auto const k0   = reshapedKernels.size(0);
+//     auto const outC = reshapedKernels.size(1);
+//     auto const inC  = reshapedKernels.size(2);
+
+//     _checkFeatures(inFeatures);
+//     _checkReshapedKernels(reshapedKernels, outC, inC); // flipped for transposed
+//     _checkTopology(nbmaps, nbsizes);
+
+//     auto gradInput  = torch::zeros_like(inFeatures);
+//     auto gradWeight = torch::zeros_like(reshapedKernels);
+
+//     if (gradOut.size(0) != 0) {
+//         FVDB_DISPATCH_KERNEL_DEVICE(gradOut.device(), [&]() {
+//             ops::dispatchSparseConvolutionKernelMapGradTransposed<DeviceTag>(
+//                 inFeatures,
+//                 gradInput,
+//                 gradOut.contiguous(),
+//                 reshapedKernels,
+//                 gradWeight,
+//                 nbmaps,
+//                 nbsizes
+//             );
+//         });
+//     }
+
+//     // The reshaped kernels were permuted as (k0*k1*k2, outC, inC)
+//     // Undo permutation to return gradient in original kernel shape (k0, k1, k2, inC, outC)
+//     gradWeight = gradWeight.reshape({k0, 1, 1, outC, inC}).permute({0, 1, 2, 4, 3});
+//     // But need to reshape to (k0, k1, k2, inC, outC). If k1, k2 > 1, this will expand correctly.
+//     // For now, assume single spatial dimension per above; adjust if needed.
+
+//     return {gradInput, gradWeight, torch::Tensor()};
+// }
 
 } // namespace convolution
 } // namespace autograd

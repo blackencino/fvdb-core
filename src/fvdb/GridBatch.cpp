@@ -803,6 +803,13 @@ GridBatch::conv_grid(Vec3iOrScalar kernel_size, Vec3iOrScalar stride) const {
 }
 
 GridBatch
+GridBatch::conv_transpose_grid(Vec3iOrScalar kernel_size, Vec3iOrScalar stride) const {
+    GridBatch result;
+    result.mImpl = mImpl->convolutionTransposeOutput(kernel_size.value(), stride.value());
+    return result;
+}
+
+GridBatch
 GridBatch::dilated_grid(const int dilation) const {
     GridBatch result;
     result.mImpl = mImpl->dilate(dilation);

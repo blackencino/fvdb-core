@@ -50,6 +50,20 @@ struct GatherScatterAutograd : public Function<GatherScatterAutograd> {
     static variable_list backward(AutogradContext *ctx, variable_list grad_output);
 };
 
+// struct GatherScatterTransposedAutograd : public Function<GatherScatterTransposedAutograd> {
+//     using Topology = GatherScatterAutograd::Topology;
+
+//     static Topology topologyFromBackendConfig(BackendConfig config);
+//     static Topology topologyFromUntransposedTopology(Topology untransposedTopology);
+
+//     static variable_list forward(AutogradContext *ctx,
+//                                  torch::Tensor inFeatures,
+//                                  torch::Tensor kernels,
+//                                  Topology topology);
+
+//     static variable_list backward(AutogradContext *ctx, variable_list grad_output);
+// };
+
 } // namespace convolution
 } // namespace autograd
 } // namespace detail
