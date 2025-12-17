@@ -19,6 +19,38 @@ namespace fvdb {
 
 enum ConvPackBackend { GATHER_SCATTER, IGEMM, CUTLASS, LGGS, HALO, DENSE, MATMUL };
 
+/*
+
+Thoughts about how to handle simplification and refactor. Right now, on the
+python side we have a "convolution plan" which is instantiated from the
+source and target grids, the kernel size and stride, a transposed flag,
+and then a bunch of "expert config" options which are used to theoretically
+select the correct backend.
+
+The convolution plan is immutable, and after it is constructed from the
+factory methods from the init components above, it has this information:
+
+    _pack_info: SparseConvPackInfoCpp
+    _channel_pairs: tuple[tuple[int, int], ...]
+    _transposed: bool
+    _expert_config: dict[str, Any]
+    _backend: ConvPackBackend
+
+The pack info in an instance of the class below, which is effectively a
+variant, though at a component level. The channel pairs are meaningful to
+some backends but not others, as is the expert config dictionary. The
+actual backend flag is redundant against the pack info.
+
+I intend to refactor this so that there's a ConvolutionBackend abstract base class
+in python, which internally contains an instance of the C++ backend components
+that it requires to operate. The C++ components will be functional and not have
+class taxonomy, that will be handled at the python level only. Then the
+convolution plan ends up just being mostly an instance of the ConvolutionBackend
+class.
+
+
+*/
+
 // =============================================================================
 // Legacy SparseConvPackInfo (kept for backward compatibility)
 // =============================================================================

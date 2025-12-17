@@ -38,6 +38,7 @@ execute_process(
 # Source files
 set(FVDB_CPP_FILES
     fvdb/Config.cpp
+    fvdb/ConvolutionBackends.cpp
     fvdb/detail/autograd/AvgPoolGrid.cpp
     fvdb/detail/autograd/EvaluateSphericalHarmonics.cpp
     fvdb/detail/autograd/Inject.cpp

@@ -4,6 +4,10 @@
 #ifndef FVDB_DETAIL_AUTOGRAD_COMMON_H
 #define FVDB_DETAIL_AUTOGRAD_COMMON_H
 
+#include <fvdb/GridBatch.h>
+
+#include <nanovdb/math/Math.h>
+
 #include <torch/autograd.h>
 #include <torch/types.h>
 

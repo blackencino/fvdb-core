@@ -33,6 +33,7 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/src/)
 # Source files
 set(FVDB_BINDINGS_CPP_FILES
     src/python/Bindings.cpp
+    src/python/ConvolutionBinding.cpp
     src/python/FusedSSIMBinding.cpp
     src/python/GaussianSplatBinding.cpp
     src/python/GridBatchBinding.cpp
