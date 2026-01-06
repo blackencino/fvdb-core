@@ -11,9 +11,183 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/types.h>
+#include <dlpack/dlpack.h>
 
 #include <algorithm>
 #include <variant>
+
+
+namespace sketch {
+
+
+enum class ValueType {
+    Int,
+    Float,
+    Double,
+};
+
+static constexpr int ValueTypeCount = 3;
+
+int value_type_to_index(ValueType value_type) {
+    switch (value_type) {
+        case ValueType::Int:
+            return 2;
+        case ValueType::Float:
+            return 0;
+        case ValueType::Double:
+            return 1;
+    }
+}
+
+template <typename T>
+struct ValueTypeTraits;
+
+template <>
+struct ValueTypeTraits<int> {
+    static constexpr ValueType value_type = ValueType::Int;
+};
+
+template <>
+struct ValueTypeTraits<float> {
+    static constexpr ValueType value_type = ValueType::Float;
+};
+
+template <> struct ValueTypeTraits<double> {
+    static constexpr ValueType value_type = ValueType::Double;
+};
+
+
+// Indexer is a standalone type. No customization needed.
+struct ValueTypeIndexer {
+    using key_type = ValueType;
+    static constexpr size_t count = 3;
+
+    static constexpr size_t index(ValueType vt) {
+        switch (vt) {
+            case ValueType::Int:    return 2;
+            case ValueType::Float:  return 0;
+            case ValueType::Double: return 1;
+        }
+        return count;
+    }
+};
+
+
+struct ValueTypeKeyTraits {
+    template <typename T>
+    static constexpr auto key() {
+        if constexpr (std::is_same_v<T, int>)    return ValueType::Int;
+        else if constexpr (std::is_same_v<T, float>)  return ValueType::Float;
+        else if constexpr (std::is_same_v<T, double>) return ValueType::Double;
+        else static_assert(sizeof(T) == 0, "Unsupported type");
+    }
+};
+
+// Jump table derives KeyType FROM the indexer - no redundant parameters
+template <typename IndexerType, typename... Args>
+struct ImplJumpTable {
+    using key_type = typename IndexerType::key_type;
+    static constexpr size_t count = IndexerType::count;
+    using function_type = void (*)(Args...);
+
+    function_type functions[count]{};
+
+    void set(key_type key, function_type fn) {
+        functions[IndexerType::index(key)] = fn;
+    }
+
+    void where_null_set(function_type fn) {
+        for (size_t i = 0; i < count; ++i) {
+            if (!functions[i]) functions[i] = fn;
+        }
+    }
+
+    void operator()(key_type key, Args... args) const {
+        auto idx = IndexerType::index(key);
+        if (idx < count && functions[idx]) {
+            functions[idx](args...);
+        } else {
+            throw std::runtime_error("No implementation for key");
+        }
+    }
+};
+
+template <typename Op, typename... SupportedTypes>
+auto make_dispatch_table() {
+    typename Op::table_type table;
+
+    (table.set(
+        Op::KeyTraits::template key<SupportedTypes>,
+        &Op::template invoke<SupportedTypes>
+    ), ...);
+
+    table.where_null_set(&Op::invoke_fallback);
+    return table;
+}
+
+template <typename T>
+struct TypedArrayView {
+    int64_t count = 0;
+    T const* data = nullptr;
+
+    int64_t size() const { return count; }
+    T const& operator[](int64_t index) const { return data[index]; }
+};
+
+struct GenericArrayView {
+    int64_t count = 0;
+    void const* data = nullptr;
+    ValueType value_type = ValueType::Int;
+
+    template <typename T>
+    TypedArrayView<T> as() const {
+        return TypedArrayView<T>{count, static_cast<T const*>(data)};
+    }
+};
+
+void razzle_impl(TypedArrayView<int> view) {
+    printf("Razzle INTEGER. Count: %lld, first value: %d\n", view.size(), view[0]);
+}
+
+void razzle_impl(TypedArrayView<float> view) {
+    printf("Razzle FLOAT. Count: %lld, first value: %f\n", view.size(), view[0]);
+}
+
+template <typename T>
+void razzle_impl(TypedArrayView<T> view) {
+    printf("Razzle GENERIC. Count: %lld, can't print values\n", view.size());
+}
+
+
+// The Op is fully self-describing.
+struct RazzleOp {
+    // Configuration
+    using Indexer = ValueTypeIndexer;
+    using KeyTraits = ValueTypeKeyTraits;
+
+    // This defines the function signature (GenericArrayView here)
+    using table_type = ImplJumpTable<Indexer, GenericArrayView>;
+
+    // Type-specific dispatch - signature must match table_type's function_type
+    template <typename T>
+    static void invoke(GenericArrayView view) {
+        razzle_impl(view.as<T>());
+    }
+
+    // Fallback
+    static void invoke_fallback(GenericArrayView view) {
+        razzle_impl<void>(view.as<void>());
+    }
+};
+
+void razzle(GenericArrayView const& view) {
+    static auto razzle_table = make_dispatch_table<RazzleOp, int, float>();
+    razzle_table(view.value_type, view);
+}
+
+} // namespace sketch
+
+
 
 namespace fvdb {
 namespace detail {
