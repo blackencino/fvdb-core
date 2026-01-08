@@ -162,6 +162,10 @@ using BlubAxes        = AxisProduct<BlubDeviceAxis, BlubScalarTypeAxis, BlubScal
 using BlubSignature   = torch::Tensor(torch::Tensor, torch::ScalarType);
 using BlubFunctionPtr = BlubSignature *;
 
+
+template <auto... Values>
+struct ValuePack {};
+
 // -------------------------------------------------------------------------
 // Factory: a template lambda that maps axis types to a function pointer.
 // This uses C++20 template lambdas, which is safe here since this section
@@ -188,8 +192,7 @@ constexpr auto blub_impl_factory =
 };
 
 template <torch::DeviceType DeviceValue, torch::ScalarType InStype, torch::ScalarType OutStype>
-struct BlubCall {
-    using value_pack_type = ValuePack<DeviceValue, InStype, OutStype>;
+struct BlubCall : ValuePack<DeviceValue, InStype, OutStype>{
     static torch::Tensor call(torch::Tensor in, torch::ScalarType out_dtype) {
         torch::Tensor out = torch::empty_like(in, in.options().dtype(out_dtype));
         auto concrete_in  = concrete<DeviceValue, InStype, 1>(in);
@@ -199,9 +202,6 @@ struct BlubCall {
     }
 };
 
-template <auto... Values>
-struct ValuePack {};
-
 template <typename Axes, typename ValuesT>
 struct _bind_helper;
 
@@ -210,19 +210,19 @@ struct _bind_helper<Axes, ValuePack<Values...>> {
     static constexpr auto index = Axes::index_of_values(Values...);
 };
 
+template <typename Table, typename CallOrCalls>
+struct NewBinding;
+
 template <typename Table, typename Call>
-struct NewBinding {
+struct NewBinding<Table, Call> {
     using function_ptr_type = Table::FunctionPtr;
     using axes_type = typename Table::Axes;
-    using value_pack_type = typename Call::value_pack_type;
 
     static void bind(Table &table) {
         function_ptr_type fn_ptr = Call::call;
-        table.table_[_bind_helper<axes_type, value_pack_type>::index] = fn_ptr;
+        table.table_[_bind_helper<axes_type, Call>::index] = fn_ptr;
     }
 };
-
-
 
 template <typename Table, typename... Calls>
 struct NewBindings {
