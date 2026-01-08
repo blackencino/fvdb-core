@@ -11,11 +11,6 @@ namespace fvdb {
 namespace dispatch {
 namespace example {
 
-// -------------------------------------------------------------------------
-// CPU-only implementations (no CUDA accessor types needed)
-// All tensor parameters use enum values for dtype.
-// -------------------------------------------------------------------------
-
 void
 blub_impl(TorchDeviceCpuTag, CpuTensor<torch::kFloat32, 1> in, CpuTensor<torch::kInt32, 1> out) {
     printf("blub_impl(Cpu, kFloat32, kInt32)\n");
@@ -51,11 +46,6 @@ template void blub_impl<torch::kFloat64>(TorchDeviceCpuTag,
                                          CpuTensor<torch::kFloat64, 1>,
                                          CpuTensor<torch::kFloat64, 1>);
 
-// -------------------------------------------------------------------------
-// CUDA implementation (requires nvcc for PackedTensorAccessor types)
-// All tensor parameters use enum values for dtype.
-// -------------------------------------------------------------------------
-
 void
 blub_impl(TorchDeviceCudaTag, CudaTensor<torch::kFloat32, 1> in, CudaTensor<torch::kInt32, 1> out) {
     printf("blub_impl(Cuda, kFloat32, kInt32)\n");
@@ -65,12 +55,6 @@ blub_impl(TorchDeviceCudaTag, CudaTensor<torch::kFloat32, 1> in, CudaTensor<torc
            (long)in_accessor.size(0),
            (long)out_accessor.size(0));
 }
-
-// -------------------------------------------------------------------------
-// Device-generic template for double->int conversion
-// Template definition here since it uses ConcreteTensor<DeviceTag, DtypeTag, Rank>
-// Both CPU and CUDA instantiations provided here to satisfy ODR.
-// -------------------------------------------------------------------------
 
 template <torch::DeviceType DeviceValue>
 void
@@ -92,6 +76,72 @@ template void blub_impl<torch::kCUDA>(Tag<torch::kCUDA>,
                                       ConcreteTensor<torch::kCUDA, torch::kFloat64, 1>,
                                       ConcreteTensor<torch::kCUDA, torch::kInt32, 1>);
 
+//---------------------------------------------------------------------------------
+// SECOND WAY: Struct with statics
+//---------------------------------------------------------------------------------
+void
+Blub:impl(TorchDeviceCpuTag, CpuTensor<torch::kFloat32, 1> in, CpuTensor<torch::kInt32, 1> out) {
+    printf("Blub::impl(Cpu, kFloat32, kInt32)\n");
+    auto in_accessor  = accessor(in);
+    auto out_accessor = accessor(out);
+    // Verify accessors work by accessing size
+    printf("  in.size(0)=%ld, out.size(0)=%ld\n", in_accessor.size(0), out_accessor.size(0));
+}
+
+template <torch::ScalarType Dtype>
+void
+Blub::impl(TorchDeviceCpuTag, CpuTensor<Dtype, 1> in, CpuTensor<Dtype, 1> out) {
+    printf("generic same-type Blub::impl(Cpu, dtype=%d)\n", static_cast<int>(Dtype));
+    auto in_accessor  = accessor(in);
+    auto out_accessor = accessor(out);
+    // Verify accessors work by accessing size
+    printf("  in.size(0)=%ld, out.size(0)=%ld\n", in_accessor.size(0), out_accessor.size(0));
+}
+
+Blub::impl(TorchDeviceCudaTag, CudaTensor<torch::kFloat32, 1> in, CudaTensor<torch::kInt32, 1> out) {
+    printf("Blub::impl(Cuda, kFloat32, kInt32)\n");
+    auto in_accessor  = accessor(in);
+    auto out_accessor = accessor(out);
+    printf("  in.size(0)=%ld, out.size(0)=%ld\n",
+           (long)in_accessor.size(0),
+           (long)out_accessor.size(0));
+}
+
+template <torch::DeviceType DeviceValue>
+void
+Blub::impl(Tag<DeviceValue>,
+          ConcreteTensor<DeviceValue, torch::kFloat64, 1> in,
+          ConcreteTensor<DeviceValue, torch::kInt32, 1> out) {
+    printf("any-device kFloat64->kInt32 Blub::impl(%d)\n", static_cast<int>(DeviceValue));
+    auto in_accessor  = accessor(in);
+    auto out_accessor = accessor(out);
+    printf("  in.size(0)=%ld, out.size(0)=%ld\n",
+           (long)in_accessor.size(0),
+           (long)out_accessor.size(0));
+}
+
+template void Blub::impl<torch::kInt32>(TorchDeviceCpuTag,
+    CpuTensor<torch::kInt32, 1>,
+    CpuTensor<torch::kInt32, 1>);
+template void Blub::impl<torch::kInt64>(TorchDeviceCpuTag,
+    CpuTensor<torch::kInt64, 1>,
+    CpuTensor<torch::kInt64, 1>);
+template void Blub::impl<torch::kFloat16>(TorchDeviceCpuTag,
+      CpuTensor<torch::kFloat16, 1>,
+      CpuTensor<torch::kFloat16, 1>);
+template void Blub::impl<torch::kFloat32>(TorchDeviceCpuTag,
+      CpuTensor<torch::kFloat32, 1>,
+      CpuTensor<torch::kFloat32, 1>);
+template void Blub::impl<torch::kFloat64>(TorchDeviceCpuTag,
+      CpuTensor<torch::kFloat64, 1>,
+      CpuTensor<torch::kFloat64, 1>);
+
+template void Blub::impl<torch::kCPU>(Tag<torch::kCPU>,
+                                     ConcreteTensor<torch::kCPU, torch::kFloat64, 1>,
+                                     ConcreteTensor<torch::kCPU, torch::kInt32, 1>);
+template void Blub::impl<torch::kCUDA>(Tag<torch::kCUDA>,
+                                      ConcreteTensor<torch::kCUDA, torch::kFloat64, 1>,
+                                      ConcreteTensor<torch::kCUDA, torch::kInt32, 1>);
 // -------------------------------------------------------------------------
 // The following section requires C++20 template lambdas which nvcc doesn't
 // fully support (template lambdas converted to function pointers). This
@@ -106,9 +156,9 @@ template void blub_impl<torch::kCUDA>(Tag<torch::kCUDA>,
 // All axes use enum values, not C++ types.
 // -------------------------------------------------------------------------
 using BlubDeviceAxis = TorchDeviceDispatchAxis<torch::kCPU, torch::kCUDA>;
-using BlubDtypeAxis =
-    TorchDtypeAxis<torch::kInt32, torch::kInt64, torch::kFloat16, torch::kFloat32, torch::kFloat64>;
-using BlubAxes        = AxisProduct<BlubDeviceAxis, BlubDtypeAxis, BlubDtypeAxis>;
+using BlubScalarTypeAxis =
+    TorchScalarTypeAxis<torch::kInt32, torch::kInt64, torch::kFloat16, torch::kFloat32, torch::kFloat64>;
+using BlubAxes        = AxisProduct<BlubDeviceAxis, BlubScalarTypeAxis, BlubScalarTypeAxis>;
 using BlubSignature   = torch::Tensor(torch::Tensor, torch::ScalarType);
 using BlubFunctionPtr = BlubSignature *;
 
@@ -136,6 +186,53 @@ constexpr auto blub_impl_factory =
         return out;
     };
 };
+
+template <torch::DeviceType DeviceValue, torch::ScalarType InStype, torch::ScalarType OutStype>
+struct BlubCall {
+    using value_pack_type = ValuePack<DeviceValue, InStype, OutStype>;
+    static torch::Tensor call(torch::Tensor in, torch::ScalarType out_dtype) {
+        torch::Tensor out = torch::empty_like(in, in.options().dtype(out_dtype));
+        auto concrete_in  = concrete<DeviceValue, InStype, 1>(in);
+        auto concrete_out = concrete<DeviceValue, OutStype, 1>(out);
+        blub_impl(Tag<DeviceValue>{}, concrete_in, concrete_out);
+        return out;
+    }
+};
+
+template <auto... Values>
+struct ValuePack {};
+
+template <typename Axes, typename ValuesT>
+struct _bind_helper;
+
+template <typename Axes, typename... Values>
+struct _bind_helper<Axes, ValuePack<Values...>> {
+    static constexpr auto index = Axes::index_of_values(Values...);
+};
+
+template <typename Table, typename Call>
+struct NewBinding {
+    using function_ptr_type = Table::FunctionPtr;
+    using axes_type = typename Table::Axes;
+    using value_pack_type = typename Call::value_pack_type;
+
+    static void bind(Table &table) {
+        function_ptr_type fn_ptr = Call::call;
+        table.table_[_bind_helper<axes_type, value_pack_type>::index] = fn_ptr;
+    }
+};
+
+
+
+template <typename Table, typename... Calls>
+struct NewBindings {
+    static void bind(Table &table) {
+        (NewBinding<Table, Calls>::bind(table), ...);
+    }
+};
+
+template <typename Signature, typename Axes, typename... Calls>
+
 
 // -----------------------------------------------------------------------------
 // Operation-specific error handler for unsupported combinations.

@@ -34,6 +34,11 @@ template <torch::DeviceType Device, torch::ScalarType Stype, size_t Rank> struct
     }
 };
 
+template <torch::DeviceType Device, torch::ScalarType Stype, size_t Rank>
+ConcreteTensor<Device, Stype, Rank> concrete(torch::Tensor t) {
+    return ConcreteTensor<Device, Stype, Rank>{t};
+}
+
 // Convenience aliases using device tags and dtype enum values
 template <torch::ScalarType Stype, size_t Rank>
 using CpuTensor = ConcreteTensor<torch::kCPU, Stype, Rank>;
