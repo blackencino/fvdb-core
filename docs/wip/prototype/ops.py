@@ -14,7 +14,9 @@ from typing import Any, Callable
 
 import numpy as np
 
+from .layouts import flip as flip_layout
 from .layouts import indexed as indexed_layout
+from .layouts import struct_layout, StructElement
 from .types import (
     Dynamic,
     ElementType,
@@ -250,3 +252,177 @@ def Each(val: Value, fn: Callable[[Value], Value]) -> Value:
 
         result_type = Type(Shape(outer_extent), inner_type)
         return Value(result_type, results)
+
+
+# ---------------------------------------------------------------------------
+# FlipStruct -- data-level struct-of-arrays -> array-of-structs
+# ---------------------------------------------------------------------------
+
+@dataclass
+class StructValue:
+    """A single struct element: named fields, each a scalar or small array."""
+
+    fields: dict[str, Any]  # name -> numpy scalar or array
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "fields":
+            return object.__getattribute__(self, "fields")
+        flds = object.__getattribute__(self, "fields")
+        if name in flds:
+            return flds[name]
+        raise AttributeError(f"StructValue has no field '{name}'")
+
+    def __repr__(self) -> str:
+        inner = ", ".join(f"{k}={v}" for k, v in self.fields.items())
+        return f"StructValue({inner})"
+
+
+def FlipStruct(**fields: Value) -> Value:
+    """Build an array-of-structs Value from named arrays with compatible shapes.
+
+    This is the data-level counterpart of the type-level flip(struct(...)):
+    it takes separate named arrays (struct-of-arrays) and produces a single
+    Value whose type is the flipped struct and whose data can be accessed
+    per-element as structs.
+
+    All field Values must have the same outer iteration length.
+    """
+    if not fields:
+        raise TypeError("FlipStruct requires at least one field")
+
+    names = list(fields.keys())
+    values = list(fields.values())
+
+    # Type-level: build struct then flip
+    sty = struct_layout(**{k: v.type for k, v in fields.items()})
+    flipped_type = flip_layout(sty)
+
+    # Data-level: determine outer length and zip element-wise
+    first = values[0]
+    if isinstance(first.data, np.ndarray):
+        n = first.data.shape[0]
+    elif isinstance(first.data, list):
+        n = len(first.data)
+    else:
+        raise TypeError(f"Cannot determine length of {type(first.data)}")
+
+    # Verify all fields have the same outer length
+    for name, val in fields.items():
+        if isinstance(val.data, np.ndarray):
+            length = val.data.shape[0]
+        elif isinstance(val.data, list):
+            length = len(val.data)
+        else:
+            raise TypeError(f"Cannot determine length of field '{name}'")
+        if length != n:
+            raise TypeError(
+                f"Field '{name}' has length {length}, expected {n}"
+            )
+
+    # Build per-element structs
+    elements = []
+    for i in range(n):
+        elem_fields = {}
+        for name, val in fields.items():
+            if isinstance(val.data, np.ndarray):
+                elem_fields[name] = val.data[i]
+            else:
+                elem_fields[name] = val.data[i]
+        elements.append(StructValue(elem_fields))
+
+    return Value(flipped_type, elements)
+
+
+# ---------------------------------------------------------------------------
+# Decompose -- bitfield coordinate split for hierarchical grids
+# ---------------------------------------------------------------------------
+
+def Decompose(coord: Value, bit_widths: list[int]) -> Value:
+    """Split a global coordinate into sub-coordinates via bitfield extraction.
+
+    bit_widths is leaf-first: [leaf_bits, lower_bits, ...].
+    For bit_widths = [3, 4] (leaf=8, lower=16):
+      - leaf_local   = coord & 7           -- bottom 3 bits
+      - lower_local  = (coord >> 3) & 15   -- next 4 bits
+      - which_lower  = coord >> 7          -- remaining bits
+
+    Input:  (3,) i32  (a single 3D coordinate)
+    Output: StructValue with fields 'level_0', 'level_1', ..., 'which_top',
+            each a (3,) i32 sub-coordinate.
+
+    Also works batched: (*,r) i32 -> struct of (*,r) i32 arrays.
+    """
+    data = coord.data  # (3,) or (N, 3)
+
+    fields = {}
+    shift = 0
+    for i, bw in enumerate(bit_widths):
+        mask = (1 << bw) - 1
+        fields[f"level_{i}"] = ((data >> shift) & mask).astype(np.int32)
+        shift += bw
+    fields["which_top"] = (data >> shift).astype(np.int32)
+
+    # Build type: struct of sub-coord types matching input's element shape
+    field_types = {}
+    for name in fields:
+        field_types[name] = coord.type
+
+    sty = struct_layout(**field_types)
+    flipped = flip_layout(sty)
+
+    # Return as StructValue
+    return Value(flipped, StructValue(fields))
+
+
+# ---------------------------------------------------------------------------
+# Morton curve primitives
+# ---------------------------------------------------------------------------
+
+def _part1by2(x: np.ndarray) -> np.ndarray:
+    """Spread bits of x so that there are two zero bits between each."""
+    x = x.astype(np.int64)
+    x = x & 0x1FFFFF
+    x = (x | (x << 32)) & 0x1F00000000FFFF
+    x = (x | (x << 16)) & 0x1F0000FF0000FF
+    x = (x | (x << 8))  & 0x100F00F00F00F00F
+    x = (x | (x << 4))  & 0x10C30C30C30C30C3
+    x = (x | (x << 2))  & 0x1249249249249249
+    return x
+
+
+def _compact1by2(x: np.ndarray) -> np.ndarray:
+    """Inverse of _part1by2: extract every third bit."""
+    x = x.astype(np.int64)
+    x = x & 0x1249249249249249
+    x = (x | (x >> 2))  & 0x10C30C30C30C30C3
+    x = (x | (x >> 4))  & 0x100F00F00F00F00F
+    x = (x | (x >> 8))  & 0x1F0000FF0000FF
+    x = (x | (x >> 16)) & 0x1F00000000FFFF
+    x = (x | (x >> 32)) & 0x1FFFFF
+    return x.astype(np.int32)
+
+
+def morton3d(coord: np.ndarray) -> np.ndarray:
+    """Encode (3,) i32 or (N, 3) i32 coordinates to morton indices.
+
+    Returns i32 scalar or (N,) i32 array.
+    """
+    if coord.ndim == 1:
+        return (_part1by2(coord[0]) | (_part1by2(coord[1]) << 1) | (_part1by2(coord[2]) << 2)).astype(np.int32)
+    else:
+        return (_part1by2(coord[:, 0]) | (_part1by2(coord[:, 1]) << 1) | (_part1by2(coord[:, 2]) << 2)).astype(np.int32)
+
+
+def inv_morton3d(code: np.ndarray) -> np.ndarray:
+    """Decode morton index back to (3,) i32 or (N, 3) i32 coordinates."""
+    code = code.astype(np.int64)
+    if code.ndim == 0:
+        x = _compact1by2(code)
+        y = _compact1by2(code >> 1)
+        z = _compact1by2(code >> 2)
+        return np.array([x, y, z], dtype=np.int32)
+    else:
+        x = _compact1by2(code)
+        y = _compact1by2(code >> 1)
+        z = _compact1by2(code >> 2)
+        return np.stack([x, y, z], axis=1).astype(np.int32)

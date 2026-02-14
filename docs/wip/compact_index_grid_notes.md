@@ -125,6 +125,64 @@ representations differ, so the type system keeps them distinct.
 
 **Shape notation**: `(*, ~, 3)` = outer dynamic, middle jagged, inner static 3.
 
+### Shorthand vs. C++ type_traits comparison
+
+The compact notation maps directly to a C++20-style type traits encoding.
+The two notations describe the same thing -- one is terse for algebraic
+reasoning, the other is explicit for implementation.
+
+```
+Shorthand                    C++ (type_traits style)
+---------                    ----------------------
+i32                          Scalar<int32_t>
+(8, 8, 8) over i32          Iter<Shape<S<8>, S<8>, S<8>>, Scalar<int32_t>>
+(*) over (3) over i32       Iter<Shape<Dyn>, Iter<Shape<S<3>>, Scalar<int32_t>>>
+(*) over (~) over (3) i32   Iter<Shape<Dyn>, Iter<Shape<Jag>, Iter<Shape<S<3>>, Scalar<int32_t>>>>
+```
+
+Where the C++ building blocks would be:
+
+```cpp
+// Extent kinds
+template<int N> struct S {};       // Static<N>
+struct Dyn {};                     // Dynamic
+struct Jag {};                     // Jagged
+
+// Shape: a pack of extent kinds
+template<typename... Es> struct Shape {};
+
+// The core type: iteration shape + element type
+template<typename ShapeT, typename ElemT> struct Iter {};
+
+// Scalars are leaves
+template<typename T> struct Scalar { using stype = T; };
+
+// Examples:
+using LeafType      = Iter<Shape<S<8>, S<8>, S<8>>, Scalar<int32_t>>;
+using ActiveCoords  = Iter<Shape<Dyn>, Iter<Shape<S<3>>, Scalar<int32_t>>>;
+using JaggedNeighbors = Iter<Shape<Dyn>,
+                          Iter<Shape<Jag>,
+                            Iter<Shape<S<3>>, Scalar<int32_t>>>>;
+
+// Extent resolution via trait specialisation
+template<typename A, typename B> struct Resolve;
+template<int N>         struct Resolve<S<N>, S<N>> { using type = S<N>; };
+template<int N>         struct Resolve<S<N>, Dyn>  { using type = S<N>; };
+template<int N>         struct Resolve<Dyn, S<N>>  { using type = S<N>; };
+template<>              struct Resolve<Dyn, Dyn>   { using type = Dyn; };
+template<>              struct Resolve<Jag, Jag>   { using type = Jag; };
+// All other combinations: static_assert failure (type error)
+
+// Coord type for rank-r indexing
+template<int R>
+using CoordType = Iter<Shape<S<R>>, Scalar<int32_t>>;
+```
+
+The shorthand `(*) over (~) over (3) i32` and the C++
+`Iter<Shape<Dyn>, Iter<Shape<Jag>, Iter<Shape<S<3>>, Scalar<int32_t>>>>` are
+the same type seen from two distances. The shorthand is for whiteboard
+reasoning; the C++ is for implementation and compile-time checking.
+
 **Compatibility** (for flip, elementwise ops, etc.):
 - `n + n` = `n` (must match; mismatch is type error)
 - `n + *` = `n` (static wins)
@@ -406,11 +464,97 @@ part of the algebra.
    `Gather`, `Each` produce new `Value` objects with new data. The line
    between "free reinterpretation" and "actual work" is maintained.
 
-### What the prototype does NOT yet demonstrate
+### What v0 does NOT yet demonstrate
 
 - Multiple leaf nodes (double nesting via Cut).
 - Cross-leaf anything (the hierarchical index chain).
 - The CIG type itself (struct of three levels).
+- Indexed as a deferred layout vs. materialised Gather.
+- Struct, Flip, or any multi-feature composition.
+- Any optimisation or code generation.
+- Separation of the expression AST from its execution (currently interleaved).
+
+---
+
+## Prototype v1: Indexed, Struct, Flip
+
+Code in `docs/wip/prototype/test_indexed_flip.py`. Builds on v0.
+
+### What v1 demonstrated
+
+**1. Multiple leaf nodes with double-nested jagged.** A flat `(K*512,) i32`
+array is cut into K leaves, each reshaped to `(8,8,8)`. `Each` over leaves
+applying `Where(Map(leaf, >=0))` produces `(K,) over (~) over (3) i32` --
+double nesting where the inner jagged extent reflects varying active-voxel
+counts per leaf.
+
+**2. Indexed layout predicts Gather type.** The type-level `indexed()` call
+returns the same type that `Gather()` produces when materialised. This
+validates the layout/operation separation: you can type-check an Indexed
+association (free) and then materialise it (work) with guaranteed type
+agreement.
+
+**3. Struct + Flip composes multi-feature voxels.** Three independent feature
+arrays (position, color, density) with different element types are gathered
+at active indices, then combined via `FlipStruct`. The result type:
+
+```
+(*) over Struct({pos: (3) f32, color: (3) f32, dens: f32})
+```
+
+Each element is a `StructValue` with named field access (`voxel.pos`,
+`voxel.color`, `voxel.dens`). The type-level `flip(struct_layout(...))` and
+the data-level `FlipStruct(...)` agree. This is the struct-of-arrays to
+array-of-structs transposition working end-to-end.
+
+### What v1 does NOT yet demonstrate
+
+- Hierarchical index chain (output of one Gather feeds into the next).
+- Coordinate decomposition for multi-level lookups.
+- Swappable indexing strategies (3D vs morton).
+- Any optimisation or code generation.
+- Separation of the expression AST from its execution (currently interleaved).
+
+---
+
+## Prototype v2: Two-Level Hierarchical Grid
+
+Code in `docs/wip/prototype/test_two_level.py`. New primitives in `ops.py`:
+`Decompose`, `morton3d`, `inv_morton3d`.
+
+### What v2 demonstrated
+
+**1. Hierarchical index chain works.** A global coordinate is decomposed via
+`Decompose(coord, [3, 4])` into `{level_0: leaf_local, level_1: lower_local,
+which_top}`. Two Gathers chain: `lower[which_top][lower_local] -> leaf_idx`,
+then `leaf[leaf_idx][leaf_local] -> voxel_idx`. The output of the first
+Gather is the index into the second -- the core pattern of hierarchical
+sparse lookup.
+
+**2. Morton indexing produces identical results.** The same grid data was
+stored as `(L, 4096) i32` and `(K, 512) i32` (morton-linearized) instead of
+`(L, 16,16,16)` and `(K, 8,8,8)`. The chain structure is identical -- only
+the sub-coordinate preparation changes (morton3d encoding before Gather).
+50 random lookups match the 3D reference exactly. This proves the
+"swappable indexing strategy" claim: change how you address within a node
+without changing the hierarchical chain.
+
+**3. Single-coord Gather requires batch wrapping.** A single `(3,) i32`
+coordinate has type `(3,) over i32` -- a rank-1 iterable of scalars, not a
+rank-3 index. To Gather from a rank-3 target, it must be wrapped as
+`(1,) over (3,) i32` (batch of one coordinate). This is correct by the
+framework's rules: the indexer's element type must match the target's
+iteration rank. The `_gather_single_coord` helper encapsulates this pattern.
+
+**4. Hierarchical lookup composes with Each and Where.** Scenario 3 applies
+`Each(leaves, Where(Map(leaf, >=0)))` to find active voxels across 5 leaf
+nodes, producing `(5,) over (~,) over (3,) i32` -- the same double-nested
+jagged from v1, now verified against hierarchically-constructed data.
+
+### What the prototype does NOT yet demonstrate
+
+- The full CIG type as a struct of three levels.
+- Cross-leaf neighbor queries (hierarchical lookup for neighbor coords).
 - Any optimisation or code generation.
 - Separation of the expression AST from its execution (currently interleaved).
 
@@ -427,14 +571,13 @@ that supports:
 
 ### Exploration Roadmap
 
-1. **Single leaf** -- done above. Establishes Map, Each, Where, Gather, and
-   shows jagged emergence from filtering.
-2. **Multiple leaf nodes**: `Cut(-512, all_leaves)` gives `(*,) over (8,8,8) i32`.
-   Batch Each over leaves. First use of double nesting.
-3. **Cross-leaf neighbors**: neighbors at leaf boundaries require the lower
-   level of the tree. First use of the hierarchical index chain.
-4. **Full CIG type**: express as a struct of three levels, each a cut+reshaped
-   tensor. Define the lookup as a chain of Indexed layouts.
-5. **Target expression**: "produce the jagged set of neighbor indices for each
-   active voxel of one CIG against another." The end-to-end test of the
-   framework.
+1. **Single leaf** -- done (v0). Map, Each, Where, Gather, jagged emergence.
+2. **Multiple leaf nodes** -- done (v1). Cut + Each, double nesting.
+3. **Indexed / Struct / Flip** -- done (v1). Layout type prediction, FlipStruct.
+4. **Hierarchical chain** -- done (v2). Decompose, chained Gather, morton.
+5. **Full CIG type**: express as a struct of three levels, each a cut+reshaped
+   tensor. Define the lookup as a composed function over that struct.
+6. **Cross-leaf neighbors**: neighbors at leaf boundaries require the
+   hierarchical lookup. Compose v0's neighbor pattern with v2's chain.
+7. **Target expression**: "produce the jagged set of neighbor indices for each
+   active voxel of one CIG against another." The end-to-end capstone.
