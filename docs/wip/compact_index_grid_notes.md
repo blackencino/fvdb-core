@@ -556,7 +556,83 @@ jagged from v1, now verified against hierarchically-constructed data.
 - The full CIG type as a struct of three levels.
 - Cross-leaf neighbor queries (hierarchical lookup for neighbor coords).
 - Any optimisation or code generation.
-- Separation of the expression AST from its execution (currently interleaved).
+
+---
+
+## Prototype v3: Micro DSL
+
+Code in `docs/wip/prototype/dsl_ast.py`, `dsl_parse.py`, `dsl_eval.py`,
+`test_dsl.py`.
+
+Programs are **text strings**, parsed by a recursive-descent parser into a
+typed AST, type-checked (no data), then executed against numpy. No Python
+lambdas, no `.data` access -- the expression is fully isolated from the host
+language.
+
+### The DSL vocabulary
+
+~15 keywords total:
+
+- **Structural**: `Map(x, v => body)`, `Each(x, v => body)`, `Where(x)`, `Gather(target, indexer)`
+- **Scalar**: `Add`, `Sub`, `GE`, `And`, `Not`, `InBounds`
+- **Grid**: `Decompose`, `Morton3d`, `Field`
+- **Layout**: `Cut`, `Reshape`
+- **Connectors**: `Input("name")`, `Const(value)`
+
+The `v => body` binding syntax replaces Python lambdas. No general lambda
+calculus needed -- all inner functions are compositions of named primitives.
+
+### Example programs (actual strings from tests)
+
+**Where + Gather:**
+```
+mask = Map(Input("leaf"), x => GE(x, Const(0)))
+active = Where(mask)
+idx = Gather(Input("leaf"), active)
+```
+
+**Two-level chain:**
+```
+parts = Decompose(Input("coord"), Const([3, 4]))
+leaf_idx = Gather(Input("lower"), Field(parts, "level_1"))
+leaf_node = Gather(Input("leaf_arr"), leaf_idx)
+voxel_idx = Gather(leaf_node, Field(parts, "level_0"))
+```
+
+### What v3 demonstrated
+
+**1. Expression/execution separation.** The program string is parsed and
+type-checked before any data is touched. Types are inferred for every binding.
+The evaluator is a separate tree-walk pass. This is the AST separation that
+v0-v2 lacked.
+
+**2. No host language leakage.** The DSL programs contain no Python -- no
+lambdas, no numpy, no `.data`. The named-primitives approach works: all
+operations from v0-v2 (Map, Each, Where, Gather, Decompose, InBounds) are
+expressible as compositions of the ~15 keywords.
+
+**3. Single-point and scalar Gather.** Two special cases were needed:
+(a) `(r,) i32` as a single rank-r coordinate into a rank-r target (returns
+the element directly); (b) scalar i32 into a rank-1 target (returns the
+element unwrapped). Both handle out-of-bounds gracefully (sentinels).
+
+### Each promotes Dynamic to Jagged
+
+When `Each` applies a body independently per element, any `Dynamic` (`*`)
+extent in the body's result type becomes `Jagged` (`~`). The body runs once
+per element and has no guarantee of producing the same length each time --
+this is the definition of jagged. Static extents are preserved (they're
+structurally guaranteed uniform). This promotion happens at type-check time,
+not just at runtime, so the inferred types are correct before any data is
+touched. For example, `Each(active, ...)` producing filtered neighbor coords
+infers `(*) over (~) over (3) i32` at type-check time -- the `~` reflects
+that neighbor counts vary per voxel.
+
+### What the prototype does NOT yet demonstrate
+
+- Cross-leaf neighbor queries through the hierarchical chain.
+- Any optimisation or transformation of the AST.
+- Code generation from the AST.
 
 ---
 
@@ -575,9 +651,11 @@ that supports:
 2. **Multiple leaf nodes** -- done (v1). Cut + Each, double nesting.
 3. **Indexed / Struct / Flip** -- done (v1). Layout type prediction, FlipStruct.
 4. **Hierarchical chain** -- done (v2). Decompose, chained Gather, morton.
-5. **Full CIG type**: express as a struct of three levels, each a cut+reshaped
+5. **Micro DSL** -- done (v3). String -> parse -> type-check -> execute.
+   Expression fully isolated from host language.
+6. **Full CIG type**: express as a struct of three levels, each a cut+reshaped
    tensor. Define the lookup as a composed function over that struct.
-6. **Cross-leaf neighbors**: neighbors at leaf boundaries require the
+7. **Cross-leaf neighbors**: neighbors at leaf boundaries require the
    hierarchical lookup. Compose v0's neighbor pattern with v2's chain.
-7. **Target expression**: "produce the jagged set of neighbor indices for each
+8. **Target expression**: "produce the jagged set of neighbor indices for each
    active voxel of one CIG against another." The end-to-end capstone.

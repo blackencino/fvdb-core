@@ -180,12 +180,33 @@ def Gather(target: Value, indexer: Value) -> Value:
 # Each
 # ---------------------------------------------------------------------------
 
+def _promote_dynamic_to_jagged(ty: Type) -> Type:
+    """Promote Dynamic extents to Jagged in a type's iteration shape.
+
+    Used by Each: since the body runs independently per element, any Dynamic
+    extent in the result could resolve to a different value for each element,
+    making it jagged by definition. Static extents are preserved.
+    """
+    if ty.rank == 0:
+        return ty
+    new_extents = tuple(
+        Jagged() if isinstance(e, Dynamic) else e
+        for e in ty.iteration_shape.extents
+    )
+    if new_extents == ty.iteration_shape.extents:
+        return ty
+    return Type(Shape(*new_extents), ty.element_type)
+
+
 def each_typecheck(input_type: Type, fn_result_type: ElementType) -> Type:
     """Each: apply function per element, preserving outer iteration.
 
-    If fn returns an iterable (Type), the result nests.
-    If fn returns a scalar, the result is a new tensor type.
+    If fn returns an iterable (Type), the result nests. Dynamic extents in
+    the result are promoted to Jagged (the body runs independently per
+    element, so inner sizes may vary).
     """
+    if isinstance(fn_result_type, Type):
+        fn_result_type = _promote_dynamic_to_jagged(fn_result_type)
     return Type(input_type.iteration_shape, fn_result_type)
 
 
@@ -223,33 +244,27 @@ def Each(val: Value, fn: Callable[[Value], Value]) -> Value:
     # Determine result type from first element
     first_type = results[0].type
 
-    # Check if all results have the same shape -- both at the type level
-    # and at the data level (a Dynamic extent may resolve to different
-    # concrete sizes across elements).
-    all_same_type = all(r.type.iteration_shape == first_type.iteration_shape for r in results[1:])
+    # Promote Dynamic -> Jagged in the inner type: Each applies the body
+    # independently per element, so any Dynamic extent could vary.
+    inner_type = _promote_dynamic_to_jagged(first_type) if isinstance(first_type, Type) else first_type
+
+    # Check if all results have identical data shapes (for stacking).
     all_same_data_shape = all(
         isinstance(r.data, np.ndarray) and r.data.shape == results[0].data.shape
         for r in results[1:]
     ) if isinstance(results[0].data, np.ndarray) else False
 
-    all_same = all_same_type and all_same_data_shape
-
     # Build the outer iteration shape
     outer_extent = val.type.iteration_shape.extents[0] if val.type.rank > 0 else Static(len(results))
 
-    if all_same and isinstance(results[0].data, np.ndarray):
-        # Regular: stack into a single array
+    if all_same_data_shape and isinstance(results[0].data, np.ndarray):
+        # All elements have the same concrete shape -- can stack into one array.
+        # But the type still reflects jagged (coincidentally uniform).
         stacked = np.stack([r.data for r in results])
-        result_type = Type(Shape(outer_extent), first_type)
+        result_type = Type(Shape(outer_extent), inner_type)
         return Value(result_type, stacked)
     else:
-        # Jagged or heterogeneous: keep as list of Values.
-        # Mark the inner leading extent as jagged since sizes vary.
-        inner_type = first_type
-        if inner_type.rank > 0:
-            jagged_shape = Shape(Jagged(), *inner_type.iteration_shape.extents[1:])
-            inner_type = Type(jagged_shape, inner_type.element_type)
-
+        # Varying shapes: keep as list of Values.
         result_type = Type(Shape(outer_extent), inner_type)
         return Value(result_type, results)
 
