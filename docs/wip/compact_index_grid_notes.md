@@ -513,6 +513,60 @@ the framework scales. If not, identify what's missing.
 
 Create a new test file `test_cross_leaf.py` with DSL string programs.
 
+### Shortest path to GPU performance proof
+
+The framework's thesis is only proven when a DSL expression compiles to
+competitive GPU code. The target: 80% of hand-written performance. Not
+100% -- anything sufficiently simple to describe can be optimized further
+via idiom tables if needed.
+
+**Target expression**: the 6-neighbor gather predicate from the neighbor test:
+
+```
+Map(offsets, o => And(InBounds(Add(coord, o), 0, 8), Gather(mask, Add(coord, o))))
+```
+
+This is 6 random gathers from a 3D array at computed coordinates with
+boundary checking -- a scatter-gather pattern, the hardest GPU pattern we use.
+
+**Target backend: cuTile (not Triton).** cuTile is NVIDIA's tile-based
+Python GPU DSL built on TileIR. It is the right target for three reasons:
+
+1. **The tile model matches our layouts.** cuTile thinks in tiles --
+   fixed-size, power-of-two, immutable blocks loaded via `ct.load`, computed
+   on, stored via `ct.store`. Our Cut produces exactly these tile shapes.
+   A `(8,8,8)` leaf block IS a cuTile tile. The conceptual mapping is ~1:1.
+
+2. **TileIR as intermediate target.** TileIR is a "tile virtual machine"
+   that models the GPU as a tile processor. Our DSL is a higher-level
+   description of tile operations. Lowering DSL -> TileIR is a more natural
+   compilation path than DSL -> Triton (which has its own abstraction
+   constraints around masking and block pointers).
+
+3. **Hardware-aware.** cuTile automatically leverages tensor memory
+   accelerators and tensor cores (Blackwell and beyond). For sparse grid
+   gather patterns across hierarchical node blocks, the tile-based memory
+   model with hardware-backed async loads is exactly right.
+
+**Prerequisites**: cuTile requires CUDA Toolkit 13.1+, NVIDIA Driver r580+,
+compute capability 10.x or 12.x. This will require a CUDA version upgrade
+in the fvdb build environment. Deferring that infrastructure work for now.
+
+**The implementation plan** (a `dsl_to_cutile.py` emitter):
+
+1. Handle ~6 emission rules: Map (unroll for static extents), Add
+   (arithmetic on tile indices), Gather (`ct.load` with computed index),
+   InBounds (predicate mask), And (bitwise), GE (comparison).
+2. Emit a `@ct.kernel` function for the neighbor predicate operating over
+   a batch of active coordinates.
+3. Run on a real `(8,8,8)` mask with 400+ active voxels.
+4. Compare against: (a) the numpy DSL evaluator (should be 100x+ faster),
+   (b) a hand-written cuTile kernel doing the same thing (target: 80%).
+
+The jagged output part (Where filtering to variable-length results) is
+harder for GPU and can use a two-pass approach (count pass + scatter pass),
+which is a known pattern. The gather+predicate part is the proof of concept.
+
 ### Medium-term items
 
 - **Full CIG type**: express a 3-level compact index grid as a Struct of
