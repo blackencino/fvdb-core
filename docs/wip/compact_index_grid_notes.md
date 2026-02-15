@@ -25,7 +25,7 @@ analysis, fusion, and optimisation. The same is true of any system that hides
 structure behind a compiled API.
 
 **The claim.** A small set of **nested layouts** (Cut, Indexed, Jagged,
-Struct, Flip) applied over raw tensors, combined with a small set of
+Tuple, Struct, Flip) applied over raw tensors, combined with a small set of
 **adverbs** (Map, Each, Where, Gather), form a **portable semantic layer**
 that has the same degree of fungibility as tensors but captures the structural
 richness that tensors erase.
@@ -414,14 +414,6 @@ centroids produce identical results, demonstrating that materialisation
 schedule is independent of algorithm. DSL expresses the mesh lookup as a
 string program.
 
-### What remains unproven
-
-- Cross-leaf neighbor queries (compose neighbor pattern with hierarchical chain).
-- AST optimisation or transformation.
-- Code generation from AST to GPU kernels.
-- Materialisation scheduling as an automated decision (currently manual).
-- Adoption/virality of the protocol.
-
 ---
 
 ## Working Theory
@@ -439,18 +431,112 @@ scene graphs -- in a form that is:
 
 fVDB's sparse voxel operations are the proving ground, not the ceiling.
 
-### Exploration Roadmap
+---
 
-1. **Single leaf** -- done (v0). Map, Each, Where, Gather, jagged emergence.
-2. **Multiple leaf nodes** -- done (v1). Cut + Each, double nesting.
-3. **Indexed / Struct / Flip** -- done (v1). Layout prediction, FlipStruct.
-4. **Hierarchical chain** -- done (v2). Decompose, chained Gather, morton.
-5. **Micro DSL** -- done (v3). String -> parse -> type-check -> execute.
-6. **Mesh exemplar** -- done. Early/late materialisation, scheduling insight.
-7. **Full CIG type**: struct of three levels, lookup as composed function.
-8. **Cross-leaf neighbors**: compose neighbor pattern with hierarchical chain.
-9. **Target expression**: jagged neighbor indices across two CIGs.
-10. **Materialisation scheduling**: automated early/late decisions.
-11. **AST optimisation**: idiom detection, fusion, algebraic simplification.
-12. **Code generation**: lower DSL to cuTile / CUDA.
-13. **Protocol definition**: formal specification for interchange.
+## Next Steps (for a new agent)
+
+### Orientation
+
+Read this document top-to-bottom for the thesis, vocabulary, layout wrappers,
+adverb semantics, and worked examples. Then:
+
+- **Prototype code**: `docs/wip/prototype/`
+- **Run all tests**: `python docs/wip/prototype/run_all_tests.py` (20 tests, ~2s)
+- **Design doc**: this file (`docs/wip/compact_index_grid_notes.md`)
+
+File inventory:
+
+| File | Role |
+|------|------|
+| `types.py` | Extent kinds (Static/Dynamic/Jagged), Shape, Type, ScalarType |
+| `layouts.py` | Layout wrappers: Cut, Indexed, Tuple, Struct, Flip, Jagged |
+| `ops.py` | Python-level operations: Map, Each, Where, Gather, FlipStruct, Decompose, morton3d |
+| `dsl_ast.py` | AST node classes (~25 nodes) with `infer_type` methods |
+| `dsl_parse.py` | Recursive-descent parser: string -> AST |
+| `dsl_eval.py` | Tree-walk evaluator: type-check pass then numpy execution |
+| `test_where.py` | v0: Map, Where, Gather pipeline (DSL strings) |
+| `test_neighbors.py` | v0: neighbor finding, jagged emergence (DSL strings) |
+| `test_indexed_flip.py` | v1: multi-leaf Cut, Indexed, Struct+Flip (DSL + API tests) |
+| `test_two_level.py` | v2: hierarchical chain, Decompose, morton (DSL strings) |
+| `test_dsl.py` | v3: DSL validation (parser + evaluator correctness) |
+| `test_mesh.py` | mesh: triangle mesh, centroids via Over+Div (DSL strings) |
+| `run_all_tests.py` | Single entry point for all 20 tests |
+
+### Current state
+
+The DSL has ~25 keywords covering layouts (Cut, Reshape), structural ops
+(Map, Each, Where, Gather), K-style adverbs (Over, Scan, EachRight, EachLeft,
+Prior), scalar primitives (Add, Sub, Mul, Div, GE, And, Not, InBounds,
+Count), and domain primitives (Decompose, Morton3d, Field). Programs are text
+strings parsed into typed ASTs, type-checked without data, then executed
+against numpy.
+
+Key semantic rules:
+- Adverbs operate over the **full iteration space**. No axis parameter. Cut
+  to isolate the axis you want. The layout IS the axis specification.
+- Each promotes Dynamic to Jagged at type-check time (body runs independently
+  per element).
+- Over reduces the full iteration space (commutative+associative for rank > 1).
+  Scan and Prior require rank 1.
+- Indexed is a layout (free); Gather is its materialisation (work). When to
+  resolve is a scheduling decision, not an algorithmic one.
+
+### What has been demonstrated
+
+1. Type propagation end-to-end through all operations.
+2. Jagged (`~`) emergence from variable-length filtering within Each.
+3. Hierarchical index chain: Decompose + chained Gather through two levels.
+4. Swappable indexing strategy (3D vs morton, identical results).
+5. Struct + Flip: struct-of-arrays to array-of-structs transposition.
+6. Triangle mesh as layouts over raw tensors (no custom mesh class).
+7. Mean = `Div(Over(Add, xs), Count(xs))` -- adverb composition.
+8. Expression/execution separation via the string-parsed DSL.
+
+### Recommended immediate next step: cross-leaf neighbors
+
+**Goal**: write a DSL program that finds the jagged set of active neighbor
+coordinates for each active voxel, where neighbors may cross leaf node
+boundaries. This composes:
+- The neighbor pattern from `test_neighbors.py` (add offsets, filter active)
+- The hierarchical chain from `test_two_level.py` (Decompose + chained Gather)
+
+The expression should:
+1. Take a two-level grid (lower + leaf) and a set of global coordinates.
+2. For each active voxel, generate 6 face-neighbor global coordinates.
+3. For each neighbor coord, use Decompose + chained Gather to look up whether
+   it's active in the grid (cross-leaf boundary traversal).
+4. Filter to active neighbors only.
+5. Produce `(*) over (~) over (3) i32` -- jagged neighbor coords.
+
+This is the critical composability test. If the DSL can express this cleanly,
+the framework scales. If not, identify what's missing.
+
+Create a new test file `test_cross_leaf.py` with DSL string programs.
+
+### Medium-term items
+
+- **Full CIG type**: express a 3-level compact index grid as a Struct of
+  three levels (upper/lower/leaf), each a Cut+Reshaped tensor. Define the
+  coord-to-index lookup as a composed DSL function over that struct.
+- **Idiom detection**: recognize patterns like `Over(Add, Map(xs, Gather(...)))`
+  as scatter-gather and propose optimized implementations. This is where the
+  AST pays off -- the expression tree is inspectable.
+- **Materialisation scheduling**: given a DSL expression, automatically decide
+  where to insert Gather (early vs late) based on data characteristics
+  (sparsity ratio, memory budget). This is the Halide schedule analogy.
+- **EachBoth** (zip-map): not yet a primitive. Composes from existing but
+  would be convenient for pairwise operations.
+- **FlipStruct in DSL**: currently Python-only. Add a DSL keyword.
+- **Rank operator convenience**: the reshape/unshape telescope
+  (`Unshape(Unshape(Adverb(Shape(Shape(x)))))`) will emerge as a pattern
+  when working with higher-rank data. A rank operator that compiles to
+  Cut+Adverb+reassemble would reduce boilerplate.
+
+### North star
+
+Compile DSL expressions to working cuTile / CUDA code via algebraic
+optimisation and idiom detection. The entire SPH density calculation can be
+written as `(R/P/:)\:':` in K9 syntax -- a tacit composition of reduction,
+product, and structured iteration. This is what the framework makes possible:
+domain algorithms as tiny compositions of adverbs over structured tensors,
+compiled to GPU code without framework-specific imperative implementations.
