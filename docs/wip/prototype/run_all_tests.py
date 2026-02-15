@@ -98,6 +98,20 @@ def main():
     _run("dsl_neighbor_program", test_neighbor_program)
     _run("dsl_chain_program", test_chain_program)
 
+    # -- mesh exemplar --
+    print()
+    print("=" * 60)
+    print("Mesh: Triangle mesh -- layouts over tensors, scheduling")
+    print("=" * 60)
+    from docs.wip.prototype.test_mesh import (
+        test_mesh_types,
+        test_mesh_centroids,
+        test_mesh_dsl,
+    )
+    _run("mesh_types", test_mesh_types)
+    _run("mesh_centroids", test_mesh_centroids)
+    _run("mesh_dsl", test_mesh_dsl)
+
     print()
     print("=" * 60)
     print("All tests passed.")

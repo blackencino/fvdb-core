@@ -407,6 +407,158 @@ class ReshapeNode(Node):
 
 
 # ---------------------------------------------------------------------------
+# Adverbs (K-style)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class OverNode(Node):
+    """Over(f, xs): reduce the full iteration space with a dyadic verb.
+
+    Result is the element type (iteration space fully consumed).
+    For rank > 1, f must be commutative+associative.
+    f is a named verb (e.g. "Add", "Mul") resolved at evaluation time.
+    """
+    verb: str
+    input: Node
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        input_ty = self.input.infer_type(env, inputs)
+        et = input_ty.element_type
+        if isinstance(et, Type):
+            return et
+        return Type(Shape(), et)
+
+    def __repr__(self) -> str:
+        return f"Over({self.verb}, {self.input})"
+
+
+@dataclass(frozen=True)
+class ScanNode(Node):
+    """Scan(f, xs): running accumulation. Rank 1 only.
+
+    Same shape as input; element i is f applied cumulatively to elements 0..i.
+    """
+    verb: str
+    input: Node
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        input_ty = self.input.infer_type(env, inputs)
+        if input_ty.rank != 1:
+            raise TypeError(f"Scan requires rank 1, got rank {input_ty.rank}")
+        return input_ty
+
+    def __repr__(self) -> str:
+        return f"Scan({self.verb}, {self.input})"
+
+
+@dataclass(frozen=True)
+class EachRightNode(Node):
+    """EachRight(f, x, ys): for each y in ys, compute f(x, y). x is fixed."""
+    verb: str
+    left: Node
+    right: Node
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        right_ty = self.right.infer_type(env, inputs)
+        # Result has the iteration shape of ys, element type from f
+        left_ty = self.left.infer_type(env, inputs)
+        # For arithmetic verbs, result element = left element type
+        et = left_ty.element_type if isinstance(left_ty.element_type, ScalarType) else left_ty
+        if isinstance(right_ty.element_type, Type):
+            et = right_ty.element_type.element_type if isinstance(right_ty.element_type.element_type, ScalarType) else right_ty.element_type
+        return Type(right_ty.iteration_shape, et)
+
+    def __repr__(self) -> str:
+        return f"EachRight({self.verb}, {self.left}, {self.right})"
+
+
+@dataclass(frozen=True)
+class EachLeftNode(Node):
+    """EachLeft(f, xs, y): for each x in xs, compute f(x, y). y is fixed."""
+    verb: str
+    left: Node
+    right: Node
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        left_ty = self.left.infer_type(env, inputs)
+        et = left_ty.element_type
+        if isinstance(et, Type):
+            et = et.element_type if isinstance(et.element_type, ScalarType) else et
+        return Type(left_ty.iteration_shape, et)
+
+    def __repr__(self) -> str:
+        return f"EachLeft({self.verb}, {self.left}, {self.right})"
+
+
+@dataclass(frozen=True)
+class PriorNode(Node):
+    """Prior(f, xs): apply f to adjacent pairs. Rank 1 only.
+
+    Result length = input length - 1.
+    """
+    verb: str
+    input: Node
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        input_ty = self.input.infer_type(env, inputs)
+        if input_ty.rank != 1:
+            raise TypeError(f"Prior requires rank 1, got rank {input_ty.rank}")
+        lead = input_ty.iteration_shape.extents[0]
+        if isinstance(lead, Static):
+            new_lead = Static(lead.n - 1)
+        else:
+            new_lead = lead  # Dynamic stays Dynamic
+        return Type(Shape(new_lead), input_ty.element_type)
+
+    def __repr__(self) -> str:
+        return f"Prior({self.verb}, {self.input})"
+
+
+# ---------------------------------------------------------------------------
+# Additional scalar primitives
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class DivNode(Node):
+    a: Node
+    b: Node
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        ta = self.a.infer_type(env, inputs)
+        # Division produces float
+        if ta.rank == 0:
+            return Type(Shape(), ScalarType.F32)
+        return Type(ta.iteration_shape, ScalarType.F32)
+
+    def __repr__(self) -> str:
+        return f"Div({self.a}, {self.b})"
+
+
+@dataclass(frozen=True)
+class MulNode(Node):
+    a: Node
+    b: Node
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        return self.a.infer_type(env, inputs)
+
+    def __repr__(self) -> str:
+        return f"Mul({self.a}, {self.b})"
+
+
+@dataclass(frozen=True)
+class CountNode(Node):
+    """Count(xs): length of the iteration space. Returns scalar i32."""
+    input: Node
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        return Type(Shape(), ScalarType.I32)
+
+    def __repr__(self) -> str:
+        return f"Count({self.input})"
+
+
+# ---------------------------------------------------------------------------
 # Program: a sequence of let-bindings + an output
 # ---------------------------------------------------------------------------
 

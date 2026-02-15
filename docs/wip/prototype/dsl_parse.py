@@ -32,15 +32,23 @@ from .dsl_ast import (
     FieldNode,
     GatherNode,
     GENode,
+    CountNode,
+    DivNode,
+    EachLeftNode,
+    EachRightNode,
     InBoundsNode,
     InputNode,
     MapNode,
     Morton3dNode,
+    MulNode,
     Node,
     NotNode,
+    OverNode,
+    PriorNode,
     Program,
     RefNode,
     ReshapeNode,
+    ScanNode,
     SubNode,
     WhereNode,
 )
@@ -73,7 +81,9 @@ _TOKEN_RE = re.compile(
 
 _BUILTINS = {
     "Map", "Each", "Where", "Gather",
-    "Add", "Sub", "GE", "LE", "And", "Not", "InBounds",
+    "Over", "Scan", "EachRight", "EachLeft", "Prior",
+    "Add", "Sub", "Mul", "Div", "GE", "LE", "And", "Not", "InBounds",
+    "Count",
     "Decompose", "Morton3d", "Field",
     "Cut", "Reshape",
     "Input", "Const",
@@ -172,7 +182,13 @@ class Parser:
         kind, value = tok
 
         if kind == "NAME" and value in _BUILTINS:
-            return self.parse_call()
+            # Only parse as a call if followed by '('
+            if self.pos + 1 < len(self.tokens) and self.tokens[self.pos + 1][0] == "LPAREN":
+                return self.parse_call()
+            else:
+                # Bare builtin name (e.g. Add as a verb argument to Over)
+                name = self.advance()[1]
+                return RefNode(name)
         elif kind == "NAME":
             name = self.advance()[1]
             if name in self.bindings:
@@ -326,6 +342,50 @@ class Parser:
             if isinstance(shape_node, ConstNode) and isinstance(shape_node.value, list):
                 return ReshapeNode(input_node, tuple(shape_node.value))
             raise SyntaxError(f"Reshape expects list shape, got {shape_node}")
+
+        # -- Adverbs --
+
+        if name == "Over":
+            # Over(VerbName, xs) -- VerbName is a bare name, not a call
+            verb_arg = _expr(args[0])
+            if isinstance(verb_arg, RefNode):
+                verb_name = verb_arg.name
+            elif isinstance(verb_arg, ConstNode) and isinstance(verb_arg.value, str):
+                verb_name = verb_arg.value
+            else:
+                raise SyntaxError(f"Over expects a verb name, got {verb_arg}")
+            return OverNode(verb_name, _expr(args[1]))
+
+        if name == "Scan":
+            verb_arg = _expr(args[0])
+            verb_name = verb_arg.name if isinstance(verb_arg, RefNode) else str(verb_arg)
+            return ScanNode(verb_name, _expr(args[1]))
+
+        if name == "EachRight":
+            verb_arg = _expr(args[0])
+            verb_name = verb_arg.name if isinstance(verb_arg, RefNode) else str(verb_arg)
+            return EachRightNode(verb_name, _expr(args[1]), _expr(args[2]))
+
+        if name == "EachLeft":
+            verb_arg = _expr(args[0])
+            verb_name = verb_arg.name if isinstance(verb_arg, RefNode) else str(verb_arg)
+            return EachLeftNode(verb_name, _expr(args[1]), _expr(args[2]))
+
+        if name == "Prior":
+            verb_arg = _expr(args[0])
+            verb_name = verb_arg.name if isinstance(verb_arg, RefNode) else str(verb_arg)
+            return PriorNode(verb_name, _expr(args[1]))
+
+        # -- Scalar primitives --
+
+        if name == "Div":
+            return DivNode(_expr(args[0]), _expr(args[1]))
+
+        if name == "Mul":
+            return MulNode(_expr(args[0]), _expr(args[1]))
+
+        if name == "Count":
+            return CountNode(_expr(args[0]))
 
         raise SyntaxError(f"Unknown builtin: {name}")
 

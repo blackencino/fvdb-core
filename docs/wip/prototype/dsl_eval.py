@@ -22,17 +22,25 @@ from .dsl_ast import (
     DecomposeNode,
     EachNode,
     FieldNode,
+    CountNode,
+    DivNode,
+    EachLeftNode,
+    EachRightNode,
     GatherNode,
     GENode,
     InBoundsNode,
     InputNode,
     MapNode,
     Morton3dNode,
+    MulNode,
     Node,
     NotNode,
+    OverNode,
+    PriorNode,
     Program,
     RefNode,
     ReshapeNode,
+    ScanNode,
     SubNode,
     WhereNode,
 )
@@ -167,7 +175,6 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
         data = input_val.data
 
         if isinstance(data, np.ndarray):
-            # Iterate over leading axis, apply body to each element
             n = data.shape[0]
             elem_type = input_val.type.element_type
 
@@ -182,17 +189,21 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
                 child_env = env.with_local(node.var, elem_val)
                 results.append(eval_node(node.body, child_env))
 
-            # Stack results
-            if results and isinstance(results[0].data, np.ndarray):
+            # Determine result element type from body results, not numpy dtype.
+            first_result_type = results[0].type
+
+            if all(isinstance(r.data, np.ndarray) for r in results):
                 stacked = np.stack([r.data for r in results])
-            elif results and isinstance(results[0].data, (np.bool_, np.int32, np.float32, np.integer, np.floating)):
+            elif all(isinstance(r.data, (np.bool_, np.int32, np.float32, np.integer, np.floating)) for r in results):
                 stacked = np.array([r.data for r in results])
             else:
                 stacked = np.array([r.data for r in results])
 
-            from .ops import _numpy_dtype_to_stype
-            result_stype = _numpy_dtype_to_stype(stacked.dtype)
-            result_type = Type(input_val.type.iteration_shape, result_stype)
+            # Use body's result type as element type (preserves nesting info)
+            if first_result_type.rank == 0:
+                result_type = Type(input_val.type.iteration_shape, first_result_type.element_type)
+            else:
+                result_type = Type(input_val.type.iteration_shape, first_result_type)
             return Value(result_type, stacked)
 
         elif isinstance(data, list):
@@ -289,6 +300,126 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
             data = data.reshape(node.new_shape)
         return Value(new_type, data)
 
+    # -- Adverbs --
+
+    if isinstance(node, OverNode):
+        input_val = eval_node(node.input, env)
+        verb_fn = _resolve_verb(node.verb)
+        data = input_val.data
+        if isinstance(data, np.ndarray):
+            # Reduce over all elements of the iteration space
+            # For multi-rank, this reduces the full array to the element shape
+            et = input_val.type.element_type
+            if isinstance(et, Type):
+                # Element is itself an array -- reduce leading axis
+                result_data = data[0].copy()
+                for i in range(1, data.shape[0]):
+                    result_data = verb_fn(result_data, data[i])
+                result_type = et
+            else:
+                # Scalar element -- reduce everything
+                result_data = data.flat[0]
+                for i in range(1, data.size):
+                    result_data = verb_fn(result_data, data.flat[i])
+                result_type = Type(Shape(), et)
+            return Value(result_type, result_data)
+        elif isinstance(data, list):
+            # List of Values -- fold
+            acc = data[0]
+            for v in data[1:]:
+                acc_data = verb_fn(acc.data, v.data)
+                acc = Value(acc.type, acc_data)
+            return acc
+        raise TypeError(f"Cannot Over {type(data)}")
+
+    if isinstance(node, ScanNode):
+        input_val = eval_node(node.input, env)
+        verb_fn = _resolve_verb(node.verb)
+        data = input_val.data
+        if isinstance(data, np.ndarray):
+            result = np.empty_like(data)
+            result[0] = data[0]
+            for i in range(1, data.shape[0]):
+                result[i] = verb_fn(result[i - 1], data[i])
+            return Value(input_val.type, result)
+        raise TypeError(f"Cannot Scan {type(data)}")
+
+    if isinstance(node, EachRightNode):
+        left_val = eval_node(node.left, env)
+        right_val = eval_node(node.right, env)
+        verb_fn = _resolve_verb(node.verb)
+        data = right_val.data
+        if isinstance(data, np.ndarray):
+            results = []
+            for i in range(data.shape[0]):
+                r = verb_fn(left_val.data, data[i])
+                results.append(r)
+            stacked = np.stack(results) if isinstance(results[0], np.ndarray) else np.array(results)
+            from .ops import _numpy_dtype_to_stype
+            result_stype = _numpy_dtype_to_stype(stacked.dtype)
+            return Value(Type(right_val.type.iteration_shape, result_stype), stacked)
+        raise TypeError(f"Cannot EachRight over {type(data)}")
+
+    if isinstance(node, EachLeftNode):
+        left_val = eval_node(node.left, env)
+        right_val = eval_node(node.right, env)
+        verb_fn = _resolve_verb(node.verb)
+        data = left_val.data
+        if isinstance(data, np.ndarray):
+            results = []
+            for i in range(data.shape[0]):
+                r = verb_fn(data[i], right_val.data)
+                results.append(r)
+            stacked = np.stack(results) if isinstance(results[0], np.ndarray) else np.array(results)
+            from .ops import _numpy_dtype_to_stype
+            result_stype = _numpy_dtype_to_stype(stacked.dtype)
+            return Value(Type(left_val.type.iteration_shape, result_stype), stacked)
+        raise TypeError(f"Cannot EachLeft over {type(data)}")
+
+    if isinstance(node, PriorNode):
+        input_val = eval_node(node.input, env)
+        verb_fn = _resolve_verb(node.verb)
+        data = input_val.data
+        if isinstance(data, np.ndarray):
+            results = []
+            for i in range(1, data.shape[0]):
+                results.append(verb_fn(data[i], data[i - 1]))
+            stacked = np.stack(results) if isinstance(results[0], np.ndarray) else np.array(results)
+            lead = input_val.type.iteration_shape.extents[0]
+            new_lead = Static(lead.n - 1) if isinstance(lead, Static) else lead
+            from .ops import _numpy_dtype_to_stype
+            result_stype = _numpy_dtype_to_stype(stacked.dtype)
+            return Value(Type(Shape(new_lead), result_stype), stacked)
+        raise TypeError(f"Cannot Prior over {type(data)}")
+
+    # -- Additional scalar primitives --
+
+    if isinstance(node, DivNode):
+        a = eval_node(node.a, env)
+        b = eval_node(node.b, env)
+        b_data = b.data if isinstance(b.data, np.ndarray) else float(b.data)
+        result = (a.data / b_data).astype(np.float32)
+        a_ty = a.type
+        if a_ty.rank == 0:
+            return Value(Type(Shape(), ScalarType.F32), result)
+        return Value(Type(a_ty.iteration_shape, ScalarType.F32), result)
+
+    if isinstance(node, MulNode):
+        a = eval_node(node.a, env)
+        b = eval_node(node.b, env)
+        b_data = b.data if isinstance(b.data, np.ndarray) else b.data
+        return Value(a.type, (a.data * b_data).astype(a.data.dtype))
+
+    if isinstance(node, CountNode):
+        input_val = eval_node(node.input, env)
+        if isinstance(input_val.data, np.ndarray):
+            count = input_val.data.shape[0]
+        elif isinstance(input_val.data, list):
+            count = len(input_val.data)
+        else:
+            count = 1
+        return Value(Type(Shape(), ScalarType.I32), np.int32(count))
+
     raise TypeError(f"Cannot evaluate node type: {type(node).__name__}")
 
 
@@ -369,6 +500,23 @@ def _gather(target: Value, indexer: Value) -> Value:
         return Value(result_type, results)
 
     raise TypeError(f"Unexpected indexer data: {type(indexer.data)}")
+
+
+def _resolve_verb(name: str):
+    """Map a verb name to a binary numpy function."""
+    verbs = {
+        "Add": lambda a, b: a + b,
+        "Sub": lambda a, b: a - b,
+        "Mul": lambda a, b: a * b,
+        "Div": lambda a, b: a / b,
+        "Min": lambda a, b: np.minimum(a, b),
+        "Max": lambda a, b: np.maximum(a, b),
+        "And": lambda a, b: a & b,
+        "Or": lambda a, b: a | b,
+    }
+    if name not in verbs:
+        raise TypeError(f"Unknown verb: {name!r}")
+    return verbs[name]
 
 
 def _promote_dynamic_to_jagged(ty: Type) -> Type:

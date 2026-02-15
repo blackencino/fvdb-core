@@ -1,21 +1,17 @@
 # Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: Apache-2.0
 """
-Second proof: single-leaf neighbor finding.
+Single-leaf neighbor finding.
 
-Each test is structured in three phases:
-  1. SETUP         -- create numpy arrays, wrap as typed Values (boilerplate)
-  2. EXPRESSION    -- compose operations; this IS the algebra under test
-  3. EXTRACTION    -- pull results back to numpy, compare against reference
-
-The jagged extent kind (~) should emerge automatically from variable-length
+EXPRESSION phases use DSL strings executed via run().
+The jagged extent kind (~) emerges automatically from variable-length
 filtering within Each.
 """
 
 import numpy as np
 
-from docs.wip.prototype.layouts import cut_by_size
-from docs.wip.prototype.ops import Each, Gather, Map, Value, Where
+from docs.wip.prototype.dsl_eval import run
+from docs.wip.prototype.ops import Value
 from docs.wip.prototype.types import (
     Dynamic,
     Jagged,
@@ -27,34 +23,36 @@ from docs.wip.prototype.types import (
 )
 
 
-def _in_bounds(coord: np.ndarray, lo: int = 0, hi: int = 8) -> bool:
-    """Check if all components of a coordinate are in [lo, hi)."""
+# ---------------------------------------------------------------------------
+# DSL programs
+# ---------------------------------------------------------------------------
+
+NEIGHBOR_PROGRAM = """
+mask = Map(Input("leaf"), x => GE(x, Const(0)))
+active = Where(mask)
+nbrs = Each(active, a => Map(Input("offsets"), o => Add(a, o)))
+filtered = Each(nbrs, cs => Gather(cs, Where(Map(cs, c => And(InBounds(c, Const(0), Const(8)), Gather(mask, c))))))
+filtered
+"""
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _in_bounds(coord, lo=0, hi=8):
     return bool(np.all(coord >= lo) and np.all(coord < hi))
 
 
-def _make_filter(mask_data: np.ndarray):
-    """Build the neighbor-filter function used in the expression phase.
-
-    This is a scalar function: given a (6,) over (3,) i32 block of candidate
-    coordinates, return the (~,) over (3,) i32 subset that are in-bounds and
-    active. The variable-length output is what produces jaggedness.
-    """
-
-    def filter_active(coords6: Value) -> Value:
-        all_coords = coords6.data
-        keep = [c for c in all_coords if _in_bounds(c) and mask_data[c[0], c[1], c[2]]]
-        data = np.stack(keep).astype(np.int32) if keep else np.zeros((0, 3), dtype=np.int32)
-        return Value(Type(Shape(Dynamic()), coord_type(3)), data)
-
-    return filter_active
-
-
-# -- Face-neighbor offsets (constant, shared across tests) --
 FACE_OFFSETS = np.array(
     [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]],
     dtype=np.int32,
 )
 
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
 
 def test_neighbor_types():
     """Verify type propagation through the neighbor-finding expression."""
@@ -63,38 +61,27 @@ def test_neighbor_types():
     np.random.seed(42)
     leaf_data = np.random.randint(-1, 10, (8, 8, 8)).astype(np.int32)
     leaf = Value.from_numpy(leaf_data, ScalarType.I32)
-
-    offsets_flat = Value.from_numpy(FACE_OFFSETS.ravel(), ScalarType.I32)
-    offsets = Value(cut_by_size(3, offsets_flat.type), FACE_OFFSETS)
+    offsets = Value(
+        Type(Shape(Static(6)), Type(Shape(Static(3)), ScalarType.I32)),
+        FACE_OFFSETS,
+    )
 
     # ---- EXPRESSION ----
-    # Step 1: active voxel coordinates
-    mask = Map(leaf, lambda x: x >= 0)                          # (8,8,8) bool
-    active_ijk = Where(mask)                                    # (*) over (3) i32
-
-    # Step 2: for each active voxel, 6 candidate neighbor coords
-    neighbor_ijk = Each(active_ijk, lambda a: Value(            # (*) over (6) over (3) i32
-        Type(Shape(Static(6)), coord_type(3)),
-        a.data[np.newaxis, :] + FACE_OFFSETS,
-    ))
-
-    # Step 3: filter to in-bounds + active neighbors
-    active_neighbors = Each(neighbor_ijk, _make_filter(mask.data))  # (*) over (~) over (3) i32
+    types, result = run(NEIGHBOR_PROGRAM, {"leaf": leaf, "offsets": offsets})
 
     # ---- EXTRACTION ----
-    print(f"neighbor_ijk type:     {neighbor_ijk.type}")
-    print(f"active_neighbors type: {active_neighbors.type}")
+    print("Neighbor types:")
+    for name, ty in types.items():
+        print(f"  {name}: {ty}")
 
-    assert active_ijk.type == Type(Shape(Dynamic()), coord_type(3))
+    assert types["active"] == Type(Shape(Dynamic()), coord_type(3))
+    assert types["nbrs"].iteration_shape == Shape(Dynamic())
 
-    assert neighbor_ijk.type.iteration_shape == Shape(Dynamic())
-    assert neighbor_ijk.type.element_type == Type(Shape(Static(6)), coord_type(3))
-
-    assert active_neighbors.type.iteration_shape == Shape(Dynamic())
-    inner = active_neighbors.type.element_type
+    # filtered should have (*) outer, jagged inner
+    assert result.type.iteration_shape == Shape(Dynamic())
+    inner = result.type.element_type
     assert isinstance(inner, Type)
-    assert isinstance(inner.iteration_shape.extents[0], (Dynamic, Jagged))
-    assert inner.element_type == coord_type(3)
+    assert isinstance(inner.iteration_shape.extents[0], Jagged)
 
 
 def test_neighbor_data():
@@ -104,67 +91,58 @@ def test_neighbor_data():
     np.random.seed(42)
     leaf_data = np.random.randint(-1, 10, (8, 8, 8)).astype(np.int32)
     leaf = Value.from_numpy(leaf_data, ScalarType.I32)
+    offsets = Value(
+        Type(Shape(Static(6)), Type(Shape(Static(3)), ScalarType.I32)),
+        FACE_OFFSETS,
+    )
 
     # ---- EXPRESSION ----
-    mask = Map(leaf, lambda x: x >= 0)
-    active_ijk = Where(mask)
-    mask_data = mask.data
-
-    neighbor_ijk = Each(active_ijk, lambda a: Value(
-        Type(Shape(Static(6)), coord_type(3)),
-        a.data[np.newaxis, :] + FACE_OFFSETS,
-    ))
-    active_neighbors = Each(neighbor_ijk, _make_filter(mask_data))
+    types, result = run(NEIGHBOR_PROGRAM, {"leaf": leaf, "offsets": offsets})
 
     # ---- EXTRACTION ----
-    # Brute-force reference
-    active_coords = np.argwhere(leaf_data >= 0).astype(np.int32)
-    reference = []
-    for coord in active_coords:
+    mask_data = leaf_data >= 0
+    active_coords = np.argwhere(mask_data).astype(np.int32)
+
+    assert len(result.data) == len(active_coords)
+
+    neighbor_counts = []
+    for i, coord in enumerate(active_coords):
         nbrs = coord[np.newaxis, :] + FACE_OFFSETS
         valid = [nb for nb in nbrs if _in_bounds(nb) and mask_data[nb[0], nb[1], nb[2]]]
-        reference.append(np.array(valid, dtype=np.int32).reshape(-1, 3))
+        ref = np.array(valid, dtype=np.int32).reshape(-1, 3)
 
-    # Compare element-by-element
-    assert len(active_neighbors.data) == len(reference)
-    neighbor_counts = []
-    for i in range(len(reference)):
-        expr_coords = active_neighbors.data[i].data
-        np.testing.assert_array_equal(expr_coords, reference[i])
-        neighbor_counts.append(len(reference[i]))
+        actual = result.data[i].data
+        np.testing.assert_array_equal(actual, ref)
+        neighbor_counts.append(len(ref))
 
     neighbor_counts = np.array(neighbor_counts)
-    print(f"Neighbor data OK: {len(reference)} active voxels, "
-          f"neighbor counts min={neighbor_counts.min()} max={neighbor_counts.max()} "
+    print(f"Neighbor data OK: {len(active_coords)} active, "
+          f"min={neighbor_counts.min()} max={neighbor_counts.max()} "
           f"mean={neighbor_counts.mean():.1f}")
     assert neighbor_counts.min() != neighbor_counts.max(), "Expected jagged"
 
 
 def test_jagged_type_emerges():
-    """The key test: does ~ appear in the type automatically?"""
+    """The key test: does ~ appear in the type from the DSL?"""
 
     # ---- SETUP ----
     np.random.seed(99)
     leaf_data = np.random.randint(-1, 4, (8, 8, 8)).astype(np.int32)
     leaf = Value.from_numpy(leaf_data, ScalarType.I32)
+    offsets = Value(
+        Type(Shape(Static(6)), Type(Shape(Static(3)), ScalarType.I32)),
+        FACE_OFFSETS,
+    )
 
     # ---- EXPRESSION ----
-    mask = Map(leaf, lambda x: x >= 0)
-    active_ijk = Where(mask)
-
-    neighbor_ijk = Each(active_ijk, lambda a: Value(
-        Type(Shape(Static(6)), coord_type(3)),
-        a.data[np.newaxis, :] + FACE_OFFSETS,
-    ))
-    result = Each(neighbor_ijk, _make_filter(mask.data))
+    types, result = run(NEIGHBOR_PROGRAM, {"leaf": leaf, "offsets": offsets})
 
     # ---- EXTRACTION ----
     inner_type = result.type.element_type
-    assert isinstance(inner_type, Type), f"Expected nested Type, got {inner_type!r}"
+    assert isinstance(inner_type, Type)
     leading_extent = inner_type.iteration_shape.extents[0]
     assert isinstance(leading_extent, Jagged), (
-        f"Expected jagged (~) inner extent, got {leading_extent!r}. "
-        f"Full type: {result.type}"
+        f"Expected jagged (~), got {leading_extent!r}. Full type: {result.type}"
     )
     print(f"Jagged type confirmed: {result.type}")
 
