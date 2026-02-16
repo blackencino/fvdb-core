@@ -26,16 +26,16 @@ from .dsl_ast import (
     AddNode,
     AndNode,
     ConstNode,
+    CountNode,
     CutNode,
     DecomposeNode,
+    DivNode,
+    EachLeftNode,
     EachNode,
+    EachRightNode,
     FieldNode,
     GatherNode,
     GENode,
-    CountNode,
-    DivNode,
-    EachLeftNode,
-    EachRightNode,
     InBoundsNode,
     InputNode,
     MapNode,
@@ -53,7 +53,6 @@ from .dsl_ast import (
     WhereNode,
 )
 from .types import ScalarType
-
 
 # ---------------------------------------------------------------------------
 # Tokenizer
@@ -80,13 +79,32 @@ _TOKEN_RE = re.compile(
 )
 
 _BUILTINS = {
-    "Map", "Each", "Where", "Gather",
-    "Over", "Scan", "EachRight", "EachLeft", "Prior",
-    "Add", "Sub", "Mul", "Div", "GE", "LE", "And", "Not", "InBounds",
+    "Map",
+    "Each",
+    "Where",
+    "Gather",
+    "Over",
+    "Scan",
+    "EachRight",
+    "EachLeft",
+    "Prior",
+    "Add",
+    "Sub",
+    "Mul",
+    "Div",
+    "GE",
+    "LE",
+    "And",
+    "Not",
+    "InBounds",
     "Count",
-    "Decompose", "Morton3d", "Field",
-    "Cut", "Reshape",
-    "Input", "Const",
+    "Decompose",
+    "Morton3d",
+    "Field",
+    "Cut",
+    "Reshape",
+    "Input",
+    "Const",
 }
 
 
@@ -104,6 +122,7 @@ def _tokenize(source: str) -> list[tuple[str, str]]:
 # ---------------------------------------------------------------------------
 # Parser
 # ---------------------------------------------------------------------------
+
 
 class Parser:
     def __init__(self, tokens: list[tuple[str, str]]):
@@ -128,8 +147,20 @@ class Parser:
             raise SyntaxError(f"Expected {kind}, got {tok}")
         return tok[1]
 
+    def peek_kind(self, kind: str) -> bool:
+        tok = self.peek()
+        if tok is None:
+            return False
+        return tok[0] == kind
+
+    def peek_not_kind(self, kind: str) -> bool:
+        tok = self.peek()
+        if tok is None:
+            return False
+        return tok[0] != kind
+
     def skip_newlines(self):
-        while self.peek() and self.peek()[0] == "NEWLINE":
+        while self.peek_kind("NEWLINE"):
             self.advance()
 
     # -- Top-level --
@@ -149,7 +180,7 @@ class Parser:
                 break
 
         # Remaining token should be the output name
-        if self.peek() and self.peek()[0] == "NAME":
+        if self.peek_kind("NAME"):
             output = self.advance()[1]
         elif bindings:
             output = bindings[-1][0]
@@ -163,8 +194,7 @@ class Parser:
         """Look ahead to see if current position is NAME = expr."""
         if self.pos + 1 >= len(self.tokens):
             return False
-        return (self.tokens[self.pos][0] == "NAME" and
-                self.tokens[self.pos + 1][0] == "ASSIGN")
+        return self.tokens[self.pos][0] == "NAME" and self.tokens[self.pos + 1][0] == "ASSIGN"
 
     def parse_assignment(self) -> tuple[str, Node]:
         name = self.expect("NAME")
@@ -214,7 +244,7 @@ class Parser:
     def parse_list_literal(self) -> ConstNode:
         self.expect("LBRACKET")
         values = [int(self.expect("INT"))]
-        while self.peek() and self.peek()[0] == "COMMA":
+        while self.peek_kind("COMMA"):
             self.advance()
             values.append(int(self.expect("INT")))
         self.expect("RBRACKET")
@@ -232,9 +262,9 @@ class Parser:
     def parse_arglist(self) -> list:
         """Parse comma-separated arguments. Each arg may be a binding (name => expr) or an expr."""
         args = []
-        if self.peek() and self.peek()[0] != "RPAREN":
+        if self.peek_not_kind("RPAREN"):
             args.append(self.parse_arg())
-            while self.peek() and self.peek()[0] == "COMMA":
+            while self.peek_kind("COMMA"):
                 self.advance()
                 args.append(self.parse_arg())
         return args
@@ -242,9 +272,7 @@ class Parser:
     def parse_arg(self):
         """Parse one argument: either `name => expr` (binding) or `expr`."""
         # Look ahead for binding: NAME =>
-        if (self.peek() and self.peek()[0] == "NAME" and
-                self.pos + 1 < len(self.tokens) and
-                self.tokens[self.pos + 1][0] == "ARROW"):
+        if self.peek_kind("NAME") and self.pos + 1 < len(self.tokens) and self.tokens[self.pos + 1][0] == "ARROW":
             name = self.advance()[1]
             self.advance()  # consume =>
             body = self.parse_expr()
@@ -393,6 +421,7 @@ class Parser:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def parse(source: str) -> Program:
     """Parse a DSL program string into an AST."""

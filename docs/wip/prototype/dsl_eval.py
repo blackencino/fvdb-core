@@ -18,14 +18,14 @@ from .dsl_ast import (
     AddNode,
     AndNode,
     ConstNode,
+    CountNode,
     CutNode,
     DecomposeNode,
-    EachNode,
-    FieldNode,
-    CountNode,
     DivNode,
     EachLeftNode,
+    EachNode,
     EachRightNode,
+    FieldNode,
     GatherNode,
     GENode,
     InBoundsNode,
@@ -45,25 +45,14 @@ from .dsl_ast import (
     WhereNode,
 )
 from .dsl_parse import parse
-from .ops import (
-    Value,
-    StructValue,
-    morton3d as np_morton3d,
-)
-from .types import (
-    Dynamic,
-    Jagged,
-    ScalarType,
-    Shape,
-    Static,
-    Type,
-    coord_type,
-)
-
+from .ops import StructValue, Value
+from .ops import morton3d as np_morton3d
+from .types import Dynamic, Jagged, ScalarType, Shape, Static, Type, coord_type
 
 # ---------------------------------------------------------------------------
 # Evaluation environment
 # ---------------------------------------------------------------------------
+
 
 class EvalEnv:
     """Runtime environment: maps names to Values."""
@@ -90,6 +79,7 @@ class EvalEnv:
 # ---------------------------------------------------------------------------
 # Node evaluator
 # ---------------------------------------------------------------------------
+
 
 def eval_node(node: Node, env: EvalEnv) -> Value:
     """Recursively evaluate an AST node to a concrete Value."""
@@ -125,9 +115,13 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
             return Value(field_type, field_data)
         elif isinstance(struct_val.data, list):
             # List of StructValues -- extract field from each
-            field_data = [sv.data.fields[node.field_name] if isinstance(sv.data, StructValue)
-                          else sv.fields[node.field_name] for sv in struct_val.data]
-            return Value(field_type, np.array(field_data, dtype=np.int32) if field_data else np.array([], dtype=np.int32))
+            field_data = [
+                sv.data.fields[node.field_name] if isinstance(sv.data, StructValue) else sv.fields[node.field_name]
+                for sv in struct_val.data
+            ]
+            return Value(
+                field_type, np.array(field_data, dtype=np.int32) if field_data else np.array([], dtype=np.int32)
+            )
         raise TypeError(f"Field access on non-struct: {type(struct_val.data)}")
 
     # -- Scalar primitives --
@@ -194,7 +188,7 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
 
             if all(isinstance(r.data, np.ndarray) for r in results):
                 stacked = np.stack([r.data for r in results])
-            elif all(isinstance(r.data, (np.bool_, np.int32, np.float32, np.integer, np.floating)) for r in results):
+            elif all(isinstance(r.data, (np.bool_, np.integer, np.floating)) for r in results):
                 stacked = np.array([r.data for r in results])
             else:
                 stacked = np.array([r.data for r in results])
@@ -282,6 +276,7 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
     if isinstance(node, CutNode):
         input_val = eval_node(node.input, env)
         from .layouts import cut_by_size
+
         new_type = cut_by_size(node.size, input_val.type)
         # Reshape the data to match
         data = input_val.data
@@ -294,6 +289,7 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
     if isinstance(node, ReshapeNode):
         input_val = eval_node(node.input, env)
         from .layouts import reshape as reshape_layout
+
         new_type = reshape_layout(input_val.type, node.new_shape)
         data = input_val.data
         if isinstance(data, np.ndarray):
@@ -356,6 +352,7 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
                 results.append(r)
             stacked = np.stack(results) if isinstance(results[0], np.ndarray) else np.array(results)
             from .ops import _numpy_dtype_to_stype
+
             result_stype = _numpy_dtype_to_stype(stacked.dtype)
             return Value(Type(right_val.type.iteration_shape, result_stype), stacked)
         raise TypeError(f"Cannot EachRight over {type(data)}")
@@ -372,6 +369,7 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
                 results.append(r)
             stacked = np.stack(results) if isinstance(results[0], np.ndarray) else np.array(results)
             from .ops import _numpy_dtype_to_stype
+
             result_stype = _numpy_dtype_to_stype(stacked.dtype)
             return Value(Type(left_val.type.iteration_shape, result_stype), stacked)
         raise TypeError(f"Cannot EachLeft over {type(data)}")
@@ -388,6 +386,7 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
             lead = input_val.type.iteration_shape.extents[0]
             new_lead = Static(lead.n - 1) if isinstance(lead, Static) else lead
             from .ops import _numpy_dtype_to_stype
+
             result_stype = _numpy_dtype_to_stype(stacked.dtype)
             return Value(Type(Shape(new_lead), result_stype), stacked)
         raise TypeError(f"Cannot Prior over {type(data)}")
@@ -427,6 +426,7 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _gather(target: Value, indexer: Value) -> Value:
     """Execute a Gather: look up target at coordinates from indexer."""
     idx_elem = indexer.type.element_type
@@ -440,12 +440,14 @@ def _gather(target: Value, indexer: Value) -> Value:
 
     # Special case 1: single-point lookup with vector coordinate.
     # (r,) integer indexer into rank-r target -> single element.
-    if (isinstance(indexer.data, np.ndarray) and
-            indexer.type.is_scalar_element and
-            indexer.type.element_type in (ScalarType.I32, ScalarType.I64) and
-            indexer.data.ndim == 1 and
-            indexer.data.shape[0] == target.type.rank and
-            target.type.rank > 0):
+    if (
+        isinstance(indexer.data, np.ndarray)
+        and indexer.type.is_scalar_element
+        and indexer.type.element_type in (ScalarType.I32, ScalarType.I64)
+        and indexer.data.ndim == 1
+        and indexer.data.shape[0] == target.type.rank
+        and target.type.rank > 0
+    ):
         coord = indexer.data
         et = target.type.element_type
         result_type = Type(Shape(), et) if isinstance(et, ScalarType) else et
@@ -459,10 +461,12 @@ def _gather(target: Value, indexer: Value) -> Value:
 
     # Special case 2: scalar integer indexing into rank-1 target.
     # Returns the element directly (unwrapped).
-    if (indexer.type.rank == 0 and
-            isinstance(indexer.type.element_type, ScalarType) and
-            indexer.type.element_type in (ScalarType.I32, ScalarType.I64) and
-            target.type.rank == 1):
+    if (
+        indexer.type.rank == 0
+        and isinstance(indexer.type.element_type, ScalarType)
+        and indexer.type.element_type in (ScalarType.I32, ScalarType.I64)
+        and target.type.rank == 1
+    ):
         idx = int(indexer.data)
         et = target.type.element_type
         result_type = Type(Shape(), et) if isinstance(et, ScalarType) else et
@@ -477,6 +481,7 @@ def _gather(target: Value, indexer: Value) -> Value:
         return Value(result_type, result_data)
 
     from .layouts import indexed as indexed_layout
+
     result_type = indexed_layout(indexer.type, target.type)
 
     if isinstance(indexer.data, np.ndarray):
@@ -523,10 +528,7 @@ def _promote_dynamic_to_jagged(ty: Type) -> Type:
     """Promote Dynamic extents to Jagged in a type's iteration shape."""
     if ty.rank == 0:
         return ty
-    new_extents = tuple(
-        Jagged() if isinstance(e, Dynamic) else e
-        for e in ty.iteration_shape.extents
-    )
+    new_extents = tuple(Jagged() if isinstance(e, Dynamic) else e for e in ty.iteration_shape.extents)
     if new_extents == ty.iteration_shape.extents:
         return ty
     return Type(Shape(*new_extents), ty.element_type)
@@ -544,10 +546,11 @@ def _collect_results(input_type: Type, results: list[Value]) -> Value:
     inner_type = _promote_dynamic_to_jagged(first_type) if isinstance(first_type, Type) else first_type
 
     # Check if all results have identical data shapes (for stacking).
-    all_same_data = all(
-        isinstance(r.data, np.ndarray) and r.data.shape == results[0].data.shape
-        for r in results[1:]
-    ) if isinstance(results[0].data, np.ndarray) else False
+    all_same_data = (
+        all(isinstance(r.data, np.ndarray) and r.data.shape == results[0].data.shape for r in results[1:])
+        if isinstance(results[0].data, np.ndarray)
+        else False
+    )
 
     if all_same_data and isinstance(results[0].data, np.ndarray):
         stacked = np.stack([r.data for r in results])
@@ -561,6 +564,7 @@ def _collect_results(input_type: Type, results: list[Value]) -> Value:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def run(source: str, inputs: dict[str, Value]) -> tuple[dict[str, Type], Value]:
     """Parse, type-check, and execute a DSL program.
