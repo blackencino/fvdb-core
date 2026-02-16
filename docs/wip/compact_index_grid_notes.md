@@ -69,11 +69,11 @@ CUDA code via algebraic optimisation and idiom detection.
 **Open questions.** (1) Can the protocol surface stay small enough for
 incremental adoption? The saving grace: layouts are metadata over tensors, so
 fallback to "just send the tensors" is always available. (2) Does the
-abstract description compile to competitive GPU code? **Partially answered:**
-the v4/v5 work shows that the DSL compiles to cuTile kernels that produce
-correct results and run 4.4x faster than vectorized PyTorch GPU for the
-neighbor gather predicate. Full performance characterisation at scale is
-still needed.
+abstract description compile to competitive GPU code? **Answered (v8):**
+the compressed CIG with `masked` layout matches or beats NanoVDB (the
+production C++/CUDA sparse grid implementation) on both memory (0.22-0.73x
+at typical sparsities) and query performance (1.27-1.34x faster), from a
+4-line DSL expression compiled to a cuTile kernel.
 
 ---
 
@@ -217,7 +217,8 @@ iteration patterns by matching AST node types, not by reading case conventions.
 
 Every layout wrapper is a **type modifier**, not an operation. It reinterprets
 the logical type without touching physical storage. Layouts compose freely.
-**In the DSL, layouts use lowercase names** (`cut`, `reshape`, `field`).
+**In the DSL, layouts use lowercase names** (`cut`, `reshape`, `field`,
+`masked`).
 
 **Invariant: type transformations do no computational work.** A layout never
 allocates, copies, or gathers. If a transformation requires data movement, it
@@ -263,6 +264,25 @@ flip(dict) = table.
 ### Jagged
 
 Cut-by-offsets with proper extent notation. Outer axis `*`, inner axis `~`.
+
+### Masked
+
+Fixed-shape space with **sparse occupancy**. The counterpart of `jagged`
+(variable-length segments): where `jagged` handles "how many elements per
+group?", `masked` handles "which positions in a fixed block have data?"
+
+- Iteration space: from the mask shape (e.g. `(8,8,8)` for a leaf block).
+- Element type: from the flat data array.
+- Access: bitmask check + **popcount** for dense index. `masked(mask, offset)`
+  wraps a packed bitmask and a base offset into a flat data array. Gather
+  through a masked layout computes `offset + popcount(mask, position)` if the
+  bit is set, else returns sentinel.
+- Physical storage: packed bitmask tensor + base offset scalar/tensor + flat
+  data tensor. For an (8,8,8) leaf: 512 bits = 8 x u64 words = 64 bytes.
+- **This is the layout that makes NanoVDB-competitive CIG memory possible.**
+  NanoVDB's `LeafData<ValueIndex>` uses the same structure (64-byte mask +
+  `mValueOff` + `countOn(i)` popcount). The `masked` layout exposes the same
+  mechanism as a first-class, transparent, composable type-system concept.
 
 ---
 
@@ -323,7 +343,7 @@ Example: face centroids = `Each(faces, f => Div(Over(Add, verts_of_f), Const(3))
 
 | Name | Convention | Kind | New data? |
 |------|-----------|------|-----------|
-| `cut`, `indexed`, `tuple`, `struct`, `flip`, `jagged`, `reshape`, `field` | lowercase | Layout (free) | No |
+| `cut`, `indexed`, `tuple`, `struct`, `flip`, `jagged`, `reshape`, `field`, `masked` | lowercase | Layout (free) | No |
 | `Map`, `Each`, `Over`, `Scan`, `EachRight`, `EachLeft`, `Prior` | PascalCase | Higher-order function | Yes |
 | `Where` | PascalCase | Operation | Yes (data-dependent) |
 | `Gather` | PascalCase | Operation | Yes (materialise) |
@@ -733,6 +753,13 @@ data array. Access computes: bitmask check + popcount for the dense index.
    cuTile (74us), a 3% difference. The bitmask + popcount chain runs at
    essentially the same speed as a direct array lookup.
 
+**u64 variant:** cuTile supports `ct.uint64` tiles. A u64 kernel using 8 x
+u64 words (instead of 16 x i32) halves the gather count and popcount
+accumulations. Benchmarked at ~10% faster for 50K voxels, negligible
+difference elsewhere. The u64 variant is cleaner (no i32 mask conversion
+step) and is the preferred path. Both i32 and u64 kernels are in
+`cig_masked_cutile.py`.
+
 **Key finding:** the `masked` layout simultaneously solves the memory
 problem AND preserves the query speed advantage. The bitmask is layout
 metadata (like offsets in jagged); the popcount is the access computation
@@ -753,12 +780,94 @@ scene graphs -- in a form that is:
   before execution.
 - **Compilable**: types carry enough information to lower to concrete GPU
   code via idiom detection and algebraic transformation. **Demonstrated** in
-  v4/v5/v6: DSL string -> AST -> runnable cuTile `@ct.kernel` -> GPU
-  execution -> correct results. v6 extends this to hierarchical sparse
-  traversal with automatic gather fusion, 4.9-8.3x faster than vectorized
-  PyTorch GPU at 4-256 leaf scale.
+  v4-v8: DSL string -> AST -> runnable cuTile `@ct.kernel` -> GPU execution
+  -> correct results. v8 demonstrates NanoVDB-competitive memory and query
+  performance via the `masked` layout with bitmask + popcount, from a 4-line
+  DSL expression.
 
 fVDB's sparse voxel operations are the proving ground, not the ceiling.
+
+---
+
+## Multi-Step Compilation
+
+The current compiler emits a single cuTile `@ct.kernel` from a DSL program.
+This works for **gather-dominated pipelines** (ijk_to_index, neighbor
+predicates, cross-leaf traversal) where every operation is pointwise or
+scatter-gather -- each tile element does its own independent lookup chain.
+
+More complex operations require **collective steps** that cannot fit in a
+single kernel: sort, prefix sum, unique/dedup, and data-dependent output
+allocation. These arise in grid construction (`from_ijk`), topology
+transforms (`conv_grid`), and variable-length output (`Where` on GPU).
+
+### Barrier-based pipeline partitioning
+
+The compiler should partition the AST into **segments** separated by
+**barriers**:
+
+```
+Segment 1 (cuTile):   pointwise/gather ops  ->  @ct.kernel
+     |
+     barrier:  data-dependent output size / collective operation
+     |
+Segment 2 (cuTile):   pointwise/gather ops  ->  @ct.kernel
+```
+
+**cuTile segments:** All pointwise, scalar, Gather, Decompose, masked, and
+Map operations fuse into a single `@ct.kernel`. This is what the emitter
+does today.
+
+**Collective steps:** Dispatched to existing optimised primitives:
+- `torch.sort` / CUB radix sort
+- `torch.cumsum` / CUB prefix sum
+- `torch.unique` / CUB unique
+- Output allocation (`torch.empty` with computed size)
+
+These do not need DSL code generation -- they are already highly optimised
+library calls. The compiler's job is to **detect where they are needed** and
+wire intermediate tensors between segments.
+
+### Barrier detection signals
+
+The AST already carries the information to detect barriers:
+
+- **`Where` node**: output size is data-dependent. Requires: count pass
+  (cuTile kernel) -> prefix sum (`torch.cumsum`) -> scatter pass (cuTile
+  kernel). This is the canonical two-pass GPU pattern.
+- **`Over` (full reduction)**: tree reduction needs multiple passes or a
+  CUB reduction call. A barrier between the gather and the reduction.
+- **Sort / Unique nodes** (not yet in DSL, but needed for grid construction):
+  inherently collective. Explicit barriers.
+- **`Each` with jagged output**: collecting variable-length results requires
+  knowing all sizes first (scan for offsets), then scatter. Two passes.
+
+### Concrete example: `conv_grid`
+
+```
+Step 1 (cuTile):  For each active voxel, compute kernel-offset neighbors
+Step 2 (collective): Sort + unique the expanded coordinates (dedup)
+Step 3 (cuTile):  For each unique coord, build output CIG entries
+```
+
+The compiler sees: Map (cuTile) -> unique (barrier) -> build (cuTile). It
+emits two kernels and one `torch.unique` call, wired with intermediate
+tensors.
+
+### Relationship to successive lowering
+
+This is the successive lowering architecture discussed earlier, made
+concrete with a specific partitioning criterion:
+
+**Pass 1 (logical AST):** The program as written. Operations are abstract.
+
+**Pass 2 (step planning):** Walk the AST, identify barrier nodes, partition
+into segments. Each segment is tagged as cuTile or collective.
+
+**Pass 3 (emission):** For cuTile segments, emit a `@ct.kernel` (as today).
+For collective steps, emit PyTorch/CUB calls. Wire with intermediate
+tensors. The output is a **pipeline** -- a callable sequence of kernel
+launches and library calls.
 
 ---
 
@@ -778,7 +887,7 @@ File inventory:
 | File | Role |
 |------|------|
 | `types.py` | Extent kinds (Static/Dynamic/Jagged), Shape, Type, ScalarType |
-| `layouts.py` | Layout wrappers (lowercase): cut, indexed, tuple, struct, flip, jagged |
+| `layouts.py` | Layout wrappers (lowercase): cut, indexed, tuple, struct, flip, jagged, masked |
 | `ops.py` | Python-level operations: Map, Each, Where, Gather, FlipStruct, Decompose, morton3d |
 | `dsl_ast.py` | AST node classes (~25 nodes) with `infer_type` methods |
 | `dsl_parse.py` | Recursive-descent parser: string -> AST |
@@ -802,16 +911,16 @@ File inventory:
 | `cig_cutile.py` | v7: cuTile kernel for CIG ijk_to_index |
 | `test_cig.py` | v7: CIG builder and ijk_to_index correctness tests |
 | `bench_cig_vs_fvdb.py` | v7/v8: head-to-head CIG vs fVDB comparison |
-| `cig_masked_cutile.py` | v8: cuTile kernel with bitmask + popcount |
+| `cig_masked_cutile.py` | v8: cuTile kernels with bitmask + popcount (i32 and u64 variants) |
 | `test_masked.py` | v8: masked layout DSL tests |
 | `run_all_tests.py` | Single entry point for non-GPU tests |
 
 ### Current state
 
 The DSL has ~25 keywords. **Layouts use lowercase** (`cut`, `reshape`,
-`field`) -- they reinterpret types without moving data. **Operations use
-PascalCase** (`Map`, `Each`, `Where`, `Gather`, `Over`, `Scan`, `Add`, etc.)
--- they do computational work. This convention makes the cost model visible
+`field`, `masked`) -- they reinterpret types without moving data.
+**Operations use PascalCase** (`Map`, `Each`, `Where`, `Gather`, `Over`,
+`Scan`, `Add`, etc.) -- they do computational work. This convention makes the cost model visible
 at a glance. Programs are text strings parsed into typed ASTs, type-checked
 without data, then executed against numpy.
 
@@ -868,6 +977,9 @@ Key semantic rules:
     at typical sparsities, while maintaining 1.27-1.34x faster queries.
 22. Software popcount via Hamming weight in cuTile (i32): 16-word unrolled
     bitmask chain adds only ~3% overhead vs dense array lookup.
+23. u64 popcount variant: `ct.uint64` tiles work correctly. 8 gathers +
+    8 popcounts vs 16 + 16. Eliminates i32 mask conversion step. ~10%
+    faster at 50K voxels, negligible difference at other scales.
 
 ### Completed milestones (previously "next steps")
 
@@ -896,27 +1008,34 @@ Key semantic rules:
 
 ### Recommended next steps
 
-**1. Jagged output on GPU (Where).** The `Where` operation produces
-variable-length output, which requires a two-pass GPU pattern: count pass
-(parallel prefix sum for offsets), then scatter pass. This is a known GPU
-primitive but has not been expressed in the emitter yet.
+**1. Third CIG level (upper, 32x32x32).** Bit-widths `[3, 4, 5]` = 12
+bits = 4096 voxels per axis. The Decompose + chained Gather pattern
+already generalises to N levels (proven in v2). The `masked` layout
+applies at all levels. This is the structural gap that limits the current
+CIG to 128^3 grids -- real fVDB workloads need thousands of voxels per
+axis. Adding one more Gather step in the chain (and one more `masked`
+level for the upper nodes) is straightforward; the benchmark harness and
+fVDB comparison infrastructure already exist.
 
-**2. Full CIG type.** Express a 3-level compact index grid (Root/Upper/Lower
-/Leaf) as a composed DSL expression. The 2-level chain already works; 3
-levels adds Upper with 32x32x32 nodes. This validates the type system at
-full NanoVDB scale.
+**2. Multi-step compilation (barrier-based pipeline).** Implement the
+architecture described in the Multi-Step Compilation section above. Start
+with the simplest case: `Where` on GPU as a two-pass pipeline (count
+cuTile kernel -> `torch.cumsum` -> scatter cuTile kernel). This unlocks
+variable-length output and is the prerequisite for conv_grid and grid
+construction.
 
-**4. Performance at larger scale.** The v7 benchmark reaches 200K voxels
-(79K voxels). Real fVDB workloads have millions of voxels across thousands
-of leaves. Extend the benchmark to 1K-4K+ leaves to characterise scaling
-at production-relevant sizes.
+**3. `conv_grid` as the next fVDB operator comparison.** Takes an input
+grid + kernel size, produces the output grid topology (active voxels of
+the convolution). Requires: iterate active voxels, expand by kernel
+offsets, deduplicate -> a multi-step pipeline. Same benchmark harness as
+ijk_to_index (same grid, compare fVDB `conv_grid` vs CIG pipeline).
 
-**5. Successive lowering pass.** The emitter currently does pattern
-recognition (idiom detection) and code emission in a single tree walk.
-As more idioms are added (Where two-pass, Each grid nesting, Over tree
-reduction), factor the pattern-recognition phase into a separate AST
-lowering pass. The lowering pass replaces high-level nodes with concrete
-nodes that map 1:1 to cuTile calls; the emitter stays simple.
+**4. Per-node bounds (half-open intervals).** Store `[min, max)` per leaf
+(and per upper node once the third level exists). Derivable from node
+position and bit-widths, but explicit storage enables ray-box intersection
+without recomputing decomposition. Half-open intervals: `min == max` means
+empty, adjacent nodes share exact boundaries, size = `max - min`. ~24
+bytes per node.
 
 ### cuTile backend notes
 
@@ -941,29 +1060,33 @@ driver 591.59, cuda-tile 1.1.0,
 
 ### Medium-term items
 
-- **Emitter: Where (jagged output)**: two-pass GPU pattern (count + scatter)
-  for variable-length output. Known approach; needs emission rules for
-  `WhereNode` and the corresponding parallel prefix sum. This is the next
-  emitter extension that may benefit from a separate lowering pass.
 - **Idiom detection**: recognize patterns like `Over(Add, Map(xs, Gather(...)))`
   as scatter-gather and propose optimized implementations. The chained Gather
-  fusion (v6) is the first example; more idioms will follow.
+  fusion (v6) and masked Gather (v8) are the first two examples.
 - **Materialisation scheduling**: given a DSL expression, automatically decide
   where to insert Gather (early vs late) based on data characteristics
   (sparsity ratio, memory budget). This is the Halide schedule analogy.
-- **Full CIG type**: express a 3-level compact index grid as a struct of
-  three levels. Low risk -- just more of what the 2-level test proves.
-- **`flip` in DSL**: currently Python-only. Add as a lowercase DSL keyword.
 - **Let-bindings in Map bodies**: currently the parser only supports single
   expressions as Map/Each bodies. Adding let-bindings would avoid the deeply
   nested expressions needed for complex Map bodies (like the cross-leaf
-  predicate).
+  predicate). Straightforward parser extension.
+- **`flip` in DSL**: currently Python-only. Add as a lowercase DSL keyword.
 - **Common subexpression elimination (CSE)**: the cross-leaf kernel emits
   redundant Decompose bit-shifts (same expression appears in both the
   level_0 and level_1 field extractions). A CSE pass over the emitted code
   or AST would eliminate this. Low priority -- the cost is trivial.
-- **Performance at larger scale**: extend benchmarks to 1K-4K+ leaves to
-  characterise cuTile scaling at production-relevant sizes.
+- **u64 popcount as default**: the u64 masked kernel is cleaner and slightly
+  faster than the i32 variant. Make it the default and deprecate the i32
+  path once confidence is established.
+- **GPU-accelerated CIG builder**: the current `build_compressed_cig` is
+  pure PyTorch (sort + scatter on CPU). A GPU-native builder using CUB
+  radix sort + scatter would close the construction-time gap with fVDB.
+- **No world-to-grid transforms in CIG**: the design decision is that
+  `origin`, `voxel_size`, and transform matrices are instancing metadata,
+  not structural properties of the grid. They should live outside the CIG,
+  allowing the same grid to be instanced with different transforms (as in
+  modern geometry frameworks like USD). This is a deliberate departure from
+  NanoVDB, which embeds the transform in the grid buffer.
 
 ### North star
 

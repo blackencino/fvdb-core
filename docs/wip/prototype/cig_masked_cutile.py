@@ -152,6 +152,140 @@ def cig_masked_kernel(
     ct.scatter(result_arr, query_idx, voxel_idx, check_bounds=True)
 
 
+# ---------------------------------------------------------------------------
+# u64 variant: 8 x uint64 words instead of 16 x i32
+# ---------------------------------------------------------------------------
+
+
+@ct.kernel
+def cig_masked_u64_kernel(
+    query_arr,
+    lower_arr,
+    leaf_masks_arr,
+    leaf_offsets_arr,
+    result_arr,
+    TILE: ConstInt,
+):
+    """Compressed CIG ijk_to_index via u64 bitmask + popcount.
+
+    query_arr:      (N, 3)       i32 -- query coordinates
+    lower_arr:      (16, 16, 16) i32 -- lower-level grid
+    leaf_masks_arr: (K, 8)       i64 -- 8 x 64-bit bitmask per leaf (treated as u64)
+    leaf_offsets_arr: (K,)       i32 -- base offset per leaf
+    result_arr:     (N,)         i32 -- output
+    """
+    bid = ct.bid(0)
+    idx = ct.arange(TILE, dtype=ct.int32)
+    query_idx = bid * TILE + idx
+
+    # Load query components
+    qx = ct.gather(query_arr, (query_idx, 0), check_bounds=True, padding_value=0)
+    qy = ct.gather(query_arr, (query_idx, 1), check_bounds=True, padding_value=0)
+    qz = ct.gather(query_arr, (query_idx, 2), check_bounds=True, padding_value=0)
+
+    # Decompose
+    l0_x = qx & 7
+    l0_y = qy & 7
+    l0_z = qz & 7
+    l1_x = (qx >> 3) & 15
+    l1_y = (qy >> 3) & 15
+    l1_z = (qz >> 3) & 15
+
+    # Gather leaf index from lower
+    leaf_idx = ct.gather(lower_arr, (l1_x, l1_y, l1_z), check_bounds=True, padding_value=-1)
+
+    # Flat bit index within the 512-bit leaf mask
+    bit_idx = l0_x * 64 + l0_y * 8 + l0_z
+
+    # Which u64 word (0-7) and bit position (0-63)
+    word_idx = (bit_idx >> 6) & 7
+    bit_pos = ct.astype(bit_idx & 63, ct.uint64)
+
+    # Gather the target mask word (i64 tensor -> cast to u64 for clean bit ops)
+    target_word = ct.astype(
+        ct.gather(leaf_masks_arr, (leaf_idx, word_idx), check_bounds=True, padding_value=0),
+        ct.uint64,
+    )
+
+    # Bitmask check: is this voxel active?
+    is_active_u = (target_word >> bit_pos) & ct.uint64(1)
+    is_active = ct.astype(is_active_u, ct.int32)
+
+    # Partial word: mask out bits >= bit_pos
+    one_u = ct.uint64(1)
+    partial_mask = target_word & ((one_u << bit_pos) - one_u)
+
+    # u64 Hamming weight constants
+    m1 = ct.uint64(0x5555555555555555)
+    m2 = ct.uint64(0x3333333333333333)
+    m4 = ct.uint64(0x0F0F0F0F0F0F0F0F)
+    h01 = ct.uint64(0x0101010101010101)
+
+    def _popc64(w):
+        v = w - ((w >> ct.uint64(1)) & m1)
+        v = (v & m2) + ((v >> ct.uint64(2)) & m2)
+        v = (v + (v >> ct.uint64(4))) & m4
+        return ct.astype((v * h01) >> ct.uint64(56), ct.int32)
+
+    partial_popc = _popc64(partial_mask)
+
+    # Gather and popcount all 8 words, accumulate for words before word_idx
+    w0 = ct.astype(ct.gather(leaf_masks_arr, (leaf_idx, 0), check_bounds=True, padding_value=0), ct.uint64)
+    w1 = ct.astype(ct.gather(leaf_masks_arr, (leaf_idx, 1), check_bounds=True, padding_value=0), ct.uint64)
+    w2 = ct.astype(ct.gather(leaf_masks_arr, (leaf_idx, 2), check_bounds=True, padding_value=0), ct.uint64)
+    w3 = ct.astype(ct.gather(leaf_masks_arr, (leaf_idx, 3), check_bounds=True, padding_value=0), ct.uint64)
+    w4 = ct.astype(ct.gather(leaf_masks_arr, (leaf_idx, 4), check_bounds=True, padding_value=0), ct.uint64)
+    w5 = ct.astype(ct.gather(leaf_masks_arr, (leaf_idx, 5), check_bounds=True, padding_value=0), ct.uint64)
+    w6 = ct.astype(ct.gather(leaf_masks_arr, (leaf_idx, 6), check_bounds=True, padding_value=0), ct.uint64)
+    w7 = ct.astype(ct.gather(leaf_masks_arr, (leaf_idx, 7), check_bounds=True, padding_value=0), ct.uint64)
+
+    full_popc = (
+        _popc64(w0) * (word_idx > 0)
+        + _popc64(w1) * (word_idx > 1)
+        + _popc64(w2) * (word_idx > 2)
+        + _popc64(w3) * (word_idx > 3)
+        + _popc64(w4) * (word_idx > 4)
+        + _popc64(w5) * (word_idx > 5)
+        + _popc64(w6) * (word_idx > 6)
+        + _popc64(w7) * (word_idx > 7)
+    )
+
+    total_popc = full_popc + partial_popc
+
+    # Base offset
+    base = ct.gather(leaf_offsets_arr, leaf_idx, check_bounds=True, padding_value=0)
+
+    # Result: active -> base + popcount, inactive -> -1
+    voxel_idx = (base + total_popc) * is_active + (-1) * (1 - is_active)
+
+    ct.scatter(result_arr, query_idx, voxel_idx, check_bounds=True)
+
+
+def run_compressed_cig_ijk_to_index_u64(query_t, lower_t, leaf_masks_i64_t, leaf_offsets_t):
+    """Launch the u64 compressed CIG cuTile kernel.
+
+    Takes the native (K, 8) i64 masks directly -- no i32 conversion needed.
+    """
+    N = query_t.shape[0]
+    n_blocks = math.ceil(N / TILE)
+
+    result_t = torch.full((n_blocks * TILE,), -1, dtype=torch.int32, device="cuda")
+
+    ct.launch(
+        torch.cuda.current_stream(),
+        (n_blocks,),
+        cig_masked_u64_kernel,
+        (query_t, lower_t, leaf_masks_i64_t, leaf_offsets_t, result_t, TILE),
+    )
+
+    return result_t[:N]
+
+
+# ---------------------------------------------------------------------------
+# i32 variant helpers (kept for fallback)
+# ---------------------------------------------------------------------------
+
+
 def build_i32_masks(cig_compressed) -> torch.Tensor:
     """Convert CompressedCIG i64 masks to i32 masks for cuTile.
 
