@@ -1,10 +1,10 @@
 # Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: Apache-2.0
 """
-cuTile kernel for compressed CIG ijk_to_index with bitmask + popcount.
+cuTile kernels for compressed CIG ijk_to_index with bitmask + popcount.
 
-Uses i32 words (16 x 32-bit = 512 bits per leaf) since cuTile doesn't
-support i64 tiles. Popcount via the standard Hamming weight algorithm.
+Primary path: u64 (8 x uint64 words = 512 bits per leaf).
+Reference path: i32 (16 x int32 words) -- kept for comparison.
 
 The Gather-through-masked chain:
   1. Decompose query into level_1 (lower) and level_0 (leaf-local)
@@ -261,10 +261,22 @@ def cig_masked_u64_kernel(
     ct.scatter(result_arr, query_idx, voxel_idx, check_bounds=True)
 
 
-def run_compressed_cig_ijk_to_index_u64(query_t, lower_t, leaf_masks_i64_t, leaf_offsets_t):
-    """Launch the u64 compressed CIG cuTile kernel.
+# ---------------------------------------------------------------------------
+# Primary entry point (u64)
+# ---------------------------------------------------------------------------
 
-    Takes the native (K, 8) i64 masks directly -- no i32 conversion needed.
+
+def run_compressed_cig_ijk_to_index(query_t, lower_t, leaf_masks_i64_t, leaf_offsets_t):
+    """Launch the compressed CIG cuTile kernel (u64 path).
+
+    Args:
+        query_t:          (N, 3) i32 CUDA
+        lower_t:          (16, 16, 16) i32 CUDA
+        leaf_masks_i64_t: (K, 8) i64 CUDA -- native 8 x u64 bitmasks
+        leaf_offsets_t:   (K,) i32 CUDA -- base offsets
+
+    Returns:
+        (N,) i32 tensor of voxel indices (-1 for inactive)
     """
     N = query_t.shape[0]
     n_blocks = math.ceil(N / TILE)
@@ -282,19 +294,18 @@ def run_compressed_cig_ijk_to_index_u64(query_t, lower_t, leaf_masks_i64_t, leaf
 
 
 # ---------------------------------------------------------------------------
-# i32 variant helpers (kept for fallback)
+# i32 reference variant (kept for comparison, not the primary path)
 # ---------------------------------------------------------------------------
 
 
 def build_i32_masks(cig_compressed) -> torch.Tensor:
-    """Convert CompressedCIG i64 masks to i32 masks for cuTile.
+    """Convert CompressedCIG i64 masks to i32 masks for the i32 reference kernel.
 
     Input:  (K, 8) i64  -- 8 words of 64 bits
     Output: (K, 16) i32 -- 16 words of 32 bits
     """
     masks_i64 = cig_compressed.leaf_masks
     K = masks_i64.shape[0]
-    masks_i32 = torch.zeros(K, 16, dtype=torch.int32, device=masks_i64.device)
     masks_np = masks_i64.cpu().numpy()
 
     result_np = np.zeros((K, 16), dtype=np.int32)
@@ -309,8 +320,8 @@ def build_i32_masks(cig_compressed) -> torch.Tensor:
     return torch.from_numpy(result_np).to(masks_i64.device)
 
 
-def run_compressed_cig_ijk_to_index(query_t, lower_t, leaf_masks_i32_t, leaf_offsets_t):
-    """Launch the compressed CIG cuTile kernel.
+def run_compressed_cig_ijk_to_index_i32(query_t, lower_t, leaf_masks_i32_t, leaf_offsets_t):
+    """Launch the i32 reference compressed CIG cuTile kernel.
 
     Args:
         query_t:          (N, 3) i32 CUDA

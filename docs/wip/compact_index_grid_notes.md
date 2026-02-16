@@ -766,6 +766,56 @@ metadata (like offsets in jagged); the popcount is the access computation
 (like offset lookup in jagged). Both are transparent in the type system,
 analyzable in the AST, and compilable to GPU code.
 
+### v9: Masked Codegen -- DSL-to-cuTile for `masked` Gather
+
+Closes the compilation loop for the 4-line DSL claim. In v8, the cuTile
+kernel was hand-written; the DSL expression was proven correct via the
+numpy evaluator but not yet compiled. v9 extends the emitter so that the
+DSL produces a kernel structurally identical to the hand-written one.
+
+1. **`MaskedNode` emission** (`dsl_to_cutile.py`): the emitter recognises
+   `masked(Gather(Input("leaf_masks"), idx), Gather(Input("leaf_offsets"), idx))`
+   as a deferred layout construction. It extracts the mask array name and
+   leaf index, emits the base offset gather, and returns a masked sentinel
+   `EmitVal`. No popcount code is emitted yet -- that is deferred to the
+   downstream Gather.
+
+2. **Masked-Gather idiom** (`dsl_to_cutile.py`): when `GatherNode` detects
+   a masked target (via the sentinel), it calls `_emit_masked_gather_u64`
+   which emits the full u64 popcount chain: flat bit index, word/bit
+   decomposition, bitmask active check, Hamming weight for the partial
+   word, 8 unrolled word gathers with conditional popcount accumulation,
+   and the final `(base + popcount) * is_active + (-1) * (1 - is_active)`.
+   This is the third idiom the emitter recognises, after chained Gather
+   fusion (v6) and Decompose + field (v6).
+
+3. **Tile-parallel emission** (`dsl_to_cutile.py`): `emit_runnable_kernel`
+   generalised with a `tile_input` parameter for flat parallelism
+   (`query_idx = bid * TILE + arange(TILE)`), alongside the existing
+   batch+Map pattern. The masked CIG uses tile-parallel: each tile element
+   independently processes one query coordinate.
+
+4. **End-to-end test** (`test_cutile_masked_e2e.py`): the 4-line DSL string
+   is parsed, emitted as a `@ct.kernel`, compiled via cuTile JIT, launched
+   on GPU, and verified against both the numpy DSL evaluator and the
+   hand-written u64 kernel. The hand-written kernel is preserved as ground
+   truth and regression oracle.
+
+5. **u64 consolidation**: `cig_masked_cutile.py` now uses the u64 kernel
+   as the primary entry point (`run_compressed_cig_ijk_to_index`). The i32
+   kernel is retained as a labeled reference implementation.
+
+**The generated kernel is 105 lines of cuTile** -- produced mechanically
+from 4 lines of DSL. The structure matches the hand-written kernel
+one-to-one: same gathers, same bit operations, same popcount chain, same
+conditional result. The only difference is variable naming.
+
+**This validates the central claim:** a 4-line DSL expression specifying
+the algorithm (what to compute) compiles to a ~100-line GPU kernel
+specifying the implementation (how to compute it). The algorithm is
+portable, analyzable, and type-checked; the kernel is fast, fused, and
+hardware-specific. The emitter is the bridge.
+
 ---
 
 ## Working Theory
@@ -911,8 +961,9 @@ File inventory:
 | `cig_cutile.py` | v7: cuTile kernel for CIG ijk_to_index |
 | `test_cig.py` | v7: CIG builder and ijk_to_index correctness tests |
 | `bench_cig_vs_fvdb.py` | v7/v8: head-to-head CIG vs fVDB comparison |
-| `cig_masked_cutile.py` | v8: cuTile kernels with bitmask + popcount (i32 and u64 variants) |
+| `cig_masked_cutile.py` | v8: cuTile kernels with bitmask + popcount (i32 reference + u64 primary) |
 | `test_masked.py` | v8: masked layout DSL tests |
+| `test_cutile_masked_e2e.py` | v9: end-to-end DSL -> cuTile codegen for masked CIG ijk_to_index |
 | `run_all_tests.py` | Single entry point for non-GPU tests |
 
 ### Current state
@@ -980,6 +1031,15 @@ Key semantic rules:
 23. u64 popcount variant: `ct.uint64` tiles work correctly. 8 gathers +
     8 popcounts vs 16 + 16. Eliminates i32 mask conversion step. ~10%
     faster at 50K voxels, negligible difference at other scales.
+24. Masked Gather codegen: the 4-line masked CIG DSL expression compiles
+    to a ~105-line cuTile `@ct.kernel` via the extended emitter. The
+    generated kernel is structurally identical to the hand-written u64
+    kernel (same gathers, same popcount chain, same conditional result).
+    Third idiom recognised by the emitter (after chained Gather fusion
+    and Decompose + field). See `test_cutile_masked_e2e.py`.
+25. Tile-parallel emission: `emit_runnable_kernel` generalised to handle
+    flat query parallelism (`query_idx = bid * TILE + arange`) alongside
+    the existing batch+Map pattern. The masked CIG uses tile-parallel.
 
 ### Completed milestones (previously "next steps")
 
@@ -1005,6 +1065,11 @@ Key semantic rules:
   with popcount access. Compressed CIG is 0.22-0.73x NanoVDB memory at
   typical sparsities AND 1.27-1.34x faster. The `masked` layout is a
   first-class type-system concept. See `cig_masked_cutile.py`, `test_masked.py`.
+- **Masked codegen + u64 consolidation** (v9): done. The 4-line masked CIG
+  DSL expression now compiles to a cuTile kernel via the extended emitter.
+  `MaskedNode` emission, masked-Gather idiom detection (u64 popcount chain),
+  and tile-parallel `emit_runnable_kernel`. u64 is the primary path; i32
+  retained as reference. See `test_cutile_masked_e2e.py`, `dsl_to_cutile.py`.
 
 ### Recommended next steps
 
@@ -1096,3 +1161,24 @@ written as `(R/P/:)\:':` in K9 syntax -- a tacit composition of reduction,
 product, and structured iteration. This is what the framework makes possible:
 domain algorithms as tiny compositions of functions over structured tensors,
 compiled to GPU code without framework-specific imperative implementations.
+
+The compressed CIG `ijk_to_index` -- bitmask-compressed sparse grid lookup
+with hierarchical traversal and popcount -- has a similar ultra-minimal
+form:
+
+```
+(L;m[M,O])/@q\[3;4]
+```
+
+Decompose query `q` at bit-widths [3, 4] (`q\[3;4]`), then fold-index
+(`/@`) through two levels: `L` (the lower array, plain gather) and
+`m[M,O]` (the masked leaf, bitmask + popcount gather from masks `M` with
+offsets `O`). A third level is one more entry: `(L;U;m[M,O])/@q\[3;4;5]`.
+
+Most programmers would find this impenetrable, and readability matters --
+the 4-line DSL form is the one intended for human use. But the point is
+not the syntax. The point is that a sparse grid query which previously
+required a large C++/CUDA library and thousands of lines of code can be
+expressed as a single composed expression over structured tensors, and
+that expression compiles to a GPU kernel that matches or beats the
+hand-written implementation.

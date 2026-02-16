@@ -17,7 +17,7 @@ import torch
 from docs.wip.prototype.cig import CIG, build_cig, cig_ijk_to_index
 from docs.wip.prototype.cig import CompressedCIG, build_compressed_cig, compressed_cig_ijk_to_index
 from docs.wip.prototype.cig_cutile import run_cig_ijk_to_index
-from docs.wip.prototype.cig_masked_cutile import build_i32_masks, run_compressed_cig_ijk_to_index
+from docs.wip.prototype.cig_masked_cutile import run_compressed_cig_ijk_to_index
 
 try:
     import fvdb
@@ -162,8 +162,6 @@ def bench_one(n_voxels: int, n_queries: int = 50000):
     # Compressed CIG
     ccig = build_compressed_cig(grid_coords)
     ccig_cuda = ccig.cuda()
-    masks_i32 = build_i32_masks(ccig).cuda()
-    offsets_i32 = ccig.leaf_offsets.int().cuda()
     results["ccig_bytes"] = ccig.num_bytes
 
     # Print structure comparison
@@ -187,8 +185,10 @@ def bench_one(n_voxels: int, n_queries: int = 50000):
         (cig_pt_result.cpu() >= 0).numpy(), (ccig_pt_result >= 0).numpy()
     )
 
-    # Compressed CIG cuTile correctness
-    ccig_ct_result = run_compressed_cig_ijk_to_index(query_coords_cuda, ccig_cuda.lower, masks_i32, offsets_i32)
+    # Compressed CIG cuTile correctness (u64 path)
+    ccig_ct_result = run_compressed_cig_ijk_to_index(
+        query_coords_cuda, ccig_cuda.lower, ccig_cuda.leaf_masks, ccig_cuda.leaf_offsets.int()
+    )
     np.testing.assert_array_equal(ccig_pt_result.numpy(), ccig_ct_result.cpu().numpy())
 
     if HAS_FVDB:
@@ -208,8 +208,12 @@ def bench_one(n_voxels: int, n_queries: int = 50000):
     t_dense_ct = _time_fn(lambda: run_cig_ijk_to_index(query_coords_cuda, cig_cuda.lower, cig_cuda.leaf_arr))
     results["dense_ct_us"] = t_dense_ct
 
-    # Compressed CIG cuTile kernel
-    t_comp_ct = _time_fn(lambda: run_compressed_cig_ijk_to_index(query_coords_cuda, ccig_cuda.lower, masks_i32, offsets_i32))
+    # Compressed CIG cuTile kernel (u64 path)
+    t_comp_ct = _time_fn(
+        lambda: run_compressed_cig_ijk_to_index(
+            query_coords_cuda, ccig_cuda.lower, ccig_cuda.leaf_masks, ccig_cuda.leaf_offsets.int()
+        )
+    )
     results["comp_ct_us"] = t_comp_ct
 
     if HAS_FVDB:

@@ -32,6 +32,7 @@ from .dsl_ast import (
     InBoundsNode,
     InputNode,
     MapNode,
+    MaskedNode,
     Node,
     Program,
     RefNode,
@@ -50,7 +51,9 @@ from .types import ScalarType, Shape, Static, Type
 #   list[str]              -- per-axis decomposed (e.g. 3 variables for a 3D coord)
 #   dict[str, list[str]]   -- struct: field name -> per-axis decomposed
 #                             (produced by DecomposeNode, consumed by FieldNode)
-EmitVal = Union[str, list[str], dict[str, list[str]]]
+#   dict with "__masked__" -- masked layout sentinel (produced by MaskedNode,
+#                             consumed by GatherNode for popcount emission)
+EmitVal = Union[str, list[str], dict]
 
 
 def _next_pow2(n: int) -> int:
@@ -206,8 +209,114 @@ def emit_program(source: str, input_map: dict[str, str], kernel_name: str = "gen
 
 
 # ---------------------------------------------------------------------------
+# Masked-Gather emission: u64 popcount chain
+# ---------------------------------------------------------------------------
+
+
+def _emit_masked_gather_u64(ctx: EmitCtx, masked_val: dict, coord: EmitVal) -> str:
+    """Emit u64 bitmask check + popcount for Gather through a masked layout.
+
+    Produces code structurally identical to the hand-written
+    cig_masked_u64_kernel in cig_masked_cutile.py.
+
+    Args:
+        ctx: Emitter context.
+        masked_val: Masked sentinel dict with keys:
+            mask_arr  -- cuTile param name for (K, 8) i64 mask array
+            leaf_idx  -- emitted variable holding the gathered leaf index
+            base      -- emitted variable holding the gathered base offset
+        coord: Per-axis decomposed coordinate [l0_x, l0_y, l0_z].
+
+    Returns:
+        Variable name holding the result (i32 voxel index or -1).
+    """
+    if not isinstance(coord, list) or len(coord) != 3:
+        raise TypeError(f"Masked gather requires 3D decomposed coord, got {type(coord)}")
+
+    mask_arr = masked_val["mask_arr"]
+    leaf_idx = masked_val["leaf_idx"]
+    base_var = masked_val["base"]
+    l0_x, l0_y, l0_z = coord
+
+    ctx.emit("# --- Masked gather: u64 bitmask check + popcount ---")
+
+    # Flat bit index within the 512-bit leaf mask
+    bit_idx = ctx.fresh("bit_idx")
+    ctx.emit(f"{bit_idx} = {l0_x} * 64 + {l0_y} * 8 + {l0_z}")
+
+    # Which u64 word (0-7) and bit position (0-63)
+    word_idx = ctx.fresh("word_idx")
+    ctx.emit(f"{word_idx} = ({bit_idx} >> 6) & 7")
+    bit_pos = ctx.fresh("bit_pos")
+    ctx.emit(f"{bit_pos} = ct.astype({bit_idx} & 63, ct.uint64)")
+
+    # Gather the target mask word
+    tgt_word = ctx.fresh("tgt_word")
+    ctx.emit(
+        f"{tgt_word} = ct.astype("
+        f"ct.gather({mask_arr}, ({leaf_idx}, {word_idx}), check_bounds=True, padding_value=0), ct.uint64)"
+    )
+
+    # Bitmask check: is this voxel active?
+    is_active_u = ctx.fresh("is_active_u")
+    is_active = ctx.fresh("is_active")
+    ctx.emit(f"{is_active_u} = ({tgt_word} >> {bit_pos}) & ct.uint64(1)")
+    ctx.emit(f"{is_active} = ct.astype({is_active_u}, ct.int32)")
+
+    # Partial word: mask out bits >= bit_pos
+    partial_mask = ctx.fresh("pmask")
+    ctx.emit(f"{partial_mask} = {tgt_word} & ((ct.uint64(1) << {bit_pos}) - ct.uint64(1))")
+
+    # u64 Hamming weight constants (emitted once)
+    ctx.emit("m1_u64 = ct.uint64(0x5555555555555555)")
+    ctx.emit("m2_u64 = ct.uint64(0x3333333333333333)")
+    ctx.emit("m4_u64 = ct.uint64(0x0F0F0F0F0F0F0F0F)")
+    ctx.emit("h01_u64 = ct.uint64(0x0101010101010101)")
+
+    def emit_popc64(w_var: str) -> str:
+        """Emit inline u64 Hamming weight, return result variable name."""
+        v1 = ctx.fresh("pc")
+        ctx.emit(f"{v1} = {w_var} - (({w_var} >> ct.uint64(1)) & m1_u64)")
+        v2 = ctx.fresh("pc")
+        ctx.emit(f"{v2} = ({v1} & m2_u64) + (({v1} >> ct.uint64(2)) & m2_u64)")
+        v3 = ctx.fresh("pc")
+        ctx.emit(f"{v3} = ({v2} + ({v2} >> ct.uint64(4))) & m4_u64")
+        result = ctx.fresh("pc")
+        ctx.emit(f"{result} = ct.astype(({v3} * h01_u64) >> ct.uint64(56), ct.int32)")
+        return result
+
+    partial_popc = emit_popc64(partial_mask)
+
+    # Gather and popcount all 8 u64 words, accumulate for words before word_idx
+    terms = []
+    for i in range(8):
+        w = ctx.fresh("mw")
+        ctx.emit(
+            f"{w} = ct.astype("
+            f"ct.gather({mask_arr}, ({leaf_idx}, {i}), check_bounds=True, padding_value=0), ct.uint64)"
+        )
+        p = emit_popc64(w)
+        t = ctx.fresh("pt")
+        ctx.emit(f"{t} = {p} * ({word_idx} > {i})")
+        terms.append(t)
+
+    full_popc = ctx.fresh("full_popc")
+    ctx.emit(f"{full_popc} = " + " + ".join(terms))
+
+    total_popc = ctx.fresh("total_popc")
+    ctx.emit(f"{total_popc} = {full_popc} + {partial_popc}")
+
+    # Result: active -> base + popcount, inactive -> -1
+    result = ctx.fresh("masked_idx")
+    ctx.emit(f"{result} = ({base_var} + {total_popc}) * {is_active} + (-1) * (1 - {is_active})")
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Axis-decomposed emitter (produces runnable @ct.kernel)
 # ---------------------------------------------------------------------------
+
 
 def _emit_decomposed(node: Node, ctx: EmitCtx, input_types: dict[str, Type]) -> EmitVal:
     """Emit cuTile code with axis decomposition. Returns EmitVal."""
@@ -329,9 +438,42 @@ def _emit_decomposed(node: Node, ctx: EmitCtx, input_types: dict[str, Type]) -> 
         raise TypeError(f"Field access requires struct (dict), got {type(struct_val).__name__}")
 
     # -----------------------------------------------------------------
-    # Gather -- with chain flattening (idiom detection)
+    # Masked layout: deferred computation (no code emitted yet)
+    # -----------------------------------------------------------------
+    if isinstance(node, MaskedNode):
+        # Pattern-match: masked(Gather(Input("mask_arr"), idx), Gather(Input("offset_arr"), idx))
+        # Extract the underlying array names and the shared leaf index.
+        # The actual popcount code is emitted when a GatherNode targets this.
+        if not isinstance(node.mask, GatherNode) or not isinstance(node.mask.target, InputNode):
+            raise TypeError("masked() mask argument must be Gather(Input(...), idx)")
+        if not isinstance(node.offset, GatherNode) or not isinstance(node.offset.target, InputNode):
+            raise TypeError("masked() offset argument must be Gather(Input(...), idx)")
+
+        mask_arr_name = ctx.input_params[node.mask.target.name]
+        leaf_idx_val = _emit_decomposed(node.mask.indexer, ctx, input_types)
+        leaf_idx_str = leaf_idx_val if isinstance(leaf_idx_val, str) else leaf_idx_val[0]
+
+        offset_arr_name = ctx.input_params[node.offset.target.name]
+
+        # Emit the base offset gather (we need the scalar value at runtime)
+        base_var = ctx.fresh("mbase")
+        ctx.emit(f"{base_var} = ct.gather({offset_arr_name}, {leaf_idx_str}, check_bounds=True, padding_value=0)")
+
+        return {"__masked__": True, "mask_arr": mask_arr_name, "leaf_idx": leaf_idx_str, "base": base_var}
+
+    # -----------------------------------------------------------------
+    # Gather -- with masked-target and chain flattening (idiom detection)
     # -----------------------------------------------------------------
     if isinstance(node, GatherNode):
+        # Check for masked target (via RefNode -> masked EmitVal).
+        # Must come before chained-gather check since masked is detected
+        # at the EmitVal level, not the AST level.
+        if isinstance(node.target, RefNode):
+            val = ctx.lookup(node.target.name)
+            if isinstance(val, dict) and val.get("__masked__"):
+                indexer = _emit_decomposed(node.indexer, ctx, input_types)
+                return _emit_masked_gather_u64(ctx, val, indexer)
+
         # Detect chained gathers: Gather(Gather(source, idx1), idx2).
         # Fuse into a single ct.gather(source, (idx1..., idx2...)).
         # This is the key idiom for hierarchical traversal: the two-step
@@ -386,33 +528,108 @@ def _emit_decomposed(node: Node, ctx: EmitCtx, input_types: dict[str, Type]) -> 
 def emit_runnable_kernel(
     source: str,
     input_types: dict[str, Type],
-    batch_input: str,
-    batch_dim: int,
-    map_input: str,
-    map_elem_rank: int,
     kernel_name: str = "generated_kernel",
-) -> str:
+    # --- Pattern 1: batch + Map (existing) ---
+    batch_input: str | None = None,
+    batch_dim: int = 0,
+    map_input: str | None = None,
+    map_elem_rank: int = 0,
+    # --- Pattern 2: tile-parallel (new) ---
+    tile_input: str | None = None,
+    tile_input_rank: int = 0,
+    tile_size: int = 256,
+) -> tuple[str, int, int]:
     """Emit a complete, compilable @ct.kernel from a DSL program.
 
-    This emitter handles the neighbor-predicate pattern: an outer batch
-    dimension (mapped to ct.bid) with an inner Map over a fixed-size
-    collection (mapped to a tile via ct.arange).
+    Two patterns are supported:
 
-    Args:
-        source: DSL program string.
-        input_types: Maps DSL input names to their Types.
-        batch_input: Name of the DSL input that provides the batch dimension
-                     (e.g. "coord" -- one kernel block per element).
-        batch_dim: Number of components in the batch element (e.g. 3 for 3D).
-        map_input: Name of the DSL input iterated by the inner Map
-                   (e.g. "offsets").
-        map_elem_rank: Number of components in each Map element (e.g. 3).
-        kernel_name: Name for the generated function.
+    **Batch + Map** (set batch_input and map_input): one block per batch
+    element, one tile per inner Map. Used for neighbor predicates.
+
+    **Tile-parallel** (set tile_input): flat parallelism where each tile
+    element processes one query from an (N, K) input array.  Used for
+    CIG ijk_to_index and similar pointwise-over-queries kernels.
 
     Returns:
-        Python source code string containing a complete @ct.kernel.
+        (code, tile_size, map_len) where map_len is 0 for tile-parallel.
     """
     prog = parse(source)
+    ctx = EmitCtx()
+
+    # Build kernel parameter names
+    param_map = {}
+    for name in input_types:
+        param_map[name] = name + "_arr"
+    ctx.input_params = param_map
+
+    # ------------------------------------------------------------------
+    # Pattern 2: tile-parallel (flat query_idx = bid * TILE + arange)
+    # ------------------------------------------------------------------
+    if tile_input is not None:
+        ctx.emit("bid = ct.bid(0)")
+        idx_var = ctx.fresh("idx")
+        ctx.emit(f"{idx_var} = ct.arange({tile_size}, dtype=ct.int32)")
+        query_idx = ctx.fresh("qidx")
+        ctx.emit(f"{query_idx} = bid * {tile_size} + {idx_var}")
+        ctx.emit("")
+
+        # Decompose the tile input into per-axis tile gathers
+        tile_param = param_map[tile_input]
+        tile_axes = []
+        for ax in range(tile_input_rank):
+            v = ctx.fresh("qi")
+            ctx.emit(f"{v} = ct.gather({tile_param}, ({query_idx}, {ax}), check_bounds=True, padding_value=0)")
+            tile_axes.append(v)
+        ctx.input_params[tile_input] = "__decomposed__"
+        ctx.locals[tile_input] = tile_axes  # type: ignore[assignment]
+        ctx.bindings[tile_input] = tile_axes  # type: ignore[assignment]
+        ctx.emit("")
+
+        # Emit the program body
+        for name, node in prog.bindings:
+            val = _emit_decomposed(node, ctx, input_types)
+            ctx.bindings[name] = val
+
+        # Get the output variable
+        output_val = ctx.bindings.get(prog.output)
+        if output_val is None:
+            raise TypeError(f"Output {prog.output!r} not found")
+        output_str = output_val if isinstance(output_val, str) else output_val[0]
+
+        # Emit type cast and 1D scatter
+        result_var = ctx.fresh("out")
+        ctx.emit("")
+        ctx.emit(f"{result_var} = ct.astype({output_str}, ct.int32)")
+        ctx.emit(f"ct.scatter(result_arr, {query_idx}, {result_var}, check_bounds=True)")
+
+        # Assemble kernel source
+        all_params = [f"{name}_arr" for name in input_types]
+        all_params.append("result_arr")
+        all_params.append("TILE: ct.Constant[int]")
+        params_str = ", ".join(all_params)
+        body_lines = "\n".join(ctx.lines)
+
+        code = f"""\
+import cuda.tile as ct
+import torch
+
+ConstInt = ct.Constant[int]
+
+# --- Generated from DSL (tile-parallel) ---
+# Source: {source.strip().replace(chr(10), chr(10) + '# ')}
+# Tile input: {tile_input} (rank={tile_input_rank}), TILE={tile_size}
+
+@ct.kernel
+def {kernel_name}({params_str}):
+{body_lines}
+"""
+        return code, tile_size, 0
+
+    # ------------------------------------------------------------------
+    # Pattern 1: batch + Map (existing)
+    # ------------------------------------------------------------------
+    if batch_input is None or map_input is None:
+        raise TypeError("Either tile_input or both batch_input and map_input must be provided")
 
     # Determine tile sizes
     map_type = input_types[map_input]
@@ -421,14 +638,6 @@ def emit_runnable_kernel(
     else:
         raise TypeError("Map input must have static leading extent")
     tile_size = _next_pow2(map_len)
-
-    ctx = EmitCtx()
-
-    # Build kernel parameter names
-    param_map = {}
-    for name in input_types:
-        param_map[name] = name + "_arr"
-    ctx.input_params = param_map
 
     # Emit kernel body
     ctx.emit("bid = ct.bid(0)")
@@ -443,7 +652,6 @@ def emit_runnable_kernel(
         batch_axes.append(v)
     ctx.input_params[batch_input] = "__decomposed__"
     ctx.locals[batch_input] = batch_axes  # type: ignore[assignment]
-    # Also bind as a direct binding for RefNode lookups
     ctx.bindings[batch_input] = batch_axes  # type: ignore[assignment]
     ctx.emit("")
 
@@ -481,10 +689,9 @@ def emit_runnable_kernel(
     ctx.emit(f"ct.scatter(result_arr, (bid, {idx_var}), {result_var}, check_bounds=True)")
 
     # Assemble the full kernel source
-    # Build the parameter list: all input arrays + result_arr + TILE constant
     all_params = [f"{name}_arr" for name in input_types]
     all_params.append("result_arr")
-    all_params.append(f"TILE: ct.Constant[int]")
+    all_params.append("TILE: ct.Constant[int]")
     params_str = ", ".join(all_params)
 
     body_lines = "\n".join(ctx.lines)
@@ -495,7 +702,7 @@ import torch
 
 ConstInt = ct.Constant[int]
 
-# --- Generated from DSL ---
+# --- Generated from DSL (batch + Map) ---
 # Source: {source.strip().replace(chr(10), chr(10) + '# ')}
 # Batch input: {batch_input} (dim={batch_dim}), Map input: {map_input} (elem_rank={map_elem_rank})
 # Tile size: {tile_size} (next power-of-two >= {map_len})
