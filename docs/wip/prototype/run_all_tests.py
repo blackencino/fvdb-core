@@ -7,6 +7,13 @@ Run all prototype tests in conceptual order.
   v1  -- multiple leaves (Cut), Indexed layout, Struct + Flip
   v2  -- two-level hierarchical chain, Decompose, morton
   v3  -- micro DSL: string -> parse -> type-check -> execute
+  mesh -- triangle mesh as layouts over tensors
+  v5  -- cross-leaf neighbors via DSL evaluator (numpy)
+
+GPU tests (require `source ~/.venvs/fvdb_cutile/bin/activate`):
+  v4  -- test_cutile_smoke.py, test_cutile_gather.py, test_cutile_codegen.py
+  v5  -- test_cutile_e2e.py
+  v6  -- test_cutile_cross_leaf.py, bench_cutile_cross_leaf.py
 """
 
 import sys
@@ -111,6 +118,20 @@ def main():
     _run("mesh_types", test_mesh_types)
     _run("mesh_centroids", test_mesh_centroids)
     _run("mesh_dsl", test_mesh_dsl)
+
+    # -- v5: cross-leaf neighbors (numpy DSL evaluator) --
+    print()
+    print("=" * 60)
+    print("v5: Cross-leaf neighbors -- Decompose + chained Gather (DSL)")
+    print("=" * 60)
+    from docs.wip.prototype.test_cross_leaf import (
+        test_single_coord_cross_leaf,
+        test_cross_boundary_neighbor,
+        test_batch_cross_leaf,
+    )
+    _run("single_coord_cross_leaf", test_single_coord_cross_leaf)
+    _run("cross_boundary_neighbor", test_cross_boundary_neighbor)
+    _run("batch_cross_leaf", test_batch_cross_leaf)
 
     print()
     print("=" * 60)

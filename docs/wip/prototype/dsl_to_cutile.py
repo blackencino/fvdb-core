@@ -25,6 +25,8 @@ from .dsl_ast import (
     AddNode,
     AndNode,
     ConstNode,
+    DecomposeNode,
+    FieldNode,
     GatherNode,
     GENode,
     InBoundsNode,
@@ -43,10 +45,12 @@ from .types import ScalarType, Shape, Static, Type
 # Value representations in the emitter
 # ---------------------------------------------------------------------------
 
-# A value in the emitter is either:
-#   str          -- a single variable name (scalar or 1D tile)
-#   list[str]    -- per-axis decomposed (e.g. 3 variables for a 3D coord)
-EmitVal = Union[str, list[str]]
+# A value in the emitter is one of:
+#   str                    -- a single variable name (scalar or 1D tile)
+#   list[str]              -- per-axis decomposed (e.g. 3 variables for a 3D coord)
+#   dict[str, list[str]]   -- struct: field name -> per-axis decomposed
+#                             (produced by DecomposeNode, consumed by FieldNode)
+EmitVal = Union[str, list[str], dict[str, list[str]]]
 
 
 def _next_pow2(n: int) -> int:
@@ -282,7 +286,80 @@ def _emit_decomposed(node: Node, ctx: EmitCtx, input_types: dict[str, Type]) -> 
         ctx.emit(f"{v} = {a_str} & {b_str}")
         return v
 
+    # -----------------------------------------------------------------
+    # Pattern recognition: Decompose -> per-level bit extractions
+    # -----------------------------------------------------------------
+    if isinstance(node, DecomposeNode):
+        coord = _emit_decomposed(node.input, ctx, input_types)
+        if not isinstance(coord, list):
+            raise TypeError(f"Decompose expects decomposed coord (list), got {type(coord).__name__}")
+        ctx.emit(f"# Decompose: bit_widths={node.bit_widths}")
+        result: dict[str, list[str]] = {}
+        shift = 0
+        for i, bw in enumerate(node.bit_widths):
+            mask = (1 << bw) - 1
+            field_name = f"level_{i}"
+            axes = []
+            for ax_var in coord:
+                v = ctx.fresh(f"d{i}")
+                if shift == 0:
+                    ctx.emit(f"{v} = {ax_var} & {mask}")
+                else:
+                    ctx.emit(f"{v} = ({ax_var} >> {shift}) & {mask}")
+                axes.append(v)
+            result[field_name] = axes
+            shift += bw
+        top_axes = []
+        for ax_var in coord:
+            v = ctx.fresh("dt")
+            ctx.emit(f"{v} = {ax_var} >> {shift}")
+            top_axes.append(v)
+        result["which_top"] = top_axes
+        return result
+
+    # -----------------------------------------------------------------
+    # Pattern recognition: field projection from struct
+    # -----------------------------------------------------------------
+    if isinstance(node, FieldNode):
+        struct_val = _emit_decomposed(node.expr, ctx, input_types)
+        if isinstance(struct_val, dict):
+            if node.field_name not in struct_val:
+                raise TypeError(f"Struct has no field {node.field_name!r}")
+            return struct_val[node.field_name]
+        raise TypeError(f"Field access requires struct (dict), got {type(struct_val).__name__}")
+
+    # -----------------------------------------------------------------
+    # Gather -- with chain flattening (idiom detection)
+    # -----------------------------------------------------------------
     if isinstance(node, GatherNode):
+        # Detect chained gathers: Gather(Gather(source, idx1), idx2).
+        # Fuse into a single ct.gather(source, (idx1..., idx2...)).
+        # This is the key idiom for hierarchical traversal: the two-step
+        # "look up leaf block, then index into it" becomes one 4D gather.
+        if isinstance(node.target, GatherNode):
+            inner = node.target
+            source = _emit_decomposed(inner.target, ctx, input_types)
+            inner_idx = _emit_decomposed(inner.indexer, ctx, input_types)
+            outer_idx = _emit_decomposed(node.indexer, ctx, input_types)
+
+            source_str = source if isinstance(source, str) else source[0]
+            all_indices: list[str] = []
+            if isinstance(inner_idx, list):
+                all_indices.extend(inner_idx)
+            else:
+                all_indices.append(inner_idx)
+            if isinstance(outer_idx, list):
+                all_indices.extend(outer_idx)
+            else:
+                all_indices.append(outer_idx)
+
+            v = ctx.fresh("gath")
+            idx_tuple = "(" + ", ".join(all_indices) + ")"
+            ctx.emit(f"# Fused chained gather: {len(all_indices)}D index")
+            ctx.emit(f"{v} = ct.gather({source_str}, {idx_tuple}, check_bounds=True, padding_value=-1)")
+            return v
+
+        # Non-chained gather (existing path)
         target = _emit_decomposed(node.target, ctx, input_types)
         indexer = _emit_decomposed(node.indexer, ctx, input_types)
         target_str = target if isinstance(target, str) else target[0]

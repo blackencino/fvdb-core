@@ -495,6 +495,9 @@ bounds checking. The `check_bounds=True, padding_value=-1` pattern fuses our
 | `Add`, `GE`, `And` | tile arithmetic (`+`, `>=`, `&`) |
 | `Each(xs, ...)` | grid-level parallelism (`ct.bid(0)`) |
 | `Over(Add, xs)` | `ct.sum(tile, axis)` |
+| `Decompose(coord, [3, 4])` | `(coord >> shift) & mask` per level per axis |
+| `field(struct, "level_N")` | select per-axis tile variables |
+| `Gather(Gather(A, i), j)` | `ct.gather(A, (i, j...))` fused 4D gather |
 
 ### v5: End-to-End Codegen, Benchmark, Cross-Leaf
 
@@ -541,6 +544,59 @@ Three milestones closing the remaining gaps:
    boundaries, all correct. **The DSL composes cleanly for cross-boundary
    traversal.**
 
+### v6: Cross-Leaf GPU Codegen + Scale Benchmark
+
+Three new capabilities closing the compilation gap for hierarchical traversal:
+
+1. **Emitter: Decompose + field + chained Gather** (`dsl_to_cutile.py`):
+   three new emission rules extend `_emit_decomposed`:
+
+   - `DecomposeNode`: per-level per-axis bit extractions (`>> shift & mask`).
+   - `FieldNode`: project named field from the decomposed struct.
+   - `GatherNode` chain flattening (idiom detection):
+     `Gather(Gather(leaf_arr, leaf_idx), level_0)` fuses into a single
+     4D `ct.gather(leaf_arr, (leaf_idx, l0_x, l0_y, l0_z))`. This is the
+     first idiom the emitter recognises -- the two-step "look up leaf block,
+     then index into it" becomes one fused gather.
+
+   **Updated correspondence table:**
+
+   | DSL | cuTile |
+   |-----|--------|
+   | `Decompose(coord, [3, 4])` | `(coord >> shift) & mask` per level per axis |
+   | `field(struct, "level_N")` | select per-axis variables for level N |
+   | `Gather(Gather(A, i), j)` | `ct.gather(A, (i, j_x, j_y, j_z))` (fused) |
+
+2. **Cross-leaf on GPU** (`test_cutile_cross_leaf.py`): the Map-form DSL
+   expression for cross-leaf neighbor finding is parsed, emitted as a
+   complete `@ct.kernel`, compiled via cuTile JIT, launched on GPU, and
+   verified against both the numpy DSL evaluator and a numpy reference.
+   817 voxels across 4 leaves, 1734 active neighbors, 617 cross-leaf
+   lookups -- all correct. **DSL string -> GPU execution for hierarchical
+   sparse traversal.**
+
+3. **Scale benchmark** (`bench_cutile_cross_leaf.py`): cross-leaf predicate
+   benchmarked at 4, 64, and 256 leaves against numpy and PyTorch GPU:
+
+   | Leaves | Voxels | Lookups | numpy (us) | PyTorch GPU (us) | cuTile (us) | CT/PT |
+   |--------|--------|---------|------------|------------------|-------------|-------|
+   | 4 | 1,217 | 7,302 | 58,653 | 471 | 57 | 8.3x |
+   | 64 | 19,778 | 118,668 | 980,862 | 478 | 58 | 8.2x |
+   | 256 | 79,206 | 475,236 | 3,828,976 | 498 | 102 | 4.9x |
+
+   cuTile's advantage comes from: (a) single fused kernel with no
+   intermediate tensors, (b) the 4D fused gather avoids materialising
+   intermediate leaf blocks, (c) `ct.gather` built-in bounds checking
+   eliminates separate validation passes. The GPU scaling is excellent:
+   80x more work (4 -> 256 leaves) costs only 2x more time.
+
+**Key finding:** the chained gather pattern `Gather(Gather(A, i), j)` that
+the type system tracks as two distinct operations naturally fuses into one
+`ct.gather` at emission time. This is the Halide analogy made concrete: the
+**algorithm** is hierarchical lookup expressed as nested Gathers; the
+**schedule** is a fused 4D gather. The emitter recognises the pattern and
+applies the optimisation automatically.
+
 ---
 
 ## Working Theory
@@ -555,8 +611,10 @@ scene graphs -- in a form that is:
   before execution.
 - **Compilable**: types carry enough information to lower to concrete GPU
   code via idiom detection and algebraic transformation. **Demonstrated** in
-  v4/v5: DSL string -> AST -> runnable cuTile `@ct.kernel` -> GPU execution
-  -> correct results, 4.4x faster than vectorized PyTorch GPU.
+  v4/v5/v6: DSL string -> AST -> runnable cuTile `@ct.kernel` -> GPU
+  execution -> correct results. v6 extends this to hierarchical sparse
+  traversal with automatic gather fusion, 4.9-8.3x faster than vectorized
+  PyTorch GPU at 4-256 leaf scale.
 
 fVDB's sparse voxel operations are the proving ground, not the ceiling.
 
@@ -596,7 +654,9 @@ File inventory:
 | `test_cutile_e2e.py` | v5: end-to-end DSL string -> GPU execution -> verify |
 | `bench_cutile.py` | v5: performance benchmark (cuTile vs numpy vs PyTorch) |
 | `test_cross_leaf.py` | v5: cross-leaf neighbor finding via hierarchical chain |
-| `run_all_tests.py` | Single entry point for all 20 tests |
+| `test_cutile_cross_leaf.py` | v6: cross-leaf GPU codegen, compile, launch, verify |
+| `bench_cutile_cross_leaf.py` | v6: cross-leaf scale benchmark (cuTile vs numpy vs PyTorch) |
+| `run_all_tests.py` | Single entry point for non-GPU tests |
 
 ### Current state
 
@@ -640,6 +700,14 @@ Key semantic rules:
     vectorized PyTorch GPU for the scatter-gather predicate.
 13. Cross-leaf neighbor composability: Decompose + chained Gather traverses
     leaf boundaries correctly (300 lookups, 48 cross-leaf, all correct).
+14. Cross-leaf GPU codegen: emitter handles Decompose, field, and chained
+    Gather with automatic gather fusion. DSL string -> GPU execution for
+    hierarchical sparse traversal (817 voxels, 617 cross-leaf, all correct).
+15. Idiom detection: `Gather(Gather(A, i), j)` automatically fused into
+    a single 4D `ct.gather(A, (i, j_x, j_y, j_z))` at emission time.
+16. Scale benchmark: cuTile 4.9-8.3x faster than PyTorch GPU at 4-256
+    leaf scale (up to 79K voxels, 475K lookups). GPU scaling excellent:
+    80x more work costs only 2x more time.
 
 ### Completed milestones (previously "next steps")
 
@@ -649,28 +717,36 @@ Key semantic rules:
   cuTile JIT -> GPU launch -> correct results. See `test_cutile_e2e.py`.
 - **First performance number** (v5): done. cuTile 4.4x faster than
   PyTorch GPU, 214x faster than numpy. See `bench_cutile.py`.
+- **Cross-leaf GPU codegen** (v6): done. Emitter extended with Decompose,
+  field, and chained Gather fusion. DSL string -> GPU execution for
+  hierarchical traversal. See `test_cutile_cross_leaf.py`.
+- **Scale benchmark** (v6): done. cuTile 4.9-8.3x faster than PyTorch GPU
+  at 4-256 leaf scale (up to 79K voxels, 475K lookups). Excellent GPU
+  scaling. See `bench_cutile_cross_leaf.py`.
 
 ### Recommended next steps
 
-**1. Codegen for cross-leaf neighbors on GPU.** The cross-leaf predicate
-works in the numpy DSL evaluator. The next compilation target: emit a cuTile
-kernel for the hierarchical chain (Decompose + 4-step Gather) and run it on
-GPU. This requires the emitter to handle `Decompose`, `field`, and chained
-`Gather` -- all new emission rules beyond the current set.
-
-**2. Jagged output on GPU (Where).** The `Where` operation produces
+**1. Jagged output on GPU (Where).** The `Where` operation produces
 variable-length output, which requires a two-pass GPU pattern: count pass
 (parallel prefix sum for offsets), then scatter pass. This is a known GPU
 primitive but has not been expressed in the emitter yet.
 
-**3. Full CIG type.** Express a 3-level compact index grid (Root/Upper/Lower
+**2. Full CIG type.** Express a 3-level compact index grid (Root/Upper/Lower
 /Leaf) as a composed DSL expression. The 2-level chain already works; 3
 levels adds Upper with 32x32x32 nodes. This validates the type system at
 full NanoVDB scale.
 
-**4. Performance at scale.** The current benchmark uses 453 voxels in one
-(8,8,8) leaf. Real fVDB workloads have millions of voxels across thousands
-of leaves. Benchmark with a realistic grid size to measure how cuTile scales.
+**3. Performance at larger scale.** The v6 benchmark reaches 256 leaves
+(79K voxels). Real fVDB workloads have millions of voxels across thousands
+of leaves. Extend the benchmark to 1K-4K+ leaves to characterise scaling
+at production-relevant sizes.
+
+**4. Successive lowering pass.** The emitter currently does pattern
+recognition (idiom detection) and code emission in a single tree walk.
+As more idioms are added (Where two-pass, Each grid nesting, Over tree
+reduction), factor the pattern-recognition phase into a separate AST
+lowering pass. The lowering pass replaces high-level nodes with concrete
+nodes that map 1:1 to cuTile calls; the emitter stays simple.
 
 ### cuTile backend notes
 
@@ -695,25 +771,29 @@ driver 591.59, cuda-tile 1.1.0,
 
 ### Medium-term items
 
-- **Emitter: Decompose + field + chained Gather**: extend `dsl_to_cutile.py`
-  to emit the cross-leaf hierarchical chain as a cuTile kernel. This requires
-  new emission rules for `DecomposeNode`, `FieldNode`, and multi-step
-  `GatherNode` chains. The target kernel shape is known from the hand-written
-  examples; the emitter needs to handle struct decomposition.
 - **Emitter: Where (jagged output)**: two-pass GPU pattern (count + scatter)
   for variable-length output. Known approach; needs emission rules for
-  `WhereNode` and the corresponding parallel prefix sum.
+  `WhereNode` and the corresponding parallel prefix sum. This is the next
+  emitter extension that may benefit from a separate lowering pass.
 - **Idiom detection**: recognize patterns like `Over(Add, Map(xs, Gather(...)))`
-  as scatter-gather and propose optimized implementations. This is where the
-  AST pays off -- the expression tree is inspectable.
+  as scatter-gather and propose optimized implementations. The chained Gather
+  fusion (v6) is the first example; more idioms will follow.
 - **Materialisation scheduling**: given a DSL expression, automatically decide
   where to insert Gather (early vs late) based on data characteristics
   (sparsity ratio, memory budget). This is the Halide schedule analogy.
 - **Full CIG type**: express a 3-level compact index grid as a struct of
   three levels. Low risk -- just more of what the 2-level test proves.
 - **`flip` in DSL**: currently Python-only. Add as a lowercase DSL keyword.
-- **Performance at scale**: benchmark with realistic grid sizes (millions of
-  voxels, thousands of leaves) to characterise cuTile scaling behaviour.
+- **Let-bindings in Map bodies**: currently the parser only supports single
+  expressions as Map/Each bodies. Adding let-bindings would avoid the deeply
+  nested expressions needed for complex Map bodies (like the cross-leaf
+  predicate).
+- **Common subexpression elimination (CSE)**: the cross-leaf kernel emits
+  redundant Decompose bit-shifts (same expression appears in both the
+  level_0 and level_1 field extractions). A CSE pass over the emitted code
+  or AST would eliminate this. Low priority -- the cost is trivial.
+- **Performance at larger scale**: extend benchmarks to 1K-4K+ leaves to
+  characterise cuTile scaling at production-relevant sizes.
 
 ### North star
 
