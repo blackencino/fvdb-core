@@ -597,6 +597,76 @@ the type system tracks as two distinct operations naturally fuses into one
 **schedule** is a fused 4D gather. The emitter recognises the pattern and
 applies the optimisation automatically.
 
+### v7: CIG Format, Builder, and fVDB Head-to-Head
+
+First apples-to-apples comparison with fVDB. Three components:
+
+1. **CIG builder** (`cig.py`): `build_cig(ijk)` constructs a 2-level CIG
+   from `(N, 3)` voxel coordinates. Returns a `CIG` dataclass with `lower`
+   `(16,16,16)` and `leaf_arr` `(K,8,8,8)` tensors. Pure PyTorch. The CIG
+   equivalent of `fvdb.Grid.from_ijk()`.
+
+2. **CIG ijk_to_index** -- three implementations:
+   - Numpy reference (loop-based, correctness verification)
+   - PyTorch vectorized (broadcast + advanced indexing)
+   - cuTile kernel (`cig_cutile.py`): hand-written from the v6 cross-leaf
+     pattern, tile-parallel with TILE=256 queries per block
+
+3. **Head-to-head benchmark** (`bench_cig_vs_fvdb.py`): construction,
+   memory, and query time at 1K-200K voxels. Same coordinates, verified
+   identical active/inactive classification.
+
+   **Query performance** (50,000 queries):
+
+   | Voxels | CIG cuTile (us) | fVDB NanoVDB (us) | Speedup |
+   |--------|----------------|-------------------|---------|
+   | 1,000 | 69 | 89 | 1.3x |
+   | 10,000 | 68 | 87 | 1.3x |
+   | 50,000 | 68 | 89 | 1.3x |
+   | 200,000 | 70 | 106 | 1.5x |
+
+   **CIG cuTile is 1.3-1.5x faster than NanoVDB** for ijk_to_index. The
+   fused 4D gather avoids NanoVDB's multi-level tree traversal overhead.
+
+   **Memory footprint:**
+
+   | Voxels | CIG (KB) | fVDB NanoVDB (KB) | Ratio |
+   |--------|----------|-------------------|-------|
+   | 1,000 | 1,798 | 382 | 0.2x |
+   | 10,000 | 7,498 | 649 | 0.1x |
+   | 200,000 | 8,208 | 682 | 0.1x |
+
+   **NanoVDB uses 8-12x less memory** than the naive CIG. This is expected:
+   NanoVDB uses bitmask compression (64-byte active mask per leaf + only
+   active voxel data via popcount offsets), while CIG stores dense (8,8,8)
+   i32 blocks with -1 sentinels. The CIG trades memory for query simplicity
+   -- direct array indexing vs NanoVDB's bitmask + popcount.
+
+   **Construction time:**
+
+   | Voxels | CIG (us) | fVDB (us) | CIG/fVDB |
+   |--------|----------|-----------|----------|
+   | 1,000 | 3,033 | 3,332 | 0.9x |
+   | 10,000 | 29,235 | 3,598 | 8.1x |
+   | 200,000 | 594,207 | 7,846 | 75.7x |
+
+   CIG construction is pure Python/PyTorch (sort + scatter), while fVDB
+   uses an optimised C++ builder. A GPU-native CIG builder would close
+   this gap significantly.
+
+**Key findings:**
+- **Query speed validates the approach.** The cuTile fused gather beats
+  NanoVDB's compiled C++/CUDA kernel. This is the compilation thesis in
+  action: a simple data layout + compiled access pattern outperforms a
+  complex tree traversal on the same hardware.
+- **Memory is the open problem.** The naive dense-leaf format wastes storage
+  on inactive entries. The design question: can we add bitmask compression
+  to the CIG while keeping the fused gather pattern? NanoVDB's popcount-
+  based offset calculation would need to become part of the Gather chain.
+- **Construction needs GPU acceleration.** The pure PyTorch builder is
+  acceptable for prototyping but not competitive at scale. A GPU sort +
+  scatter builder is straightforward.
+
 ---
 
 ## Working Theory
@@ -656,6 +726,10 @@ File inventory:
 | `test_cross_leaf.py` | v5: cross-leaf neighbor finding via hierarchical chain |
 | `test_cutile_cross_leaf.py` | v6: cross-leaf GPU codegen, compile, launch, verify |
 | `bench_cutile_cross_leaf.py` | v6: cross-leaf scale benchmark (cuTile vs numpy vs PyTorch) |
+| `cig.py` | v7: CIG format definition, builder, PyTorch ijk_to_index |
+| `cig_cutile.py` | v7: cuTile kernel for CIG ijk_to_index |
+| `test_cig.py` | v7: CIG builder and ijk_to_index correctness tests |
+| `bench_cig_vs_fvdb.py` | v7: head-to-head CIG vs fVDB comparison |
 | `run_all_tests.py` | Single entry point for non-GPU tests |
 
 ### Current state
@@ -708,6 +782,12 @@ Key semantic rules:
 16. Scale benchmark: cuTile 4.9-8.3x faster than PyTorch GPU at 4-256
     leaf scale (up to 79K voxels, 475K lookups). GPU scaling excellent:
     80x more work costs only 2x more time.
+17. CIG concrete tensor format: 2-level sparse grid as two raw tensors
+    (lower + leaf_arr). Programmatic builder from voxel coordinates.
+18. First fVDB head-to-head: CIG cuTile ijk_to_index is 1.3-1.5x faster
+    than NanoVDB's compiled CUDA kernel at 1K-200K voxel scale.
+19. Memory characterisation: NanoVDB 8-12x smaller than naive dense-leaf
+    CIG. Bitmask compression is the key difference.
 
 ### Completed milestones (previously "next steps")
 
@@ -723,10 +803,23 @@ Key semantic rules:
 - **Scale benchmark** (v6): done. cuTile 4.9-8.3x faster than PyTorch GPU
   at 4-256 leaf scale (up to 79K voxels, 475K lookups). Excellent GPU
   scaling. See `bench_cutile_cross_leaf.py`.
+- **CIG format + builder** (v7): done. Concrete 2-level CIG as two tensors,
+  programmatic builder from coordinates, three ijk_to_index implementations.
+  See `cig.py`, `cig_cutile.py`, `test_cig.py`.
+- **fVDB head-to-head** (v7): done. CIG cuTile 1.3-1.5x faster than NanoVDB
+  for ijk_to_index queries. NanoVDB 8-12x smaller in memory (bitmask
+  compression). See `bench_cig_vs_fvdb.py`.
 
 ### Recommended next steps
 
-**1. Jagged output on GPU (Where).** The `Where` operation produces
+**1. CIG memory compression.** The dense-leaf CIG uses 8-12x more memory
+than NanoVDB. Adding bitmask compression (64-byte mask per leaf + popcount
+offset calculation) would close this gap while potentially preserving the
+fused gather pattern. The design question: can `Gather(leaf, coord)` be
+extended to `Gather(compressed_leaf, coord)` where the gather internally
+does a bitmask check + popcount? This is the next structural challenge.
+
+**2. Jagged output on GPU (Where).** The `Where` operation produces
 variable-length output, which requires a two-pass GPU pattern: count pass
 (parallel prefix sum for offsets), then scatter pass. This is a known GPU
 primitive but has not been expressed in the emitter yet.
@@ -736,12 +829,12 @@ primitive but has not been expressed in the emitter yet.
 levels adds Upper with 32x32x32 nodes. This validates the type system at
 full NanoVDB scale.
 
-**3. Performance at larger scale.** The v6 benchmark reaches 256 leaves
+**4. Performance at larger scale.** The v7 benchmark reaches 200K voxels
 (79K voxels). Real fVDB workloads have millions of voxels across thousands
 of leaves. Extend the benchmark to 1K-4K+ leaves to characterise scaling
 at production-relevant sizes.
 
-**4. Successive lowering pass.** The emitter currently does pattern
+**5. Successive lowering pass.** The emitter currently does pattern
 recognition (idiom detection) and code emission in a single tree walk.
 As more idioms are added (Where two-pass, Each grid nesting, Over tree
 reduction), factor the pattern-recognition phase into a separate AST
