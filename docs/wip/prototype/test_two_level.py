@@ -34,23 +34,23 @@ from docs.wip.prototype.ops import morton3d as np_morton3d
 
 CHAIN_PROGRAM = """
 parts = Decompose(Input("coord"), Const([3, 4]))
-leaf_idx = Gather(Input("lower"), Field(parts, "level_1"))
+leaf_idx = Gather(Input("lower"), field(parts, "level_1"))
 leaf_node = Gather(Input("leaf_arr"), leaf_idx)
-voxel_idx = Gather(leaf_node, Field(parts, "level_0"))
+voxel_idx = Gather(leaf_node, field(parts, "level_0"))
 voxel_idx
 """
 
 BATCH_CHAIN_PROGRAM = """
 parts = Decompose(Input("coord"), Const([3, 4]))
-leaf_idx = Gather(Input("lower"), Field(parts, "level_1"))
+leaf_idx = Gather(Input("lower"), field(parts, "level_1"))
 leaf_node = Gather(Input("leaf_arr"), leaf_idx)
-voxel_idx = Gather(leaf_node, Field(parts, "level_0"))
+voxel_idx = Gather(leaf_node, field(parts, "level_0"))
 voxel_idx
 """
 
 BATCH_ACTIVE_PROGRAM = """
-leaves = Cut(Input("leaf_flat"), Const(512))
-leaves_3d = Each(leaves, leaf => Reshape(leaf, Const([8, 8, 8])))
+leaves = cut(Input("leaf_flat"), Const(512))
+leaves_3d = Each(leaves, leaf => reshape(leaf, Const([8, 8, 8])))
 active = Each(leaves_3d, leaf => Where(Map(leaf, x => GE(x, Const(0)))))
 active
 """
@@ -197,9 +197,9 @@ def test_3d_chain_batch():
 
 MORTON_CHAIN_PROGRAM = """
 parts = Decompose(Input("coord"), Const([3, 4]))
-lower_idx = Morton3d(Field(parts, "level_1"))
+lower_idx = Morton3d(field(parts, "level_1"))
 leaf_idx = Gather(Input("lower_m"), lower_idx)
-leaf_local_m = Morton3d(Field(parts, "level_0"))
+leaf_local_m = Morton3d(field(parts, "level_0"))
 leaf_node = Gather(Input("leaf_arr_m"), leaf_idx)
 voxel_idx = Gather(leaf_node, leaf_local_m)
 voxel_idx

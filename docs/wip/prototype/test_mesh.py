@@ -53,8 +53,8 @@ TETRA_FACES = np.array([
 
 # Triangle vertex lookup (no centroid yet).
 TRIS_PROGRAM = """
-vertices = Cut(Input("positions"), Const(3))
-face_idx = Cut(Input("faces"), Const(3))
+vertices = cut(Input("positions"), Const(3))
+face_idx = cut(Input("faces"), Const(3))
 tris = Each(face_idx, f => Map(f, i => Gather(vertices, i)))
 tris
 """
@@ -62,8 +62,8 @@ tris
 # Full centroid computation: for each face, gather vertices inline, then
 # reduce with Over(Add) and divide by 3. Mean = Over(Add, xs) / Count(xs).
 CENTROID_PROGRAM = """
-vertices = Cut(Input("positions"), Const(3))
-face_idx = Cut(Input("faces"), Const(3))
+vertices = cut(Input("positions"), Const(3))
+face_idx = cut(Input("faces"), Const(3))
 centroids = Each(face_idx, f => Div(Over(Add, Map(f, i => Gather(vertices, i))), Const(3)))
 centroids
 """

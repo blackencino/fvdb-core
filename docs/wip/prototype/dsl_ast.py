@@ -145,7 +145,7 @@ class FieldNode(Node):
         raise TypeError(f"Field access requires struct element, got {elem!r}")
 
     def __repr__(self) -> str:
-        return f"Field({self.expr}, {self.field_name!r})"
+        return f"field({self.expr}, {self.field_name!r})"
 
 
 # ---------------------------------------------------------------------------
@@ -391,7 +391,7 @@ class CutNode(Node):
         return cut_by_size(self.size, self.input.infer_type(env, inputs))
 
     def __repr__(self) -> str:
-        return f"Cut({self.input}, {self.size})"
+        return f"cut({self.input}, {self.size})"
 
 
 @dataclass(frozen=True)
@@ -403,7 +403,7 @@ class ReshapeNode(Node):
         return reshape_layout(self.input.infer_type(env, inputs), self.new_shape)
 
     def __repr__(self) -> str:
-        return f"Reshape({self.input}, {self.new_shape})"
+        return f"reshape({self.input}, {self.new_shape})"
 
 
 # ---------------------------------------------------------------------------

@@ -78,6 +78,7 @@ _TOKEN_RE = re.compile(
     re.VERBOSE,
 )
 
+# Operations (PascalCase) -- computational work, moves/creates data.
 _BUILTINS = {
     "Map",
     "Each",
@@ -100,11 +101,15 @@ _BUILTINS = {
     "Count",
     "Decompose",
     "Morton3d",
-    "Field",
-    "Cut",
-    "Reshape",
     "Input",
     "Const",
+}
+
+# Layouts (lowercase) -- zero-cost type reinterpretation, no data movement.
+_LAYOUTS = {
+    "cut",
+    "reshape",
+    "field",
 }
 
 
@@ -211,7 +216,7 @@ class Parser:
 
         kind, value = tok
 
-        if kind == "NAME" and value in _BUILTINS:
+        if kind == "NAME" and (value in _BUILTINS or value in _LAYOUTS):
             # Only parse as a call if followed by '('
             if self.pos + 1 < len(self.tokens) and self.tokens[self.pos + 1][0] == "LPAREN":
                 return self.parse_call()
@@ -350,26 +355,26 @@ class Parser:
         if name == "Morton3d":
             return Morton3dNode(_expr(args[0]))
 
-        if name == "Field":
+        if name == "field":
             expr_node = _expr(args[0])
             field_node = _expr(args[1])
             if isinstance(field_node, ConstNode) and isinstance(field_node.value, str):
                 return FieldNode(expr_node, field_node.value)
-            raise SyntaxError(f"Field expects string field name, got {field_node}")
+            raise SyntaxError(f"field expects string field name, got {field_node}")
 
-        if name == "Cut":
+        if name == "cut":
             input_node = _expr(args[0])
             size_node = _expr(args[1])
             if isinstance(size_node, ConstNode) and isinstance(size_node.value, int):
                 return CutNode(input_node, size_node.value)
-            raise SyntaxError(f"Cut expects integer size, got {size_node}")
+            raise SyntaxError(f"cut expects integer size, got {size_node}")
 
-        if name == "Reshape":
+        if name == "reshape":
             input_node = _expr(args[0])
             shape_node = _expr(args[1])
             if isinstance(shape_node, ConstNode) and isinstance(shape_node.value, list):
                 return ReshapeNode(input_node, tuple(shape_node.value))
-            raise SyntaxError(f"Reshape expects list shape, got {shape_node}")
+            raise SyntaxError(f"reshape expects list shape, got {shape_node}")
 
         # -- Adverbs --
 

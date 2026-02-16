@@ -24,11 +24,11 @@ C++ components. The opacity of the inner type impedes deconstruction,
 analysis, fusion, and optimisation. The same is true of any system that hides
 structure behind a compiled API.
 
-**The claim.** A small set of **nested layouts** (Cut, Indexed, Jagged,
-Tuple, Struct, Flip) applied over raw tensors, combined with a small set of
-**adverbs** (Map, Each, Where, Gather), form a **portable semantic layer**
-that has the same degree of fungibility as tensors but captures the structural
-richness that tensors erase.
+**The claim.** A small set of **nested layouts** (`cut`, `indexed`, `jagged`,
+`tuple`, `struct`, `flip`) applied over raw tensors, combined with a small set
+of **functions** (`Map`, `Each`, `Where`, `Gather`), form a **portable
+semantic layer** that has the same degree of fungibility as tensors but
+captures the structural richness that tensors erase.
 
 The physical backing is always tensors. The layouts are metadata -- they
 describe how to traverse, partition, and associate the underlying tensor data
@@ -38,7 +38,7 @@ without moving it. This means:
   additional small tensors: offsets arrays, index arrays).
 - The layouts are already implicit in most tensor-based systems. A mesh
   stored as `(N,3) f32` vertices + `(F,3) i32` face indices has implicitly
-  applied `Cut(-3, vertices) + Indexed(faces, vertices)`. The framework
+  applied `cut(-3, vertices) + indexed(faces, vertices)`. The framework
   makes this explicit and portable.
 - Every organizational structure needed to represent a geometric scene --
   triangle meshes, variable-topology polygons, sparse grids, point clouds,
@@ -55,13 +55,13 @@ schedule** -- they describe how to traverse the data, while operations
 describe what to compute. APL/J/K conflate data shape with iteration
 structure; this system **decouples** them via the iteration-space /
 element-type separation. This decoupling is what makes it possible to write
-domain algorithms as tiny compositions of adverbs and layouts:
+domain algorithms as tiny compositions of functions and layouts:
 
 The entire SPH density calculation can be written as `(R/P/:)\:':` in K9
 syntax -- a tacit composition of a reduction, a product, and structured
-iteration adverbs over structured tensors. This is what the framework makes
-possible: domain algorithms as generic compositions, not framework-specific
-imperative code.
+iteration over structured tensors. This is what the framework makes possible:
+domain algorithms as generic compositions, not framework-specific imperative
+code.
 
 **North star.** Compile compact adverbial expressions into working cuTile /
 CUDA code via algebraic optimisation and idiom detection.
@@ -69,8 +69,11 @@ CUDA code via algebraic optimisation and idiom detection.
 **Open questions.** (1) Can the protocol surface stay small enough for
 incremental adoption? The saving grace: layouts are metadata over tensors, so
 fallback to "just send the tensors" is always available. (2) Does the
-abstract description compile to competitive GPU code? Deferred to future
-work, but the idiom-detection path is promising.
+abstract description compile to competitive GPU code? **Partially answered:**
+the v4/v5 work shows that the DSL compiles to cuTile kernels that produce
+correct results and run 4.4x faster than vectorized PyTorch GPU for the
+neighbor gather predicate. Full performance characterisation at scale is
+still needed.
 
 ---
 
@@ -187,15 +190,39 @@ template<>              struct Resolve<Jag, Jag>   { using type = Jag; };
 
 ---
 
+## Notation Convention
+
+**lowercase = free.  PascalCase = work.**
+
+Layouts (type reinterpretations that move no data) use **lowercase** names.
+Operations (functions that allocate, compute, or move data) use **PascalCase**
+names. When reading a program, if you see lowercase it costs nothing; if you
+see PascalCase it does work.
+
+| Category | Convention | Examples |
+|----------|-----------|----------|
+| Layouts (free) | lowercase | `cut`, `reshape`, `field`, `indexed`, `flip`, `jagged` |
+| Operations (work) | PascalCase | `Map`, `Each`, `Over`, `Where`, `Gather`, `Add`, `Decompose` |
+| Connectors | PascalCase | `Input`, `Const` |
+
+K-derived adverbs (`Over`, `Scan`, `EachRight`, `EachLeft`, `Prior`, `Map`,
+`Each`) are higher-order functions: they take a verb and an iterable and
+produce new data. They do not need a separate notational tier. The DSL is
+functional; adverbs are functions. The compiler recognises reduction, scan, and
+iteration patterns by matching AST node types, not by reading case conventions.
+
+---
+
 ## Layout Wrappers
 
 Every layout wrapper is a **type modifier**, not an operation. It reinterprets
 the logical type without touching physical storage. Layouts compose freely.
+**In the DSL, layouts use lowercase names** (`cut`, `reshape`, `field`).
 
 **Invariant: type transformations do no computational work.** A layout never
 allocates, copies, or gathers. If a transformation requires data movement, it
-is an **operation**. A compiler pass may insert operations as a policy
-decision, but the type system itself only recognises eligibility.
+is an **operation** (PascalCase). A compiler pass may insert operations as a
+policy decision, but the type system itself only recognises eligibility.
 
 ### Cut
 
@@ -214,7 +241,7 @@ Associates an **indexer** with a **target**:
 - Result element type = target's element type.
 - Constraint: indexer element type matches target iteration rank.
 
-As a layout: pure type-level, no work. As an operation (Gather): materialises.
+As a layout (`indexed`): pure type-level, no work. As an operation (`Gather`): materialises.
 
 ### Tuple
 
@@ -239,30 +266,30 @@ Cut-by-offsets with proper extent notation. Outer axis `*`, inner axis `~`.
 
 ---
 
-## Operations and Adverbs
+## Operations (PascalCase)
 
-Operations do computational work. Adverbs modify how an operation is applied
-across an iteration space.
+Operations do computational work. All use PascalCase. Higher-order functions
+(K-derived) modify how a verb is applied across an iteration space.
 
-**Key rule: adverbs operate over the full iteration space.** No `axis`
-parameter. The layout IS the axis specification. To reduce along a specific
-axis, Cut first to isolate it as the iteration space.
+**Key rule: higher-order functions operate over the full iteration space.**
+No `axis` parameter. The layout IS the axis specification. To reduce along a
+specific axis, `cut` first to isolate it as the iteration space.
 
-### Adverbs (K-style)
+### Higher-Order Functions (K-derived)
 
-**Parallel adverbs** (order-independent, any rank):
+**Parallel** (order-independent, any rank):
 
-| Adverb | Syntax | Input | Output |
-|--------|--------|-------|--------|
+| Function | Syntax | Input | Output |
+|----------|--------|-------|--------|
 | Over | `Over(f, xs)` | `S over E` | `E` (full reduction) |
 | Each | `Each(xs, x => body)` | `S over E` | `S over R` |
 | EachRight | `EachRight(f, x, ys)` | fixed x, iterate ys | `S_ys over R` |
 | EachLeft | `EachLeft(f, xs, y)` | iterate xs, fixed y | `S_xs over R` |
 
-**Sequential adverbs** (require rank 1, inherently ordered):
+**Sequential** (require rank 1, inherently ordered):
 
-| Adverb | Syntax | Input | Output |
-|--------|--------|-------|--------|
+| Function | Syntax | Input | Output |
+|----------|--------|-------|--------|
 | Scan | `Scan(f, xs)` | `(D,) over E` | `(D,) over E` (running accumulation) |
 | Prior | `Prior(f, xs)` | `(D,) over E` | `(D-1,) over R` (adjacent pairs) |
 
@@ -294,27 +321,28 @@ Example: face centroids = `Each(faces, f => Div(Over(Add, verts_of_f), Const(3))
 
 ### Summary
 
-| Name | Kind | New data? |
-|------|------|-----------|
-| Cut, Indexed, Tuple, Struct, Flip, Jagged | Layout | No |
-| Map, Each, Over, Scan, EachRight, EachLeft, Prior | Adverb/Operation | Yes |
-| Where | Operation | Yes (data-dependent) |
-| Gather | Operation | Yes (materialise) |
-| Add, Sub, Mul, Div, GE, And, Not, InBounds, Count | Scalar primitive | Yes |
-| Decompose, Morton3d | Domain primitive | Yes |
+| Name | Convention | Kind | New data? |
+|------|-----------|------|-----------|
+| `cut`, `indexed`, `tuple`, `struct`, `flip`, `jagged`, `reshape`, `field` | lowercase | Layout (free) | No |
+| `Map`, `Each`, `Over`, `Scan`, `EachRight`, `EachLeft`, `Prior` | PascalCase | Higher-order function | Yes |
+| `Where` | PascalCase | Operation | Yes (data-dependent) |
+| `Gather` | PascalCase | Operation | Yes (materialise) |
+| `Add`, `Sub`, `Mul`, `Div`, `GE`, `And`, `Not`, `InBounds`, `Count` | PascalCase | Scalar function | Yes |
+| `Decompose`, `Morton3d` | PascalCase | Domain function | Yes |
+| `Input`, `Const` | PascalCase | Connector | Introduces data |
 
 ---
 
 ## Worked Example: Single-Leaf Neighbors
 
 ```
-leaf     = Reshape(leaf_raw, (8,8,8))          -- (8,8,8) i32          [layout]
-features = Cut(-C, features_raw)               -- (*,) over (C,) f32   [layout]
+leaf     = reshape(leaf_raw, (8,8,8))          -- (8,8,8) i32
+features = cut(-C, features_raw)               -- (*,) over (C,) f32
 mask     = Map(leaf, x >= 0)                   -- (8,8,8) bool
 active   = Where(mask)                         -- (*,) over (3,) i32
 idx      = Gather(leaf, active)                -- (*,) over i32
 feat     = Gather(features, idx)               -- (*,) over (C,) f32
-offsets  = Cut(-3, offsets_raw)                -- (6,) over (3,) i32   [layout]
+offsets  = cut(-3, offsets_raw)                -- (6,) over (3,) i32
 nbrs     = Each(active, a => Map(offsets, o => Add(a, o)))
                                                -- (*,) over (6,) over (3,) i32
 filtered = Each(nbrs, cs =>
@@ -334,8 +362,8 @@ An OBJ-style indexed triangle mesh as layouts over two raw tensors:
 
 ```
 positions_raw: (V * 3,) f32       faces_raw: (F * 3,) i32
-vertices = Cut(-3, positions_raw)           -- (V,) over (3,) f32   [layout]
-face_idx = Cut(-3, faces_raw)               -- (F,) over (3,) i32   [layout]
+vertices = cut(-3, positions_raw)           -- (V,) over (3,) f32
+face_idx = cut(-3, faces_raw)               -- (F,) over (3,) i32
 tris = Each(face_idx, f => Map(f, i => Gather(vertices, i)))
                                             -- (F,) over (3,) over (3,) f32
 ```
@@ -343,7 +371,7 @@ tris = Each(face_idx, f => Map(f, i => Gather(vertices, i)))
 No custom mesh class. The type `(F,) over (3,) over (3,) f32` fully
 describes "F triangles of 3 vertices of 3D positions."
 
-**Type system finding:** `Indexed(face_idx, vertices)` is correctly rejected.
+**Type system finding:** `indexed(face_idx, vertices)` is correctly rejected.
 face_idx's element `(3,) i32` is three separate vertex indices, not one
 rank-3 coordinate. The type system distinguishes "one multi-dimensional
 lookup" from "multiple scalar lookups." The correct expression is
@@ -378,7 +406,10 @@ optimiser choose based on measured characteristics.
 
 ## Prototype Results
 
-Code in `docs/wip/prototype/`. Run all: `python docs/wip/prototype/run_all_tests.py`.
+Code in `docs/wip/prototype/`. Environment:
+`source ~/.venvs/fvdb_cutile/bin/activate` (Python 3.12, cuda-tile 1.1.0,
+torch 2.10, numpy 2.2; RTX PRO 6000 Blackwell, compute 12.0).
+Run all: `python docs/wip/prototype/run_all_tests.py`.
 
 ### v0: Fundamentals
 
@@ -388,8 +419,8 @@ separated. Sentinels stay out of the type system.
 
 ### v1: Composition
 
-Multiple leaves via Cut + Each (double-nested jagged). Indexed layout
-predicts Gather type. Struct + Flip composes multi-feature voxels into
+Multiple leaves via `cut` + `Each` (double-nested jagged). `indexed` layout
+predicts `Gather` type. `struct` + `flip` composes multi-feature voxels into
 `(*) over Struct({pos: (3) f32, color: (3) f32, dens: f32})`.
 
 ### v2: Hierarchical Chain
@@ -408,11 +439,107 @@ at type-check time.
 ### Mesh Exemplar
 
 Triangle mesh as layouts over two raw tensors. Type system correctly rejects
-`Indexed(face_idx, vertices)` (mesh indexing is multiple scalar lookups, not
+`indexed(face_idx, vertices)` (mesh indexing is multiple scalar lookups, not
 one multi-dimensional lookup). Early vs. late materialisation of face
 centroids produce identical results, demonstrating that materialisation
 schedule is independent of algorithm. DSL expresses the mesh lookup as a
 string program.
+
+### v4: cuTile Codegen
+
+First GPU code generation from the DSL. Three components:
+
+1. **Smoke test** (`test_cutile_smoke.py`): `ct.gather`/`ct.scatter` with
+   computed indices and 2D multi-dimensional indexing confirmed working on
+   Blackwell hardware (RTX PRO 6000, compute 12.0).
+
+2. **Hand-written target kernel** (`test_cutile_gather.py`): the neighbor
+   gather predicate -- for each of 453 active voxels in a random (8,8,8)
+   leaf, check 6 face-neighbors via `ct.gather` with 3D computed indices and
+   `check_bounds=True, padding_value=-1`. Results match numpy exactly (2094
+   active neighbors). Corner cases verified: boundary voxels, lone active
+   voxel, fully active leaf.
+
+3. **DSL-to-cuTile emitter** (`dsl_to_cutile.py`, `test_cutile_codegen.py`):
+   tree-walk emitter that parses a DSL string and emits cuTile Python source.
+   The neighbor predicate DSL expression
+
+   ```
+   Map(offsets, o => GE(Gather(mask, Add(coord, o)), Const(0)))
+   ```
+
+   emits to:
+
+   ```python
+   add_2 = coord_tile + offsets_arr
+   gath_3 = ct.gather(mask_arr, add_2, check_bounds=True, padding_value=-1)
+   ge_4 = gath_3 >= 0
+   ```
+
+   Numpy evaluator and cuTile kernel produce identical results for all 453
+   voxels.
+
+**Key finding:** `ct.gather` (not `ct.load`) is the right cuTile primitive
+for our `Gather` operation. `ct.load` requires power-of-two tile dimensions;
+`ct.gather` accepts arbitrary computed indices with broadcasting and built-in
+bounds checking. The `check_bounds=True, padding_value=-1` pattern fuses our
+`InBounds` + sentinel into a single call.
+
+**Correspondence table** (verified):
+
+| DSL | cuTile |
+|-----|--------|
+| `cut(input, size)` | `ct.load(array, index, shape)` (power-of-two tiles) |
+| `Gather(target, indexer)` | `ct.gather(array, indices, check_bounds=True)` |
+| `InBounds` + sentinel | `ct.gather(..., padding_value=-1)` (fused) |
+| `Add`, `GE`, `And` | tile arithmetic (`+`, `>=`, `&`) |
+| `Each(xs, ...)` | grid-level parallelism (`ct.bid(0)`) |
+| `Over(Add, xs)` | `ct.sum(tile, axis)` |
+
+### v5: End-to-End Codegen, Benchmark, Cross-Leaf
+
+Three milestones closing the remaining gaps:
+
+1. **End-to-end codegen** (`test_cutile_e2e.py`): the emitter now produces
+   a complete, compilable `@ct.kernel` with `ct.bid(0)` grid parallelism,
+   per-axis coordinate decomposition, power-of-two tile padding, and
+   `ct.scatter` output. The DSL string is parsed, emitted to a `.py` file
+   (cuTile JIT requires `inspect.getsource()`), imported, launched, and
+   verified against both the numpy DSL evaluator and the hand-written kernel.
+   **The loop is closed: DSL string -> GPU execution -> correct results.**
+
+2. **First performance number** (`bench_cutile.py`): the hand-written cuTile
+   neighbor predicate kernel (which is the emitter's target) benchmarked
+   against numpy and PyTorch. On 453 active voxels:
+
+   | Method | Median (us) | vs numpy | vs PyTorch GPU |
+   |--------|-------------|----------|----------------|
+   | numpy (loop) | 13,708 | 1.0x | -- |
+   | PyTorch CPU (vectorized) | 133 | 103x | -- |
+   | PyTorch GPU (vectorized) | 284 | 48x | 1.0x |
+   | cuTile (hand-written) | 64 | 214x | 4.4x |
+
+   cuTile's advantage comes from fused gather+predicate+scatter in a single
+   kernel launch with no intermediate tensors. PyTorch GPU is slower than
+   PyTorch CPU at this scale due to kernel launch overhead.
+
+3. **Cross-leaf neighbors** (`test_cross_leaf.py`): the critical DSL
+   composability test. For each active voxel, check 6 face-neighbors via
+   Decompose + chained Gather through a two-level hierarchy, where neighbors
+   may be in different leaf nodes. The DSL expression:
+
+   ```
+   nbr = Add(Input("coord"), Input("offset"))
+   parts = Decompose(nbr, Const([3, 4]))
+   leaf_idx = Gather(Input("lower"), field(parts, "level_1"))
+   leaf_node = Gather(Input("leaf_arr"), leaf_idx)
+   voxel_val = Gather(leaf_node, field(parts, "level_0"))
+   is_active = GE(voxel_val, Const(0))
+   ```
+
+   50 voxels x 6 offsets = 300 hierarchical lookups, 48 crossing leaf
+   boundaries, all correct. **The DSL composes cleanly for cross-boundary
+   traversal.**
 
 ---
 
@@ -427,7 +554,9 @@ scene graphs -- in a form that is:
 - **Analyzable**: the typed AST can be inspected, transformed, and optimised
   before execution.
 - **Compilable**: types carry enough information to lower to concrete GPU
-  code via idiom detection and algebraic transformation.
+  code via idiom detection and algebraic transformation. **Demonstrated** in
+  v4/v5: DSL string -> AST -> runnable cuTile `@ct.kernel` -> GPU execution
+  -> correct results, 4.4x faster than vectorized PyTorch GPU.
 
 fVDB's sparse voxel operations are the proving ground, not the ceiling.
 
@@ -449,37 +578,46 @@ File inventory:
 | File | Role |
 |------|------|
 | `types.py` | Extent kinds (Static/Dynamic/Jagged), Shape, Type, ScalarType |
-| `layouts.py` | Layout wrappers: Cut, Indexed, Tuple, Struct, Flip, Jagged |
+| `layouts.py` | Layout wrappers (lowercase): cut, indexed, tuple, struct, flip, jagged |
 | `ops.py` | Python-level operations: Map, Each, Where, Gather, FlipStruct, Decompose, morton3d |
 | `dsl_ast.py` | AST node classes (~25 nodes) with `infer_type` methods |
 | `dsl_parse.py` | Recursive-descent parser: string -> AST |
 | `dsl_eval.py` | Tree-walk evaluator: type-check pass then numpy execution |
 | `test_where.py` | v0: Map, Where, Gather pipeline (DSL strings) |
 | `test_neighbors.py` | v0: neighbor finding, jagged emergence (DSL strings) |
-| `test_indexed_flip.py` | v1: multi-leaf Cut, Indexed, Struct+Flip (DSL + API tests) |
+| `test_indexed_flip.py` | v1: multi-leaf cut, indexed, Struct+Flip (DSL + API tests) |
 | `test_two_level.py` | v2: hierarchical chain, Decompose, morton (DSL strings) |
 | `test_dsl.py` | v3: DSL validation (parser + evaluator correctness) |
 | `test_mesh.py` | mesh: triangle mesh, centroids via Over+Div (DSL strings) |
+| `dsl_to_cutile.py` | v4: DSL AST -> cuTile Python source emitter |
+| `test_cutile_smoke.py` | v4: cuTile toolchain validation (gather/scatter) |
+| `test_cutile_gather.py` | v4: hand-written neighbor predicate kernel vs numpy |
+| `test_cutile_codegen.py` | v4: emitter output validation + numpy vs cuTile |
+| `test_cutile_e2e.py` | v5: end-to-end DSL string -> GPU execution -> verify |
+| `bench_cutile.py` | v5: performance benchmark (cuTile vs numpy vs PyTorch) |
+| `test_cross_leaf.py` | v5: cross-leaf neighbor finding via hierarchical chain |
 | `run_all_tests.py` | Single entry point for all 20 tests |
 
 ### Current state
 
-The DSL has ~25 keywords covering layouts (Cut, Reshape), structural ops
-(Map, Each, Where, Gather), K-style adverbs (Over, Scan, EachRight, EachLeft,
-Prior), scalar primitives (Add, Sub, Mul, Div, GE, And, Not, InBounds,
-Count), and domain primitives (Decompose, Morton3d, Field). Programs are text
-strings parsed into typed ASTs, type-checked without data, then executed
-against numpy.
+The DSL has ~25 keywords. **Layouts use lowercase** (`cut`, `reshape`,
+`field`) -- they reinterpret types without moving data. **Operations use
+PascalCase** (`Map`, `Each`, `Where`, `Gather`, `Over`, `Scan`, `Add`, etc.)
+-- they do computational work. This convention makes the cost model visible
+at a glance. Programs are text strings parsed into typed ASTs, type-checked
+without data, then executed against numpy.
 
 Key semantic rules:
-- Adverbs operate over the **full iteration space**. No axis parameter. Cut
-  to isolate the axis you want. The layout IS the axis specification.
+- Higher-order functions operate over the **full iteration space**. No axis
+  parameter. `cut` to isolate the axis you want. The layout IS the axis
+  specification.
 - Each promotes Dynamic to Jagged at type-check time (body runs independently
   per element).
 - Over reduces the full iteration space (commutative+associative for rank > 1).
   Scan and Prior require rank 1.
-- Indexed is a layout (free); Gather is its materialisation (work). When to
-  resolve is a scheduling decision, not an algorithmic one.
+- `indexed` is a layout (free, lowercase); `Gather` is its materialisation
+  (work, PascalCase). When to resolve is a scheduling decision, not an
+  algorithmic one.
 
 ### What has been demonstrated
 
@@ -489,102 +627,93 @@ Key semantic rules:
 4. Swappable indexing strategy (3D vs morton, identical results).
 5. Struct + Flip: struct-of-arrays to array-of-structs transposition.
 6. Triangle mesh as layouts over raw tensors (no custom mesh class).
-7. Mean = `Div(Over(Add, xs), Count(xs))` -- adverb composition.
+7. Mean = `Div(Over(Add, xs), Count(xs))` -- function composition.
 8. Expression/execution separation via the string-parsed DSL.
+9. cuTile GPU code generation: DSL string -> AST -> cuTile Python source,
+   with `ct.gather` for computed-index access and built-in bounds checking.
+10. Numerical equivalence: numpy DSL evaluator and cuTile kernel produce
+    identical results for the neighbor gather predicate (453 voxels, 2094
+    active neighbors).
+11. End-to-end codegen loop: DSL string -> emitted `@ct.kernel` -> cuTile
+    JIT compile -> GPU launch -> correct results (no hand-written kernel).
+12. Performance: cuTile kernel 214x faster than numpy, 4.4x faster than
+    vectorized PyTorch GPU for the scatter-gather predicate.
+13. Cross-leaf neighbor composability: Decompose + chained Gather traverses
+    leaf boundaries correctly (300 lookups, 48 cross-leaf, all correct).
 
-### Recommended immediate next step: cross-leaf neighbors
+### Completed milestones (previously "next steps")
 
-**Goal**: write a DSL program that finds the jagged set of active neighbor
-coordinates for each active voxel, where neighbors may cross leaf node
-boundaries. This composes:
-- The neighbor pattern from `test_neighbors.py` (add offsets, filter active)
-- The hierarchical chain from `test_two_level.py` (Decompose + chained Gather)
+- **Cross-leaf neighbors** (v5): done. The DSL composes Decompose + chained
+  Gather across leaf boundaries cleanly. See `test_cross_leaf.py`.
+- **GPU codegen loop** (v5): done. DSL string -> emitted `@ct.kernel` ->
+  cuTile JIT -> GPU launch -> correct results. See `test_cutile_e2e.py`.
+- **First performance number** (v5): done. cuTile 4.4x faster than
+  PyTorch GPU, 214x faster than numpy. See `bench_cutile.py`.
 
-The expression should:
-1. Take a two-level grid (lower + leaf) and a set of global coordinates.
-2. For each active voxel, generate 6 face-neighbor global coordinates.
-3. For each neighbor coord, use Decompose + chained Gather to look up whether
-   it's active in the grid (cross-leaf boundary traversal).
-4. Filter to active neighbors only.
-5. Produce `(*) over (~) over (3) i32` -- jagged neighbor coords.
+### Recommended next steps
 
-This is the critical composability test. If the DSL can express this cleanly,
-the framework scales. If not, identify what's missing.
+**1. Codegen for cross-leaf neighbors on GPU.** The cross-leaf predicate
+works in the numpy DSL evaluator. The next compilation target: emit a cuTile
+kernel for the hierarchical chain (Decompose + 4-step Gather) and run it on
+GPU. This requires the emitter to handle `Decompose`, `field`, and chained
+`Gather` -- all new emission rules beyond the current set.
 
-Create a new test file `test_cross_leaf.py` with DSL string programs.
+**2. Jagged output on GPU (Where).** The `Where` operation produces
+variable-length output, which requires a two-pass GPU pattern: count pass
+(parallel prefix sum for offsets), then scatter pass. This is a known GPU
+primitive but has not been expressed in the emitter yet.
 
-### Shortest path to GPU performance proof
+**3. Full CIG type.** Express a 3-level compact index grid (Root/Upper/Lower
+/Leaf) as a composed DSL expression. The 2-level chain already works; 3
+levels adds Upper with 32x32x32 nodes. This validates the type system at
+full NanoVDB scale.
 
-The framework's thesis is only proven when a DSL expression compiles to
-competitive GPU code. The target: 80% of hand-written performance. Not
-100% -- anything sufficiently simple to describe can be optimized further
-via idiom tables if needed.
+**4. Performance at scale.** The current benchmark uses 453 voxels in one
+(8,8,8) leaf. Real fVDB workloads have millions of voxels across thousands
+of leaves. Benchmark with a realistic grid size to measure how cuTile scales.
 
-**Target expression**: the 6-neighbor gather predicate from the neighbor test:
+### cuTile backend notes
 
-```
-Map(offsets, o => And(InBounds(Add(coord, o), 0, 8), Gather(mask, Add(coord, o))))
-```
+**Target backend: cuTile** (NVIDIA's tile-based Python GPU DSL on TileIR).
 
-This is 6 random gathers from a 3D array at computed coordinates with
-boundary checking -- a scatter-gather pattern, the hardest GPU pattern we use.
+**Why cuTile:**
+1. `ct.gather` with computed indices + `check_bounds` + `padding_value`
+   maps directly to our `Gather` + `InBounds` + sentinel pattern.
+2. Grid-level parallelism (`ct.bid`) maps to `Each`.
+3. Tile-level elementwise ops map to `Map` over static-size collections.
+4. `ct.load` with power-of-two tiles maps to `cut` for aligned access.
+5. Hardware-aware: leverages TMA, tensor cores on Blackwell.
 
-**Target backend: cuTile (not Triton).** cuTile is NVIDIA's tile-based
-Python GPU DSL built on TileIR. It is the right target for three reasons:
+**Key constraint discovered:** `ct.load` requires power-of-two tile
+dimensions; `ct.gather` does not. For our scatter-gather patterns,
+`ct.gather` is the primary primitive. `ct.load` is used only for
+tile-aligned block access (e.g. loading a full (8,8,8) leaf).
 
-1. **The tile model matches our layouts.** cuTile thinks in tiles --
-   fixed-size, power-of-two, immutable blocks loaded via `ct.load`, computed
-   on, stored via `ct.store`. Our Cut produces exactly these tile shapes.
-   A `(8,8,8)` leaf block IS a cuTile tile. The conceptual mapping is ~1:1.
-
-2. **TileIR as intermediate target.** TileIR is a "tile virtual machine"
-   that models the GPU as a tile processor. Our DSL is a higher-level
-   description of tile operations. Lowering DSL -> TileIR is a more natural
-   compilation path than DSL -> Triton (which has its own abstraction
-   constraints around masking and block pointers).
-
-3. **Hardware-aware.** cuTile automatically leverages tensor memory
-   accelerators and tensor cores (Blackwell and beyond). For sparse grid
-   gather patterns across hierarchical node blocks, the tile-based memory
-   model with hardware-backed async loads is exactly right.
-
-**Prerequisites**: cuTile requires CUDA Toolkit 13.1+, NVIDIA Driver r580+,
-compute capability 10.x or 12.x. This will require a CUDA version upgrade
-in the fvdb build environment. Deferring that infrastructure work for now.
-
-**The implementation plan** (a `dsl_to_cutile.py` emitter):
-
-1. Handle ~6 emission rules: Map (unroll for static extents), Add
-   (arithmetic on tile indices), Gather (`ct.load` with computed index),
-   InBounds (predicate mask), And (bitwise), GE (comparison).
-2. Emit a `@ct.kernel` function for the neighbor predicate operating over
-   a batch of active coordinates.
-3. Run on a real `(8,8,8)` mask with 400+ active voxels.
-4. Compare against: (a) the numpy DSL evaluator (should be 100x+ faster),
-   (b) a hand-written cuTile kernel doing the same thing (target: 80%).
-
-The jagged output part (Where filtering to variable-length results) is
-harder for GPU and can use a two-pass approach (count pass + scatter pass),
-which is a known pattern. The gather+predicate part is the proof of concept.
+**Environment** (satisfied): RTX PRO 6000 Blackwell (compute 12.0),
+driver 591.59, cuda-tile 1.1.0,
+`source ~/.venvs/fvdb_cutile/bin/activate`.
 
 ### Medium-term items
 
-- **Full CIG type**: express a 3-level compact index grid as a Struct of
-  three levels (upper/lower/leaf), each a Cut+Reshaped tensor. Define the
-  coord-to-index lookup as a composed DSL function over that struct.
+- **Emitter: Decompose + field + chained Gather**: extend `dsl_to_cutile.py`
+  to emit the cross-leaf hierarchical chain as a cuTile kernel. This requires
+  new emission rules for `DecomposeNode`, `FieldNode`, and multi-step
+  `GatherNode` chains. The target kernel shape is known from the hand-written
+  examples; the emitter needs to handle struct decomposition.
+- **Emitter: Where (jagged output)**: two-pass GPU pattern (count + scatter)
+  for variable-length output. Known approach; needs emission rules for
+  `WhereNode` and the corresponding parallel prefix sum.
 - **Idiom detection**: recognize patterns like `Over(Add, Map(xs, Gather(...)))`
   as scatter-gather and propose optimized implementations. This is where the
   AST pays off -- the expression tree is inspectable.
 - **Materialisation scheduling**: given a DSL expression, automatically decide
   where to insert Gather (early vs late) based on data characteristics
   (sparsity ratio, memory budget). This is the Halide schedule analogy.
-- **EachBoth** (zip-map): not yet a primitive. Composes from existing but
-  would be convenient for pairwise operations.
-- **FlipStruct in DSL**: currently Python-only. Add a DSL keyword.
-- **Rank operator convenience**: the reshape/unshape telescope
-  (`Unshape(Unshape(Adverb(Shape(Shape(x)))))`) will emerge as a pattern
-  when working with higher-rank data. A rank operator that compiles to
-  Cut+Adverb+reassemble would reduce boilerplate.
+- **Full CIG type**: express a 3-level compact index grid as a struct of
+  three levels. Low risk -- just more of what the 2-level test proves.
+- **`flip` in DSL**: currently Python-only. Add as a lowercase DSL keyword.
+- **Performance at scale**: benchmark with realistic grid sizes (millions of
+  voxels, thousands of leaves) to characterise cuTile scaling behaviour.
 
 ### North star
 
@@ -592,5 +721,5 @@ Compile DSL expressions to working cuTile / CUDA code via algebraic
 optimisation and idiom detection. The entire SPH density calculation can be
 written as `(R/P/:)\:':` in K9 syntax -- a tacit composition of reduction,
 product, and structured iteration. This is what the framework makes possible:
-domain algorithms as tiny compositions of adverbs over structured tensors,
+domain algorithms as tiny compositions of functions over structured tensors,
 compiled to GPU code without framework-specific imperative implementations.

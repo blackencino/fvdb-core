@@ -146,9 +146,9 @@ def test_neighbor_program():
 
 CHAIN_PROGRAM = """
 parts = Decompose(Input("coord"), Const([3, 4]))
-leaf_idx = Gather(Input("lower"), Field(parts, "level_1"))
+leaf_idx = Gather(Input("lower"), field(parts, "level_1"))
 leaf_node = Gather(Input("leaf_arr"), leaf_idx)
-voxel_idx = Gather(leaf_node, Field(parts, "level_0"))
+voxel_idx = Gather(leaf_node, field(parts, "level_0"))
 voxel_idx
 """
 

@@ -38,14 +38,14 @@ from docs.wip.prototype.types import (
 # =========================================================================
 
 MULTI_LEAF_CUT_PROGRAM = """
-leaves = Cut(Input("flat"), Const(512))
-leaves_3d = Each(leaves, leaf => Reshape(leaf, Const([8, 8, 8])))
+leaves = cut(Input("flat"), Const(512))
+leaves_3d = Each(leaves, leaf => reshape(leaf, Const([8, 8, 8])))
 leaves_3d
 """
 
 MULTI_LEAF_WHERE_PROGRAM = """
-leaves = Cut(Input("flat"), Const(512))
-leaves_3d = Each(leaves, leaf => Reshape(leaf, Const([8, 8, 8])))
+leaves = cut(Input("flat"), Const(512))
+leaves_3d = Each(leaves, leaf => reshape(leaf, Const([8, 8, 8])))
 active = Each(leaves_3d, leaf => Where(Map(leaf, x => GE(x, Const(0)))))
 active
 """
