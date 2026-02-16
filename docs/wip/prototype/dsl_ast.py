@@ -13,10 +13,12 @@ from dataclasses import dataclass
 from typing import Any, Union
 
 from .layouts import (
+    MaskedElement,
     StructElement,
     cut_by_size,
     flip as flip_layout,
     indexed as indexed_layout,
+    masked_layout,
     reshape as reshape_layout,
     struct_layout,
 )
@@ -316,6 +318,13 @@ class GatherNode(Node):
         target_ty = self.target.infer_type(env, inputs)
         indexer_ty = self.indexer.infer_type(env, inputs)
 
+        # Masked target: Gather(masked_layout, coord) -> element type.
+        # The coord must match the masked layout's iteration shape rank.
+        # Returns the masked element type (i64 dense index, or -1 sentinel).
+        if isinstance(target_ty.element_type, MaskedElement):
+            me = target_ty.element_type
+            return Type(Shape(), me.element_type)
+
         # Special case 1: single-point lookup with a vector coordinate.
         # If the indexer is (r,) integer and the target is rank r, treat the
         # entire indexer as one coordinate, returning the target's element type.
@@ -404,6 +413,33 @@ class ReshapeNode(Node):
 
     def __repr__(self) -> str:
         return f"reshape({self.input}, {self.new_shape})"
+
+
+@dataclass(frozen=True)
+class MaskedNode(Node):
+    """masked(mask_expr, offset_expr): layout (lowercase, free).
+
+    Constructs a masked layout from a bitmask and a base offset.
+    The mask provides the iteration shape; the offset provides the
+    base index into a flat data array. Access via Gather computes
+    bitmask check + popcount.
+
+    Physical: mask is a packed bitmask (e.g. (8,) i64 = 512 bits),
+    offset is a scalar i64.
+    """
+
+    mask: Node
+    offset: Node
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        mask_ty = self.mask.infer_type(env, inputs)
+        # The masked layout's logical shape comes from the mask's total bit count.
+        # For a (8,) i64 mask: 8 * 64 = 512 bits = (8,8,8) voxel space.
+        # The element type is i64 (the computed dense index).
+        return Type(Shape(), MaskedElement(Shape(Static(8), Static(8), Static(8)), ScalarType.I64))
+
+    def __repr__(self) -> str:
+        return f"masked({self.mask}, {self.offset})"
 
 
 # ---------------------------------------------------------------------------

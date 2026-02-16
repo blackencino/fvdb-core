@@ -39,6 +39,7 @@ from .dsl_ast import (
     InBoundsNode,
     InputNode,
     MapNode,
+    MaskedNode,
     Morton3dNode,
     MulNode,
     Node,
@@ -110,6 +111,7 @@ _LAYOUTS = {
     "cut",
     "reshape",
     "field",
+    "masked",
 }
 
 
@@ -375,6 +377,9 @@ class Parser:
             if isinstance(shape_node, ConstNode) and isinstance(shape_node.value, list):
                 return ReshapeNode(input_node, tuple(shape_node.value))
             raise SyntaxError(f"reshape expects list shape, got {shape_node}")
+
+        if name == "masked":
+            return MaskedNode(_expr(args[0]), _expr(args[1]))
 
         # -- Adverbs --
 

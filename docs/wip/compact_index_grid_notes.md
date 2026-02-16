@@ -667,6 +667,78 @@ First apples-to-apples comparison with fVDB. Three components:
   acceptable for prototyping but not competitive at scale. A GPU sort +
   scatter builder is straightforward.
 
+### v8: The `masked` Layout -- Bitmask-Compressed CIG
+
+The key structural addition: `masked` as a first-class layout in the type
+system. This is the sparse-occupancy counterpart of `jagged` (variable-
+length segments). A masked layout wraps a fixed-shape iteration space with a
+bitmask indicating which positions have data, plus a base offset into a flat
+data array. Access computes: bitmask check + popcount for the dense index.
+
+1. **`masked` layout** (`layouts.py`): `MaskedElement` carries the mask
+   shape and element type. `masked(mask_expr, offset_expr)` in the DSL
+   constructs the layout. Gather through masked emits the bitmask + popcount
+   chain. Zero-cost layout -- no data movement, just type interpretation.
+
+2. **Compressed CIG** (`cig.py`): `CompressedCIG` stores:
+   - `leaf_masks: (K, 16) i32` -- 16 words of 32 bits = 512-bit mask/leaf
+   - `leaf_offsets: (K,) i32` -- base offset per leaf
+   - `voxel_data: (N_active,) i32` -- flat voxel indices
+   Per-leaf cost: 68 bytes (vs 2,048 dense, vs NanoVDB's 96 bytes).
+
+3. **cuTile kernel with popcount** (`cig_masked_cutile.py`): software
+   Hamming weight in i32 (cuTile lacks i64 support). The popcount chain
+   unrolls across 16 mask words with conditional accumulation. The bitmask
+   check + popcount + offset calculation adds negligible overhead vs the
+   dense Gather.
+
+4. **DSL expression** for compressed CIG `ijk_to_index`:
+
+   ```
+   parts = Decompose(query, [3, 4])
+   leaf_idx = Gather(lower, field(parts, "level_1"))
+   leaf = masked(Gather(leaf_masks, leaf_idx), Gather(leaf_offsets, leaf_idx))
+   voxel_idx = Gather(leaf, field(parts, "level_0"))
+   ```
+
+   Four lines. The `masked` layout makes the bitmask compression visible
+   in the type system, not hidden in an implementation detail.
+
+5. **Head-to-head benchmark** at 1K-200K voxels, 50K queries:
+
+   **Memory:**
+
+   | Voxels | Dense CIG | Compressed CIG | NanoVDB | Comp/fVDB |
+   |--------|-----------|---------------|---------|-----------|
+   | 1,000 | 1,841 KB | 83 KB | 382 KB | 0.22x |
+   | 10,000 | 7,498 KB | 318 KB | 649 KB | 0.49x |
+   | 50,000 | 8,208 KB | 499 KB | 682 KB | 0.73x |
+   | 200,000 | 8,208 KB | 1,085 KB | 682 KB | 1.59x |
+
+   **Query time (us):**
+
+   | Voxels | Dense CT | Compressed CT | fVDB NanoVDB | Comp/fVDB |
+   |--------|---------|--------------|-------------|-----------|
+   | 1,000 | 72 | 76 | 96 | 1.27x |
+   | 10,000 | 82 | 79 | 101 | 1.28x |
+   | 50,000 | 74 | 76 | 102 | 1.34x |
+   | 200,000 | 78 | 77 | 98 | 1.28x |
+
+   **The compressed CIG is both smaller AND faster than NanoVDB** at typical
+   sparsities (1K-50K voxels). At 200K voxels (high density, nearly all
+   lower nodes filled), CIG uses 1.6x more memory due to the dense (16,16,16)
+   lower array -- addressable by adding masked compression to internal nodes.
+
+   The popcount overhead is negligible: compressed cuTile (76us) vs dense
+   cuTile (74us), a 3% difference. The bitmask + popcount chain runs at
+   essentially the same speed as a direct array lookup.
+
+**Key finding:** the `masked` layout simultaneously solves the memory
+problem AND preserves the query speed advantage. The bitmask is layout
+metadata (like offsets in jagged); the popcount is the access computation
+(like offset lookup in jagged). Both are transparent in the type system,
+analyzable in the AST, and compilable to GPU code.
+
 ---
 
 ## Working Theory
@@ -729,7 +801,9 @@ File inventory:
 | `cig.py` | v7: CIG format definition, builder, PyTorch ijk_to_index |
 | `cig_cutile.py` | v7: cuTile kernel for CIG ijk_to_index |
 | `test_cig.py` | v7: CIG builder and ijk_to_index correctness tests |
-| `bench_cig_vs_fvdb.py` | v7: head-to-head CIG vs fVDB comparison |
+| `bench_cig_vs_fvdb.py` | v7/v8: head-to-head CIG vs fVDB comparison |
+| `cig_masked_cutile.py` | v8: cuTile kernel with bitmask + popcount |
+| `test_masked.py` | v8: masked layout DSL tests |
 | `run_all_tests.py` | Single entry point for non-GPU tests |
 
 ### Current state
@@ -788,6 +862,12 @@ Key semantic rules:
     than NanoVDB's compiled CUDA kernel at 1K-200K voxel scale.
 19. Memory characterisation: NanoVDB 8-12x smaller than naive dense-leaf
     CIG. Bitmask compression is the key difference.
+20. `masked` layout: first-class sparse-occupancy layout in the type system.
+    Bitmask + popcount for dense index computation, zero-cost construction.
+21. Compressed CIG with masked leaves: 0.22-0.73x the memory of NanoVDB
+    at typical sparsities, while maintaining 1.27-1.34x faster queries.
+22. Software popcount via Hamming weight in cuTile (i32): 16-word unrolled
+    bitmask chain adds only ~3% overhead vs dense array lookup.
 
 ### Completed milestones (previously "next steps")
 
@@ -809,17 +889,14 @@ Key semantic rules:
 - **fVDB head-to-head** (v7): done. CIG cuTile 1.3-1.5x faster than NanoVDB
   for ijk_to_index queries. NanoVDB 8-12x smaller in memory (bitmask
   compression). See `bench_cig_vs_fvdb.py`.
+- **`masked` layout + compressed CIG** (v8): done. Bitmask-compressed leaves
+  with popcount access. Compressed CIG is 0.22-0.73x NanoVDB memory at
+  typical sparsities AND 1.27-1.34x faster. The `masked` layout is a
+  first-class type-system concept. See `cig_masked_cutile.py`, `test_masked.py`.
 
 ### Recommended next steps
 
-**1. CIG memory compression.** The dense-leaf CIG uses 8-12x more memory
-than NanoVDB. Adding bitmask compression (64-byte mask per leaf + popcount
-offset calculation) would close this gap while potentially preserving the
-fused gather pattern. The design question: can `Gather(leaf, coord)` be
-extended to `Gather(compressed_leaf, coord)` where the gather internally
-does a bitmask check + popcount? This is the next structural challenge.
-
-**2. Jagged output on GPU (Where).** The `Where` operation produces
+**1. Jagged output on GPU (Where).** The `Where` operation produces
 variable-length output, which requires a two-pass GPU pattern: count pass
 (parallel prefix sum for offsets), then scatter pass. This is a known GPU
 primitive but has not been expressed in the emitter yet.

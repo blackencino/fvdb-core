@@ -200,6 +200,41 @@ class StructElement:
         return f"Struct({{{inner}}})"
 
 
+@dataclass(frozen=True)
+class MaskedElement:
+    """Element type for a masked (sparse-occupancy) layout.
+
+    Represents a fixed-shape iteration space where only some positions have
+    data, identified by a bitmask. The dense index of an active position is
+    computed via popcount of the mask bits below that position.
+
+    Physical storage: a packed bitmask + a base offset into a flat data array.
+    This is the sparse-occupancy counterpart of jagged (variable-length).
+    """
+
+    mask_shape: Shape  # shape of the iteration space (e.g., (8,8,8))
+    element_type: "ElementType"  # type of each active element
+
+    def __repr__(self) -> str:
+        return f"Masked({self.mask_shape}, {self.element_type!r})"
+
+
+def masked_layout(mask_shape: Shape, elem_type: "ElementType") -> Type:
+    """Masked layout: fixed-shape space with sparse occupancy.
+
+    The mask_shape defines the logical iteration space (e.g., (8,8,8) for a
+    leaf block). Only positions where the bitmask is set have data. Access
+    requires a bitmask check + popcount to compute the dense index.
+
+    This is a layout (lowercase, free): it describes how to interpret a
+    bitmask + flat data array as a sparse block. No data is moved.
+
+    The resulting Type has rank 0 (the masked layout wraps the full space
+    into a single element that can be Gathered into with a coordinate).
+    """
+    return Type(Shape(), MaskedElement(mask_shape, elem_type))
+
+
 def tuple_layout(*children: Type) -> Type:
     """Generic tuple: rank-1, length = number of children, heterogeneous."""
     elem = TupleElement(tuple(c for c in children))

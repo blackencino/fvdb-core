@@ -31,6 +31,7 @@ from .dsl_ast import (
     InBoundsNode,
     InputNode,
     MapNode,
+    MaskedNode,
     Morton3dNode,
     MulNode,
     Node,
@@ -45,9 +46,56 @@ from .dsl_ast import (
     WhereNode,
 )
 from .dsl_parse import parse
+from .layouts import MaskedElement
 from .ops import StructValue, Value
 from .ops import morton3d as np_morton3d
 from .types import Dynamic, Jagged, ScalarType, Shape, Static, Type, coord_type
+
+
+# ---------------------------------------------------------------------------
+# Masked value -- carries bitmask + offset for masked Gather
+# ---------------------------------------------------------------------------
+
+
+class MaskedValue:
+    """Runtime representation of a masked layout: bitmask + base offset."""
+
+    def __init__(self, mask_data, offset_data):
+        self.mask_data = mask_data  # numpy array (8,) i64 -- packed 512-bit mask
+        self.offset_data = offset_data  # numpy scalar i64 -- base offset
+
+    def lookup(self, coord):
+        """Check bitmask and compute dense index for a 3D coordinate.
+
+        Args:
+            coord: (3,) i32 array -- leaf-local coordinate
+
+        Returns:
+            int: base_offset + popcount if active, else -1
+        """
+        flat_idx = int(coord[0]) * 64 + int(coord[1]) * 8 + int(coord[2])
+        word_idx = flat_idx >> 6
+        bit_pos = flat_idx & 63
+
+        if word_idx < 0 or word_idx >= len(self.mask_data):
+            return np.int64(-1)
+
+        word = int(self.mask_data[word_idx])
+        if not ((word >> bit_pos) & 1):
+            return np.int64(-1)
+
+        # Popcount: count set bits before flat_idx
+        total = 0
+        for w in range(word_idx):
+            total += bin(int(self.mask_data[w]) & 0xFFFFFFFFFFFFFFFF).count("1")
+        partial_mask = word & ((1 << bit_pos) - 1)
+        total += bin(partial_mask & 0xFFFFFFFFFFFFFFFF).count("1")
+
+        return np.int64(int(self.offset_data) + total)
+
+    def __repr__(self):
+        n_active = sum(bin(int(w) & 0xFFFFFFFFFFFFFFFF).count("1") for w in self.mask_data)
+        return f"MaskedValue(offset={self.offset_data}, active={n_active}/512)"
 
 # ---------------------------------------------------------------------------
 # Evaluation environment
@@ -271,6 +319,14 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
         result = np_morton3d(coord_val.data)
         return Value(Type(Shape(), ScalarType.I32), result)
 
+    if isinstance(node, MaskedNode):
+        mask_val = eval_node(node.mask, env)
+        offset_val = eval_node(node.offset, env)
+        input_types = {k: v.type for k, v in env.inputs.items()}
+        type_env = {k: v.type for k, v in {**env.bindings, **env.locals}.items()}
+        result_type = node.infer_type(type_env, input_types)
+        return Value(result_type, MaskedValue(mask_val.data, offset_val.data))
+
     # -- Layout operations --
 
     if isinstance(node, CutNode):
@@ -437,6 +493,12 @@ def _gather(target: Value, indexer: Value) -> Value:
         elif et in (ScalarType.I32, ScalarType.I64):
             return np.int32(-1)
         return np.float32(0.0)
+
+    # Masked target: bitmask check + popcount.
+    if isinstance(target.data, MaskedValue):
+        coord = indexer.data
+        result = target.data.lookup(coord)
+        return Value(Type(Shape(), ScalarType.I64), result)
 
     # Special case 1: single-point lookup with vector coordinate.
     # (r,) integer indexer into rank-r target -> single element.

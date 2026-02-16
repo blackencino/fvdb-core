@@ -6,10 +6,7 @@ Head-to-head comparison: CIG vs fVDB Grid.
 Compares construction time, memory footprint, and ijk_to_index query
 performance at multiple grid sizes, using the same input coordinates.
 
-Three query implementations:
-  - fVDB Grid.ijk_to_index  (NanoVDB C++/CUDA kernel)
-  - CIG PyTorch vectorized   (advanced indexing)
-  - CIG cuTile kernel        (hand-written from the cross-leaf pattern)
+Includes both dense CIG (v7) and compressed CIG with masked layout (v8).
 """
 
 import time
@@ -18,7 +15,9 @@ import numpy as np
 import torch
 
 from docs.wip.prototype.cig import CIG, build_cig, cig_ijk_to_index
+from docs.wip.prototype.cig import CompressedCIG, build_compressed_cig, compressed_cig_ijk_to_index
 from docs.wip.prototype.cig_cutile import run_cig_ijk_to_index
+from docs.wip.prototype.cig_masked_cutile import build_i32_masks, run_compressed_cig_ijk_to_index
 
 try:
     import fvdb
@@ -160,59 +159,73 @@ def bench_one(n_voxels: int, n_queries: int = 50000):
         results["fvdb_build_us"] = None
         results["fvdb_bytes"] = None
 
+    # Compressed CIG
+    ccig = build_compressed_cig(grid_coords)
+    ccig_cuda = ccig.cuda()
+    masks_i32 = build_i32_masks(ccig).cuda()
+    offsets_i32 = ccig.leaf_offsets.int().cuda()
+    results["ccig_bytes"] = ccig.num_bytes
+
     # Print structure comparison
-    print(f"  CIG:  {cig.n_active:>7,} voxels, {cig.n_leaves:>5,} leaves, {cig.num_bytes:>10,} bytes ({cig.num_bytes / 1024:.1f} KB)")
+    print(f"  Dense CIG:      {cig.n_active:>7,} voxels, {cig.n_leaves:>5,} leaves, {cig.num_bytes:>10,} bytes ({cig.num_bytes / 1024:.1f} KB)")
+    print(f"  Compressed CIG: {ccig.n_active:>7,} voxels, {ccig.n_leaves:>5,} leaves, {ccig.num_bytes:>10,} bytes ({ccig.num_bytes / 1024:.1f} KB)")
     if HAS_FVDB:
         print(
-            f"  fVDB: {grid.num_voxels:>7,} voxels, {grid.num_leaf_nodes:>5,} leaves, "
+            f"  fVDB (NanoVDB): {grid.num_voxels:>7,} voxels, {grid.num_leaf_nodes:>5,} leaves, "
             f"{grid.num_bytes:>10,} bytes ({grid.num_bytes / 1024:.1f} KB)"
         )
-        ratio = grid.num_bytes / max(cig.num_bytes, 1)
-        print(f"  Memory ratio (fVDB / CIG): {ratio:.2f}x")
+        ratio = ccig.num_bytes / max(grid.num_bytes, 1)
+        print(f"  Compressed CIG / fVDB memory: {ratio:.2f}x")
 
     # ===== Query correctness =====
 
     cig_pt_result = cig_ijk_to_index(cig_cuda, query_coords_cuda)
-    cig_ct_result = run_cig_ijk_to_index(query_coords_cuda, cig_cuda.lower, cig_cuda.leaf_arr)
 
-    # CIG PyTorch vs cuTile should be identical
-    np.testing.assert_array_equal(cig_pt_result.cpu().numpy(), cig_ct_result.cpu().numpy())
+    # Compressed CIG correctness (PyTorch)
+    ccig_pt_result = compressed_cig_ijk_to_index(ccig, query_coords_cuda.cpu())
+    np.testing.assert_array_equal(
+        (cig_pt_result.cpu() >= 0).numpy(), (ccig_pt_result >= 0).numpy()
+    )
+
+    # Compressed CIG cuTile correctness
+    ccig_ct_result = run_compressed_cig_ijk_to_index(query_coords_cuda, ccig_cuda.lower, masks_i32, offsets_i32)
+    np.testing.assert_array_equal(ccig_pt_result.numpy(), ccig_ct_result.cpu().numpy())
 
     if HAS_FVDB:
         fvdb_result = grid.ijk_to_index(query_coords_cuda)
-        agree, n_hits = verify_agreement(fvdb_result.cpu(), cig_pt_result.cpu(), "fVDB vs CIG")
+        agree, n_hits = verify_agreement(fvdb_result.cpu(), ccig_ct_result.cpu(), "fVDB vs Compressed CIG")
         if agree:
             print(f"  Query agreement: OK ({n_hits} hits out of {n_queries})")
         results["n_hits"] = n_hits
     else:
-        n_hits = (cig_pt_result >= 0).sum().item()
+        n_hits = (ccig_ct_result >= 0).sum().item()
         results["n_hits"] = n_hits
         print(f"  CIG queries: {n_hits} hits out of {n_queries}")
 
     # ===== Query timing =====
 
-    # CIG PyTorch vectorized
-    t_cig_pt = _time_fn(lambda: cig_ijk_to_index(cig_cuda, query_coords_cuda))
-    results["cig_pt_us"] = t_cig_pt
+    # Dense CIG cuTile kernel
+    t_dense_ct = _time_fn(lambda: run_cig_ijk_to_index(query_coords_cuda, cig_cuda.lower, cig_cuda.leaf_arr))
+    results["dense_ct_us"] = t_dense_ct
 
-    # CIG cuTile kernel
-    t_cig_ct = _time_fn(lambda: run_cig_ijk_to_index(query_coords_cuda, cig_cuda.lower, cig_cuda.leaf_arr))
-    results["cig_ct_us"] = t_cig_ct
+    # Compressed CIG cuTile kernel
+    t_comp_ct = _time_fn(lambda: run_compressed_cig_ijk_to_index(query_coords_cuda, ccig_cuda.lower, masks_i32, offsets_i32))
+    results["comp_ct_us"] = t_comp_ct
 
     if HAS_FVDB:
         t_fvdb = _time_fn(lambda: grid.ijk_to_index(query_coords_cuda))
         results["fvdb_us"] = t_fvdb
 
     # Print timing
-    print(f"\n  {'Method':<25} {'Build (us)':>12} {'Query (us)':>12}")
-    print(f"  {'-' * 52}")
+    print(f"\n  {'Method':<30} {'Memory (KB)':>12} {'Query (us)':>12}")
+    print(f"  {'-' * 58}")
     if HAS_FVDB:
-        print(f"  {'fVDB (NanoVDB)':<25} {results['fvdb_build_us']:>12.1f} {results['fvdb_us']:>12.1f}")
-    print(f"  {'CIG PyTorch':<25} {t_cig_build:>12.1f} {t_cig_pt:>12.1f}")
-    print(f"  {'CIG cuTile':<25} {'--':>12} {t_cig_ct:>12.1f}")
+        print(f"  {'fVDB (NanoVDB)':<30} {results['fvdb_bytes'] / 1024:>12.1f} {results['fvdb_us']:>12.1f}")
+    print(f"  {'Dense CIG cuTile':<30} {cig.num_bytes / 1024:>12.1f} {t_dense_ct:>12.1f}")
+    print(f"  {'Compressed CIG cuTile':<30} {ccig.num_bytes / 1024:>12.1f} {t_comp_ct:>12.1f}")
 
     if HAS_FVDB:
-        print(f"\n  Query speedup (CIG cuTile vs fVDB): {results['fvdb_us'] / t_cig_ct:.2f}x")
+        print(f"\n  Compressed CIG vs fVDB query: {results['fvdb_us'] / t_comp_ct:.2f}x")
 
     return results
 
@@ -235,42 +248,35 @@ def main():
         all_results.append(r)
 
     # Summary table
-    print("\n\n" + "=" * 65)
+    print("\n\n" + "=" * 70)
     print("Summary")
-    print("=" * 65)
+    print("=" * 70)
 
-    header_mem = f"{'Voxels':>8} {'CIG (KB)':>10} "
-    header_query = f"{'CIG-PT (us)':>12} {'CIG-CT (us)':>12} "
-    if HAS_FVDB:
-        header_mem += f"{'fVDB (KB)':>10} {'Ratio':>7}"
-        header_query += f"{'fVDB (us)':>10} {'CT/fVDB':>8}"
     print(f"\n  Memory:")
-    print(f"  {header_mem}")
-    print(f"  {'-' * len(header_mem)}")
-    for r in all_results:
-        line = f"  {r['n_voxels']:>8,} {r['cig_bytes'] / 1024:>10.1f} "
-        if HAS_FVDB and r["fvdb_bytes"] is not None:
-            ratio = r["fvdb_bytes"] / max(r["cig_bytes"], 1)
-            line += f"{r['fvdb_bytes'] / 1024:>10.1f} {ratio:>6.1f}x"
-        print(line)
-
-    print(f"\n  Query time ({all_results[0]['n_queries']:,} queries):")
-    print(f"  {header_query}")
-    print(f"  {'-' * len(header_query)}")
-    for r in all_results:
-        line = f"  {r['cig_pt_us']:>12.1f} {r['cig_ct_us']:>12.1f} "
-        if HAS_FVDB and r.get("fvdb_us") is not None:
-            speedup = r["fvdb_us"] / r["cig_ct_us"]
-            line += f"{r['fvdb_us']:>10.1f} {speedup:>7.2f}x"
-        print(line)
-
+    hdr = f"  {'Voxels':>8} {'Dense CIG':>12} {'Comp. CIG':>12}"
     if HAS_FVDB:
-        print(f"\n  Build time:")
-        print(f"  {'Voxels':>8} {'CIG (us)':>12} {'fVDB (us)':>12} {'Ratio':>8}")
-        print(f"  {'-' * 45}")
-        for r in all_results:
-            ratio = r["fvdb_build_us"] / max(r["cig_build_us"], 1)
-            print(f"  {r['n_voxels']:>8,} {r['cig_build_us']:>12.1f} {r['fvdb_build_us']:>12.1f} {ratio:>7.2f}x")
+        hdr += f" {'NanoVDB':>12} {'Comp/fVDB':>10}"
+    print(hdr)
+    print(f"  {'-' * len(hdr)}")
+    for r in all_results:
+        line = f"  {r['n_voxels']:>8,} {r['cig_bytes']:>12,} {r['ccig_bytes']:>12,}"
+        if HAS_FVDB and r.get("fvdb_bytes"):
+            ratio = r["ccig_bytes"] / r["fvdb_bytes"]
+            line += f" {r['fvdb_bytes']:>12,} {ratio:>9.2f}x"
+        print(line)
+
+    print(f"\n  Query time (us, {all_results[0]['n_queries']:,} queries):")
+    hdr2 = f"  {'Voxels':>8} {'Dense CT':>10} {'Comp CT':>10}"
+    if HAS_FVDB:
+        hdr2 += f" {'fVDB':>10} {'Comp/fVDB':>10}"
+    print(hdr2)
+    print(f"  {'-' * len(hdr2)}")
+    for r in all_results:
+        line = f"  {r['n_voxels']:>8,} {r['dense_ct_us']:>10.1f} {r['comp_ct_us']:>10.1f}"
+        if HAS_FVDB and r.get("fvdb_us"):
+            speedup = r["fvdb_us"] / r["comp_ct_us"]
+            line += f" {r['fvdb_us']:>10.1f} {speedup:>9.2f}x"
+        print(line)
 
 
 if __name__ == "__main__":
