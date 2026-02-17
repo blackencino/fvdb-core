@@ -1,5 +1,7 @@
 # Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: Apache-2.0
+#
+# DSL status: out-of-DSL (construction is imperative torch; query via DSL pipeline)
 """
 Compact Index Grid (CIG) -- 3-level bitmask-compressed sparse index grid.
 
@@ -89,12 +91,11 @@ def _build_masked_level(node_of_child, child_local_flat, n_nodes, n_words, devic
     sorted_flat = child_local_flat[sort_order]
 
     masks = torch.zeros(n_nodes, n_words, dtype=torch.int64, device=device)
-    for i in range(M):
-        ni = int(sorted_node[i])
-        fl = int(sorted_flat[i])
-        word_idx = fl >> 6
-        bit_pos = fl & 63
-        masks[ni, word_idx] |= 1 << bit_pos
+    word_idx = sorted_flat >> 6
+    bit_pos = sorted_flat & 63
+    bits = torch.ones(M, dtype=torch.int64, device=device) << bit_pos
+    flat_idx = sorted_node.long() * n_words + word_idx
+    masks.view(-1).scatter_add_(0, flat_idx, bits)
 
     rel_prefix = _build_prefix_sums(masks)
 
@@ -178,7 +179,7 @@ class CompressedCIG3:
         )
 
 
-def build_compressed_cig3(ijk: torch.Tensor) -> CompressedCIG3:
+def build_compressed_cig3(ijk: torch.Tensor) -> CompressedCIG3:  # OUT_OF_DSL: imperative torch construction
     """Build a 3-level bitmask-compressed CIG from voxel coordinates.
 
     Bit-widths [3, 4, 5]:
@@ -351,7 +352,3 @@ def cig3_ijk_to_index_ref(cig: CompressedCIG3, query: torch.Tensor) -> torch.Ten
         result[i] = voxel_idx
 
     return result
-
-
-# Backward-compatible alias
-cig3_ijk_to_index_numpy = cig3_ijk_to_index_ref

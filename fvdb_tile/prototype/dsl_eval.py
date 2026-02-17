@@ -1112,14 +1112,11 @@ def _unique_leading_axis(data: torch.Tensor) -> torch.Tensor:
         return torch.unique(data, sorted=True)
     rows = data.reshape(data.shape[0], -1)
     _, inverse = torch.unique(rows, dim=0, return_inverse=True)
-    # Find first occurrence of each unique row
-    first_occ: dict[int, int] = {}
-    for i in range(rows.shape[0]):
-        u = inverse[i].item()
-        if u not in first_occ:
-            first_occ[u] = i
-    first_idx_sorted = sorted(first_occ.values())
-    return data[first_idx_sorted].clone()
+    n_unique = int(inverse.max().item()) + 1
+    arange = torch.arange(rows.shape[0], dtype=torch.long, device=data.device)
+    first_occ = torch.full((n_unique,), rows.shape[0], dtype=torch.long, device=data.device)
+    first_occ.scatter_reduce_(0, inverse.long(), arange, reduce="amin", include_self=False)
+    return data[first_occ.sort().values].clone()
 
 
 def _promote_dynamic_to_jagged(ty: Type) -> Type:

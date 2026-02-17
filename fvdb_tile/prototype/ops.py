@@ -830,15 +830,16 @@ def hash_map_compute_storage_size(item_count: int) -> int:
 def hash_map_build(keys: torch.Tensor) -> torch.Tensor:
     """Build hash map from i64 keys.  Returns the key array (the map).
 
-    Sequential reference implementation (no CAS needed on CPU).
-    The key array length IS the storage_size.  Sentinel-filled.
+    CPU-only reference implementation (sequential, no CAS).  For GPU
+    tensors, use ``hashmap_cuda.gpu_hash_map_build`` instead.
 
     Args:
-        keys: (N,) i64 tensor of keys.  Must not contain EMPTY_KEY.
+        keys: (N,) i64 CPU tensor of keys.  Must not contain EMPTY_KEY.
 
     Returns:
         (storage_size,) i64 key array.
     """
+    assert not keys.is_cuda, "hash_map_build is CPU-only; use hashmap_cuda.gpu_hash_map_build for CUDA tensors"
     n = keys.shape[0]
     storage_size = hash_map_compute_storage_size(n)
     if storage_size == 0:
@@ -871,13 +872,17 @@ def hash_map_build(keys: torch.Tensor) -> torch.Tensor:
 def hash_map_lookup(key_arr: torch.Tensor, queries: torch.Tensor) -> torch.Tensor:
     """Look up keys in a hash map.  Returns slot indices.
 
+    CPU-only reference implementation.  For GPU tensors, use
+    ``hashmap_cuda.gpu_hash_map_lookup`` instead.
+
     Args:
-        key_arr: (storage_size,) i64 key array from hash_map_build.
-        queries: (M,) i64 query keys.
+        key_arr: (storage_size,) i64 CPU key array from hash_map_build.
+        queries: (M,) i64 CPU query keys.
 
     Returns:
         (M,) i64 tensor of slot indices.  HASH_MAP_NO_SLOT for misses.
     """
+    assert not key_arr.is_cuda, "hash_map_lookup is CPU-only; use hashmap_cuda.gpu_hash_map_lookup for CUDA tensors"
     storage_size = key_arr.shape[0]
     if storage_size == 0:
         return torch.full(
@@ -913,15 +918,19 @@ def hash_map_scatter_reduce(
 ) -> torch.Tensor:
     """Scatter values into hash map slots, combining with a reduce function.
 
+    CPU-only reference implementation.  For GPU tensors, use
+    ``hashmap_cuda.gpu_hash_map_scatter_reduce`` instead.
+
     Args:
-        key_arr: (storage_size,) i64 key array from hash_map_build.
-        keys: (N,) i64 keys to scatter.
-        values: (N, ...) values to scatter.
+        key_arr: (storage_size,) i64 CPU key array from hash_map_build.
+        keys: (N,) i64 CPU keys to scatter.
+        values: (N, ...) CPU values to scatter.
         reduce_fn: "or", "add", "max" -- combining function for collisions.
 
     Returns:
         (storage_size, ...) value array with reduced values at each slot.
     """
+    assert not key_arr.is_cuda, "hash_map_scatter_reduce is CPU-only; use hashmap_cuda for CUDA tensors"
     storage_size = key_arr.shape[0]
     value_shape = values.shape[1:]
     result = torch.zeros((storage_size, *value_shape), dtype=values.dtype, device=values.device)

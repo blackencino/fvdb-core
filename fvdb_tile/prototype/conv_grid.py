@@ -1,5 +1,7 @@
 # Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: Apache-2.0
+#
+# DSL status: fully DSL-driven
 """
 conv_grid: topology expansion for sparse convolution.
 
@@ -206,10 +208,12 @@ def conv_grid(
         stride_t = torch.tensor(st, dtype=torch.int32, device=dev)
         inputs["stride"] = Value(Type(Shape(Static(3)), ScalarType.I32), stride_t)
 
-    # --- Execute via pipeline (evaluator + collective hooks) ---
-    result = pipeline.run(inputs, device=None)
+    # --- Execute via pipeline ---
+    # Pass device so cutile segments compile to GPU kernels and collectives
+    # dispatch to torch GPU ops.  Data stays on-device throughout.
+    result = pipeline.run(inputs, device=device)
     output = result.output.data
 
     if isinstance(output, torch.Tensor):
-        return output.to(dtype=torch.int32)
+        return output.to(device=dev, dtype=torch.int32)
     return torch.empty((0, 3), dtype=torch.int32, device=dev)

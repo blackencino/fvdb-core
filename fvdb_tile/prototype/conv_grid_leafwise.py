@@ -1,5 +1,7 @@
 # Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: Apache-2.0
+#
+# DSL status: out-of-DSL (GPU path uses hand-fused kernels; future fusion target)
 """
 conv_grid_leafwise: topology expansion via leaf-level bitmask dilation.
 
@@ -121,7 +123,8 @@ def conv_grid_leafwise(
 
 
 # ---------------------------------------------------------------------------
-# GPU path: 3 launches, 0 Python loops over data
+# OUT_OF_DSL: GPU path -- 3 kernel launches, hand-fused, bypasses DSL pipeline.
+# Future: express as DSL program with idiom-recognition fusion.
 # ---------------------------------------------------------------------------
 
 

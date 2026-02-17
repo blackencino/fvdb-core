@@ -190,7 +190,8 @@ d
     exe = compile_source(source)
     result_cuda = exe.run({"x": x_val}, device="cuda")
 
-    torch.testing.assert_close(result_cuda.output.data, direct_out.data, atol=0, rtol=0)
+    # GPU pipeline keeps results on device; move to CPU for comparison.
+    torch.testing.assert_close(result_cuda.output.data.cpu(), direct_out.data, atol=0, rtol=0)
 
 
 def test_pipeline_cutile_matches_evaluator():
@@ -212,4 +213,5 @@ c
     result_none = exe.run({"x": x_val}, device=None)
     result_cuda = exe.run({"x": x_val}, device="cuda")
 
-    torch.testing.assert_close(result_cuda.output.data, result_none.output.data, atol=0, rtol=0)
+    # GPU pipeline keeps results on device; move to CPU for comparison.
+    torch.testing.assert_close(result_cuda.output.data.cpu(), result_none.output.data, atol=0, rtol=0)

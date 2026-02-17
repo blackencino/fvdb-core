@@ -1,5 +1,7 @@
 # Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: Apache-2.0
+#
+# DSL status: out-of-DSL (hand-written CUDA kernels; future fusion/codegen target)
 """
 GPU hash map operations via CUDA kernels.
 
@@ -531,7 +533,7 @@ def gpu_hash_map_scatter_reduce(
     return result
 
 
-def gpu_conv_grid_dilate(
+def gpu_conv_grid_dilate(  # OUT_OF_DSL: hand-fused kernel, future fusion target
     leaf_masks: torch.Tensor,
     leaf_coords: torch.Tensor,
     offsets: torch.Tensor,
@@ -544,10 +546,10 @@ def gpu_conv_grid_dilate(
     boundary crossings, computes the target leaf key, probes the hash
     map, and atomicOr's the shifted bits into the output.
 
-    NOTE: This is a performance-proving fused kernel.  It is correct
-    and matches the DSL-level algorithm description, but is NOT yet
-    expressed through the DSL/AST pipeline.  Future work should express
-    this as a DSL program with idiom-recognition lowering.
+    OUT_OF_DSL: This is a performance-proving fused kernel.  It is
+    correct and matches the DSL-level algorithm description, but is NOT
+    yet expressed through the DSL/AST pipeline.  Future work should
+    express this as a DSL program with idiom-recognition lowering.
 
     Args:
         leaf_masks:    (L, 8) i64 CUDA -- input leaf occupancy masks.

@@ -483,7 +483,7 @@ def _run_cutile_segment(
         tuple(launch_args),
     )
 
-    result_trimmed = result_t[:tile_N].to(torch.int32).cpu()
+    result_trimmed = result_t[:tile_N].to(torch.int32)
     result_type = all_types.get(last_name)
     if result_type is None:
         result_type = Type(Shape(Dynamic()), ScalarType.I32)
@@ -563,35 +563,24 @@ def _torch_unique(node: UniqueNode, env: EvalEnv) -> Value:
 
 
 def _make_collective_hooks(device: str) -> dict:
-    """Build a hooks dict that intercepts collective nodes with torch ops."""
+    """Build a hooks dict that intercepts collective nodes with torch ops.
+
+    Results are kept on the target device throughout pipeline execution --
+    no GPU->CPU round-trips between segments.
+    """
     torch_device = torch.device(device)
 
     def where_hook(node, env):
         val = _torch_where(node, env)
-        if torch_device.type != "cpu":
-            t = val.data.to(torch_device)
-            return Value(val.type, t.cpu())
-        return val
+        return Value(val.type, val.data.to(torch_device))
 
     def sort_hook(node, env):
         val = _torch_sort(node, env)
-        if torch_device.type != "cpu":
-            t = val.data.to(torch_device)
-            sorted_t, _ = torch.sort(t, stable=True, dim=0)
-            return Value(val.type, sorted_t.cpu())
-        return val
+        return Value(val.type, val.data.to(torch_device))
 
     def unique_hook(node, env):
         val = _torch_unique(node, env)
-        if torch_device.type != "cpu":
-            t = val.data.to(torch_device)
-            if t.ndim == 1:
-                unique_t = torch.unique(t, sorted=True)
-            else:
-                unique_t = torch.unique(t, dim=0, sorted=True)
-            in_ty = val.type
-            return Value(in_ty, unique_t.cpu())
-        return val
+        return Value(val.type, val.data.to(torch_device))
 
     def hashmap_build_hook(node, env):
         keys_val = eval_node(node.keys, EvalEnv(env.inputs, env.bindings))
@@ -602,8 +591,9 @@ def _make_collective_hooks(device: str) -> dict:
         if torch_device.type != "cpu":
             data_gpu = data.to(device=torch_device, dtype=torch.int64)
             from .hashmap_cuda import gpu_hash_map_build
+
             key_arr, _slots = gpu_hash_map_build(data_gpu)
-            return Value(result_type, key_arr.cpu())
+            return Value(result_type, key_arr)
         else:
             key_arr = hash_map_build(data)
             return Value(result_type, key_arr)
@@ -616,7 +606,7 @@ def _make_collective_hooks(device: str) -> dict:
         if not isinstance(key_arr_data, torch.Tensor) or not isinstance(queries_data, torch.Tensor):
             raise TypeError("HashMapLookup requires tensor data")
         query_ty = node.queries.infer_type(
-            {k: v.type for k, v in {**env.bindings, **getattr(env, 'locals', {})}.items()},
+            {k: v.type for k, v in {**env.bindings, **getattr(env, "locals", {})}.items()},
             {k: v.type for k, v in env.inputs.items()},
         )
         result_type = Type(query_ty.iteration_shape, ScalarType.I64)
@@ -624,8 +614,9 @@ def _make_collective_hooks(device: str) -> dict:
             ka_gpu = key_arr_data.to(device=torch_device, dtype=torch.int64)
             q_gpu = queries_data.to(device=torch_device, dtype=torch.int64)
             from .hashmap_cuda import gpu_hash_map_lookup
+
             slots = gpu_hash_map_lookup(ka_gpu, q_gpu)
-            return Value(result_type, slots.cpu())
+            return Value(result_type, slots)
         else:
             slots = hash_map_lookup(key_arr_data, queries_data)
             return Value(result_type, slots)

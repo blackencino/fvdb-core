@@ -333,8 +333,9 @@ def test_pipeline_gpu_bitwise():
     result_gpu = pipeline.run(inputs, device="cuda")
 
     # cuTile segments output int32; CPU eval preserves int64. Compare as int64.
-    gpu_data = result_gpu.output.data.to(torch.int64)
-    cpu_data = result_cpu.output.data.to(torch.int64)
+    # GPU pipeline keeps results on device; move to CPU for comparison.
+    gpu_data = result_gpu.output.data.cpu().to(torch.int64)
+    cpu_data = result_cpu.output.data.cpu().to(torch.int64)
     torch.testing.assert_close(gpu_data, cpu_data, atol=0, rtol=0)
 
 
