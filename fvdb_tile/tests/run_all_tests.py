@@ -6,14 +6,16 @@ Run all prototype tests in conceptual order.
   v0  -- types, Map, Where, Gather, Each, jagged emergence
   v1  -- multiple leaves (Cut), Indexed layout, Struct + Flip
   v2  -- two-level hierarchical chain, Decompose, morton
-  v3  -- micro DSL: string -> parse -> type-check -> execute
+  v3  -- micro DSL: string -> parse -> type-check -> execute;
+         Sort/Unique primitives; barrier-aware pipeline planning
   mesh -- triangle mesh as layouts over tensors
   v5  -- cross-leaf neighbors via DSL evaluator (numpy)
 
 GPU tests (require `source ~/.venvs/fvdb_cutile/bin/activate`):
-  v4  -- test_cutile_smoke.py, test_cutile_gather.py, test_cutile_codegen.py
+  v4  -- test_cutile_smoke.py
   v5  -- test_cutile_e2e.py
-  v6  -- test_cutile_cross_leaf.py, bench_cutile_cross_leaf.py
+  v6  -- test_cutile_cross_leaf.py
+  v8+ -- test_cutile_masked_e2e.py, test_cutile_cig3_e2e.py
 """
 
 import sys

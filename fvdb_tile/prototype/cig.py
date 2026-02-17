@@ -1,22 +1,22 @@
 # Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: Apache-2.0
 """
-Compact Index Grid (CIG) -- concrete tensor format and operations.
+Compact Index Grid (CIG) -- 3-level bitmask-compressed sparse index grid.
 
-A CIG is a 2-level sparse index grid stored as two raw tensors:
+A CompressedCIG3 maps (i, j, k) voxel coordinates to linear indices via
+three masked levels: upper (32^3), lower (16^3), leaf (8^3), with a root
+lookup over variable upper nodes.
 
-  lower:    (16, 16, 16)   i32  -- maps lower-level 3D coords to leaf index (-1 = empty)
-  leaf_arr: (K, 8, 8, 8)   i32  -- K leaf blocks, each maps local 3D coords to
-                                    a linear voxel index (-1 = inactive)
-
-Bit-width decomposition [3, 4]:
-  level_0 (leaf-local):  coord & 7          (bottom 3 bits)
-  level_1 (lower-node):  (coord >> 3) & 15  (next 4 bits)
+Bit-width decomposition [3, 4, 5]:
+  level_0 (leaf-local):  coord & 7              (3 bits)
+  level_1 (lower-local): (coord >> 3) & 15      (4 bits)
+  level_2 (upper-local): (coord >> 7) & 31      (5 bits)
+  which_top:             coord >> 12             (root key)
 
 This file provides:
-  build_cig()           -- construct a CIG from (N, 3) voxel coordinates
-  cig_ijk_to_index()    -- vectorized PyTorch query: (N, 3) -> (N,) indices
-  cig_num_bytes()       -- total memory footprint in bytes
+  build_compressed_cig3()       -- construct from (N, 3) voxel coordinates
+  root_lookup()                 -- torch root-level linear scan
+  cig3_ijk_to_index_numpy()     -- numpy reference query (loop-based)
 """
 
 from __future__ import annotations
@@ -27,226 +27,9 @@ import numpy as np
 import torch
 
 
-@dataclass
-class CIG:
-    """A 2-level Compact Index Grid."""
-
-    lower: torch.Tensor  # (16, 16, 16) i32
-    leaf_arr: torch.Tensor  # (K, 8, 8, 8) i32
-    n_active: int  # total number of active voxels
-    n_leaves: int  # number of allocated leaf blocks (K)
-
-    @property
-    def num_bytes(self) -> int:
-        """Total memory footprint of the CIG tensors in bytes."""
-        return self.lower.nelement() * self.lower.element_size() + self.leaf_arr.nelement() * self.leaf_arr.element_size()
-
-    @property
-    def device(self) -> torch.device:
-        return self.lower.device
-
-    def cuda(self) -> "CIG":
-        if self.lower.is_cuda:
-            return self
-        return CIG(
-            lower=self.lower.cuda(),
-            leaf_arr=self.leaf_arr.cuda(),
-            n_active=self.n_active,
-            n_leaves=self.n_leaves,
-        )
-
-
-def build_cig(ijk: torch.Tensor) -> CIG:
-    """Build a 2-level CIG from voxel coordinates.
-
-    Args:
-        ijk: (N, 3) i32 tensor of voxel coordinates. Duplicates are
-             deduplicated (only one voxel per coordinate).
-
-    Returns:
-        A CIG with lower and leaf_arr tensors, plus metadata.
-    """
-    assert ijk.ndim == 2 and ijk.shape[1] == 3, f"Expected (N, 3), got {ijk.shape}"
-    device = ijk.device
-
-    # Decompose coordinates into lower-level and leaf-local parts
-    lower_coords = (ijk >> 3) & 15  # (N, 3)
-    leaf_local = ijk & 7  # (N, 3)
-
-    # Deduplicate: unique (lower, local) pairs
-    full_coords = torch.cat([lower_coords, leaf_local], dim=1)  # (N, 6)
-    unique_full, _ = torch.unique(full_coords, dim=0, return_inverse=True)
-    lower_coords_u = unique_full[:, :3]
-    leaf_local_u = unique_full[:, 3:]
-    N_unique = unique_full.shape[0]
-
-    # Find unique lower nodes and assign leaf indices
-    unique_lower, lower_inverse = torch.unique(lower_coords_u, dim=0, return_inverse=True)
-    K = unique_lower.shape[0]
-
-    # Build the lower array: (16, 16, 16) i32, -1 = empty
-    lower = torch.full((16, 16, 16), -1, dtype=torch.int32, device=device)
-    leaf_indices = torch.arange(K, dtype=torch.int32, device=device)
-    lower[unique_lower[:, 0], unique_lower[:, 1], unique_lower[:, 2]] = leaf_indices
-
-    # Build leaf array: (K, 8, 8, 8) i32, -1 = inactive
-    leaf_arr = torch.full((K, 8, 8, 8), -1, dtype=torch.int32, device=device)
-
-    # Assign sequential voxel indices within each leaf.
-    # Sort by leaf index for stable within-leaf ordering.
-    leaf_of_voxel = lower_inverse  # (N_unique,) -- which leaf each voxel belongs to
-    sort_key = leaf_of_voxel * 512 + leaf_local_u[:, 0] * 64 + leaf_local_u[:, 1] * 8 + leaf_local_u[:, 2]
-    sort_order = torch.argsort(sort_key)
-
-    sorted_leaf = leaf_of_voxel[sort_order]
-    sorted_local = leaf_local_u[sort_order]
-
-    # Compute per-leaf offsets for sequential index assignment
-    # Count voxels per leaf
-    counts = torch.zeros(K, dtype=torch.int64, device=device)
-    counts.scatter_add_(0, sorted_leaf.long(), torch.ones(N_unique, dtype=torch.int64, device=device))
-    offsets = torch.zeros(K, dtype=torch.int64, device=device)
-    offsets[1:] = counts[:-1].cumsum(0)
-
-    # Assign linear voxel indices: offset[leaf] + position_within_leaf
-    position_within_leaf = torch.arange(N_unique, dtype=torch.int64, device=device) - offsets[sorted_leaf.long()]
-    voxel_indices = offsets[sorted_leaf.long()] + position_within_leaf
-    leaf_arr[sorted_leaf.long(), sorted_local[:, 0].long(), sorted_local[:, 1].long(), sorted_local[:, 2].long()] = voxel_indices.int()
-
-    return CIG(
-        lower=lower,
-        leaf_arr=leaf_arr,
-        n_active=int(N_unique),
-        n_leaves=int(K),
-    )
-
-
-def cig_ijk_to_index(cig: CIG, query: torch.Tensor) -> torch.Tensor:
-    """Vectorized PyTorch ijk_to_index: map (N, 3) coordinates to linear indices.
-
-    Returns (N,) i32 tensor. -1 for coordinates not in the grid.
-    """
-    assert query.ndim == 2 and query.shape[1] == 3
-    device = query.device
-
-    # Decompose
-    l1 = (query >> 3) & 15  # (N, 3) lower-level coords
-    l0 = query & 7  # (N, 3) leaf-local coords
-
-    lower = cig.lower.to(device)
-    leaf_arr = cig.leaf_arr.to(device)
-    K = leaf_arr.shape[0]
-
-    # Bounds check on lower coords
-    l1_valid = (l1 >= 0).all(dim=1) & (l1 < 16).all(dim=1)  # (N,)
-    l1_clamped = l1.clamp(0, 15)
-
-    # Gather leaf index from lower
-    leaf_idx = lower[l1_clamped[:, 0], l1_clamped[:, 1], l1_clamped[:, 2]]  # (N,)
-    valid_leaf = l1_valid & (leaf_idx >= 0) & (leaf_idx < K)
-    safe_leaf_idx = leaf_idx.clamp(min=0, max=max(K - 1, 0)).long()
-
-    # Gather voxel index from leaf_arr
-    l0_clamped = l0.clamp(0, 7)
-    voxel_idx = leaf_arr[safe_leaf_idx, l0_clamped[:, 0].long(), l0_clamped[:, 1].long(), l0_clamped[:, 2].long()]
-
-    # Mask invalid lookups
-    result = torch.where(valid_leaf & (voxel_idx >= 0), voxel_idx, torch.tensor(-1, dtype=torch.int32, device=device))
-    return result
-
-
 # ---------------------------------------------------------------------------
-# Compressed CIG: bitmask + popcount (the masked layout in tensor form)
+# Internal helpers: popcount and masked-level builder
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class CompressedCIG:
-    """A 2-level CIG with bitmask-compressed leaves.
-
-    Physical storage:
-      lower:            (16, 16, 16) i32  -- maps lower-level 3D coords to leaf index
-      leaf_masks:       (K, 8)       i64  -- 512-bit bitmask per leaf (8 x 64-bit words)
-      leaf_abs_prefix:  (K, 8)       i32  -- absolute prefix: offset + cum_popc_before_word
-      voxel_data:       (N_active,)  i32  -- flat contiguous voxel indices
-
-    Per-leaf cost: 96 bytes (64 mask + 32 abs_prefix).
-    """
-
-    lower: torch.Tensor
-    leaf_masks: torch.Tensor
-    leaf_abs_prefix: torch.Tensor
-    voxel_data: torch.Tensor
-    n_active: int
-    n_leaves: int
-
-    @property
-    def num_bytes(self) -> int:
-        total = 0
-        for t in [self.lower, self.leaf_masks, self.leaf_abs_prefix, self.voxel_data]:
-            total += t.nelement() * t.element_size()
-        return total
-
-    @property
-    def device(self) -> torch.device:
-        return self.lower.device
-
-    def cuda(self) -> "CompressedCIG":
-        if self.lower.is_cuda:
-            return self
-        return CompressedCIG(
-            lower=self.lower.cuda(),
-            leaf_masks=self.leaf_masks.cuda(),
-            leaf_abs_prefix=self.leaf_abs_prefix.cuda(),
-            voxel_data=self.voxel_data.cuda(),
-            n_active=self.n_active,
-            n_leaves=self.n_leaves,
-        )
-
-
-def build_compressed_cig(ijk: torch.Tensor) -> CompressedCIG:
-    """Build a bitmask-compressed 2-level CIG from voxel coordinates.
-
-    Same input as build_cig, but produces compressed leaf storage:
-    bitmask + absolute prefix per leaf instead of dense (8,8,8) i32 blocks.
-    """
-    assert ijk.ndim == 2 and ijk.shape[1] == 3, f"Expected (N, 3), got {ijk.shape}"
-    device = ijk.device
-
-    lower_coords = (ijk >> 3) & 15
-    leaf_local = ijk & 7
-
-    # Deduplicate
-    full_coords = torch.cat([lower_coords, leaf_local], dim=1)
-    unique_full, _ = torch.unique(full_coords, dim=0, return_inverse=True)
-    lower_coords_u = unique_full[:, :3]
-    leaf_local_u = unique_full[:, 3:]
-    N_unique = unique_full.shape[0]
-
-    # Unique lower nodes -> leaf indices
-    unique_lower, lower_inverse = torch.unique(lower_coords_u, dim=0, return_inverse=True)
-    K = unique_lower.shape[0]
-
-    # Build lower array
-    lower = torch.full((16, 16, 16), -1, dtype=torch.int32, device=device)
-    lower[unique_lower[:, 0], unique_lower[:, 1], unique_lower[:, 2]] = torch.arange(K, dtype=torch.int32, device=device)
-
-    # Build leaf level using the generic masked builder
-    leaf_of_voxel = lower_inverse
-    flat_local = leaf_local_u[:, 0] * 64 + leaf_local_u[:, 1] * 8 + leaf_local_u[:, 2]
-    leaf_masks, leaf_abs_prefix = _build_masked_level(leaf_of_voxel, flat_local, K, 8, device)
-
-    # Voxel data: sequential indices [0, N_unique)
-    voxel_data = torch.arange(N_unique, dtype=torch.int32, device=device)
-
-    return CompressedCIG(
-        lower=lower,
-        leaf_masks=leaf_masks,
-        leaf_abs_prefix=leaf_abs_prefix,
-        voxel_data=voxel_data,
-        n_active=int(N_unique),
-        n_leaves=int(K),
-    )
 
 
 def _popcount_i64(x: torch.Tensor) -> torch.Tensor:
@@ -522,101 +305,69 @@ def root_lookup(root_coords: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
     return upper_idx
 
 
-def compressed_cig_ijk_to_index(cig: CompressedCIG, query: torch.Tensor) -> torch.Tensor:
-    """Vectorized PyTorch ijk_to_index for compressed CIG.
+# ---------------------------------------------------------------------------
+# Numpy reference: 3-level ijk_to_index
+# ---------------------------------------------------------------------------
 
-    Uses absolute prefix (offset folded in). Returns (N,) i32, -1 for not in grid.
-    """
-    assert query.ndim == 2 and query.shape[1] == 3
-    device = query.device
-    N = query.shape[0]
-    K = cig.n_leaves
 
-    l1 = (query >> 3) & 15
-    l0 = query & 7
-
-    lower = cig.lower.to(device)
-    leaf_masks = cig.leaf_masks.to(device)
-    leaf_abs_prefix = cig.leaf_abs_prefix.to(device)
-
-    # Lower lookup
-    l1_clamped = l1.clamp(0, 15)
-    leaf_idx = lower[l1_clamped[:, 0], l1_clamped[:, 1], l1_clamped[:, 2]]
-    valid_leaf = (l1 >= 0).all(dim=1) & (l1 < 16).all(dim=1) & (leaf_idx >= 0) & (leaf_idx < K)
-    safe_leaf = leaf_idx.clamp(0, max(K - 1, 0)).long()
-
-    # Flat bit index
-    flat_idx = l0[:, 0].long() * 64 + l0[:, 1].long() * 8 + l0[:, 2].long()
+def _masked_lookup_numpy(mask_words, abs_prefix, flat_idx):
+    """Single masked lookup: check bitmask + absolute prefix popcount."""
     word_idx = flat_idx >> 6
     bit_pos = flat_idx & 63
-
-    # Gather mask word and abs_prefix
-    mask_word = leaf_masks[safe_leaf, word_idx.clamp(0, 7)]
-    is_active = ((mask_word >> bit_pos) & 1).bool()
-    abs_cum = leaf_abs_prefix[safe_leaf, word_idx.clamp(0, 7)]
-
-    # Partial word popcount
-    partial_mask = mask_word & ((torch.ones(N, dtype=torch.int64, device=device) << bit_pos) - 1)
-    partial_count = _popcount_i64(partial_mask)
-
-    voxel_idx = (abs_cum.long() + partial_count).int()
-    result = torch.where(valid_leaf & is_active, voxel_idx, torch.tensor(-1, dtype=torch.int32, device=device))
-    return result
+    if word_idx < 0 or word_idx >= len(mask_words):
+        return -1
+    word = int(mask_words[word_idx])
+    if not ((word >> bit_pos) & 1):
+        return -1
+    cum = int(abs_prefix[word_idx])
+    partial = bin(word & ((1 << bit_pos) - 1) & 0xFFFFFFFFFFFFFFFF).count("1")
+    return cum + partial
 
 
-def compressed_cig_ijk_to_index_numpy(cig: CompressedCIG, query_np: np.ndarray) -> np.ndarray:
-    """Numpy reference ijk_to_index for compressed CIG (uses abs_prefix)."""
-    lower_np = cig.lower.cpu().numpy()
-    masks_np = cig.leaf_masks.cpu().numpy()
-    abs_prefix_np = cig.leaf_abs_prefix.cpu().numpy()
-    K = cig.n_leaves
+def cig3_ijk_to_index_numpy(cig: CompressedCIG3, query_np: np.ndarray) -> np.ndarray:
+    """Numpy reference ijk_to_index for 3-level CIG."""
+    root_np = cig.root_coords.cpu().numpy()
+    u_masks = cig.upper_masks.cpu().numpy()
+    u_abs_prefix = cig.upper_abs_prefix.cpu().numpy()
+    l_masks = cig.lower_masks.cpu().numpy()
+    l_abs_prefix = cig.lower_abs_prefix.cpu().numpy()
+    k_masks = cig.leaf_masks.cpu().numpy()
+    k_abs_prefix = cig.leaf_abs_prefix.cpu().numpy()
+
     N = query_np.shape[0]
     result = np.full(N, -1, dtype=np.int32)
 
     for i in range(N):
         coord = query_np[i]
-        l1 = (coord >> 3) & 15
-        l0 = coord & 7
-        if np.any(l1 < 0) or np.any(l1 >= 16):
+        wt = coord >> 12
+        ul = (coord >> 7) & 31
+        ll = (coord >> 3) & 15
+        fl = coord & 7
+
+        # Root: linear scan for matching which_top
+        upper_idx = -1
+        for r in range(root_np.shape[0]):
+            if np.array_equal(root_np[r], wt):
+                upper_idx = r
+                break
+        if upper_idx < 0:
             continue
-        leaf_idx = lower_np[l1[0], l1[1], l1[2]]
-        if leaf_idx < 0 or leaf_idx >= K:
+
+        # Upper -> lower
+        flat_ul = int(ul[0]) * 1024 + int(ul[1]) * 32 + int(ul[2])
+        lower_idx = _masked_lookup_numpy(u_masks[upper_idx], u_abs_prefix[upper_idx], flat_ul)
+        if lower_idx < 0:
             continue
 
-        flat_idx = int(l0[0]) * 64 + int(l0[1]) * 8 + int(l0[2])
-        word_idx = flat_idx >> 6
-        bit_pos = flat_idx & 63
-        word = int(masks_np[leaf_idx, word_idx])
-        if not ((word >> bit_pos) & 1):
+        # Lower -> leaf
+        flat_ll = int(ll[0]) * 256 + int(ll[1]) * 16 + int(ll[2])
+        leaf_idx = _masked_lookup_numpy(l_masks[lower_idx], l_abs_prefix[lower_idx], flat_ll)
+        if leaf_idx < 0:
             continue
 
-        abs_cum = int(abs_prefix_np[leaf_idx, word_idx])
-        partial = word & ((1 << bit_pos) - 1)
-        partial_count = bin(partial & 0xFFFFFFFFFFFFFFFF).count("1")
-        result[i] = abs_cum + partial_count
-
-    return result
-
-
-def cig_ijk_to_index_numpy(cig: CIG, query_np: np.ndarray) -> np.ndarray:
-    """Numpy reference ijk_to_index: loop-based, for correctness verification."""
-    lower_np = cig.lower.cpu().numpy()
-    leaf_arr_np = cig.leaf_arr.cpu().numpy()
-    K = leaf_arr_np.shape[0]
-    N = query_np.shape[0]
-    result = np.full(N, -1, dtype=np.int32)
-
-    for i in range(N):
-        coord = query_np[i]
-        l1 = (coord >> 3) & 15
-        l0 = coord & 7
-
-        if np.any(l1 < 0) or np.any(l1 >= 16):
-            continue
-        leaf_idx = lower_np[l1[0], l1[1], l1[2]]
-        if leaf_idx < 0 or leaf_idx >= K:
-            continue
-        voxel_idx = leaf_arr_np[leaf_idx, l0[0], l0[1], l0[2]]
+        # Leaf -> voxel
+        flat_fl = int(fl[0]) * 64 + int(fl[1]) * 8 + int(fl[2])
+        voxel_idx = _masked_lookup_numpy(k_masks[leaf_idx], k_abs_prefix[leaf_idx], flat_fl)
         result[i] = voxel_idx
 
     return result

@@ -429,7 +429,7 @@ optimiser choose based on measured characteristics.
 Code in `fvdb_tile/prototype/`. Environment:
 `source ~/.venvs/fvdb_cutile/bin/activate` (Python 3.12, cuda-tile 1.1.0,
 torch 2.10, numpy 2.2; RTX PRO 6000 Blackwell, compute 12.0).
-Run all: `python fvdb_tile/prototype/run_all_tests.py`.
+Run all: `python fvdb_tile/tests/run_all_tests.py`.
 
 ### v0: Fundamentals
 
@@ -1269,8 +1269,10 @@ dimension.  Options:
   includes a batch index column.  More complex but avoids per-grid
   launch overhead.
 
-**4. Multi-step compilation (barrier-based pipeline).**  Implement the
-architecture described in the Multi-Step Compilation section.  Start with
+**4. Multi-step compilation (barrier-based pipeline).**  The pipeline
+planner (`dsl_pipeline.py`) now exists: it partitions programs into
+`cutile` (kernel-fusible) and `collective` (torch GPU barrier) segments,
+with `Sort` and `Unique` as first-class DSL primitives.  Next: implement
 `Where` on GPU as a two-pass pipeline (count cuTile kernel ->
 `torch.cumsum` -> scatter cuTile kernel).  This unlocks variable-length
 output and is the prerequisite for conv_grid and grid construction.

@@ -428,16 +428,3 @@ def morton3d(coord: np.ndarray) -> np.ndarray:
         return (_part1by2(coord[:, 0]) | (_part1by2(coord[:, 1]) << 1) | (_part1by2(coord[:, 2]) << 2)).astype(np.int32)
 
 
-def inv_morton3d(code: np.ndarray) -> np.ndarray:
-    """Decode morton index back to (3,) i32 or (N, 3) i32 coordinates."""
-    code = code.astype(np.int64)
-    if code.ndim == 0:
-        x = _compact1by2(code)
-        y = _compact1by2(code >> 1)
-        z = _compact1by2(code >> 2)
-        return np.array([x, y, z], dtype=np.int32)
-    else:
-        x = _compact1by2(code)
-        y = _compact1by2(code >> 1)
-        z = _compact1by2(code >> 2)
-        return np.stack([x, y, z], axis=1).astype(np.int32)

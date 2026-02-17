@@ -3,11 +3,8 @@
 """
 DSL-to-cuTile emitter.
 
-Two levels:
-  1. emit_program()  -- proof-of-concept text emitter (v4 original)
-  2. emit_runnable_kernel() -- produces a complete, compilable @ct.kernel
-     with grid parallelism, per-axis decomposition, and ct.scatter output.
-     Used by test_cutile_e2e.py to close the DSL -> GPU execution loop.
+Produces a complete, compilable @ct.kernel with grid parallelism, per-axis
+decomposition, and ct.scatter output via emit_runnable_kernel().
 
 Key insight: multi-component values (like 3D coordinates) must be decomposed
 into per-axis tiles for ct.gather index tuples. The emitter tracks whether
@@ -90,124 +87,6 @@ class EmitCtx:
         if name in self.bindings:
             return self.bindings[name]
         raise NameError(f"Unresolved name in emitter: {name!r}")
-
-
-# ---------------------------------------------------------------------------
-# Node emitters (v4 original -- text output, no decomposition)
-# ---------------------------------------------------------------------------
-
-def emit_node(node: Node, ctx: EmitCtx) -> str:
-    """Emit cuTile code for a single AST node. Returns variable name (str)."""
-
-    if isinstance(node, InputNode):
-        if node.name not in ctx.input_params:
-            raise NameError(f"Input {node.name!r} not declared")
-        return ctx.input_params[node.name]
-
-    if isinstance(node, RefNode):
-        val = ctx.lookup(node.name)
-        if isinstance(val, list):
-            return val[0]
-        return val
-
-    if isinstance(node, ConstNode):
-        if isinstance(node.value, int):
-            return repr(node.value)
-        if isinstance(node.value, list):
-            v = ctx.fresh("const")
-            ctx.emit(f"{v} = {node.value!r}")
-            return v
-        if isinstance(node.value, str):
-            return repr(node.value)
-        raise TypeError(f"Cannot emit const: {node.value!r}")
-
-    if isinstance(node, AddNode):
-        a = emit_node(node.a, ctx)
-        b = emit_node(node.b, ctx)
-        v = ctx.fresh("add")
-        ctx.emit(f"{v} = {a} + {b}")
-        return v
-
-    if isinstance(node, SubNode):
-        a = emit_node(node.a, ctx)
-        b = emit_node(node.b, ctx)
-        v = ctx.fresh("sub")
-        ctx.emit(f"{v} = {a} - {b}")
-        return v
-
-    if isinstance(node, GENode):
-        a = emit_node(node.a, ctx)
-        b = emit_node(node.b, ctx)
-        v = ctx.fresh("ge")
-        ctx.emit(f"{v} = {a} >= {b}")
-        return v
-
-    if isinstance(node, AndNode):
-        a = emit_node(node.a, ctx)
-        b = emit_node(node.b, ctx)
-        v = ctx.fresh("and")
-        ctx.emit(f"{v} = {a} & {b}")
-        return v
-
-    if isinstance(node, InBoundsNode):
-        coord = emit_node(node.coord, ctx)
-        lo = emit_node(node.lo, ctx)
-        hi = emit_node(node.hi, ctx)
-        v = ctx.fresh("ib")
-        ctx.emit(f"# InBounds: fuse with gather in opt pass")
-        ctx.emit(f"{v}_lo = {coord} >= {lo}")
-        ctx.emit(f"{v}_hi = {coord} < {hi}")
-        ctx.emit(f"{v} = {v}_lo & {v}_hi")
-        return v
-
-    if isinstance(node, GatherNode):
-        target = emit_node(node.target, ctx)
-        indexer = emit_node(node.indexer, ctx)
-        v = ctx.fresh("gath")
-        ctx.emit(f"{v} = ct.gather({target}, {indexer}, check_bounds=True, padding_value=-1)")
-        return v
-
-    if isinstance(node, MapNode):
-        input_var = emit_node(node.input, ctx)
-        old_locals = ctx.locals.copy()
-        ctx.emit(f"# Map: {node.var} => ... (tile-level elementwise)")
-        ctx.locals[node.var] = input_var
-        result = emit_node(node.body, ctx)
-        ctx.locals = old_locals
-        return result
-
-    raise TypeError(f"Unsupported node for cuTile emission: {type(node).__name__}")
-
-
-def emit_program(source: str, input_map: dict[str, str], kernel_name: str = "generated_kernel") -> tuple[str, str]:
-    """Parse a DSL program and emit cuTile kernel source code (text only, v4 original)."""
-    prog = parse(source)
-    ctx = EmitCtx()
-    ctx.input_params = dict(input_map)
-    for name, node in prog.bindings:
-        var = emit_node(node, ctx)
-        ctx.bindings[name] = var
-    output_var = ctx.bindings.get(prog.output, prog.output)
-    param_names = list(input_map.values())
-    params_str = ", ".join(param_names)
-    body = "\n".join(ctx.lines)
-    code = textwrap.dedent(f"""\
-        import cuda.tile as ct
-
-        ConstInt = ct.Constant[int]
-
-        # --- Generated from DSL ---
-        # Source:
-        #   {source.strip().replace(chr(10), chr(10) + '#   ')}
-        #
-        # Input mapping: {input_map}
-
-        @ct.kernel
-        def {kernel_name}({params_str}):
-        {body}
-            # output: {output_var}
-    """)
-    return code, output_var
 
 
 # ---------------------------------------------------------------------------

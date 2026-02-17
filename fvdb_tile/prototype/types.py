@@ -174,13 +174,6 @@ class Type:
 # Convenience constructors
 # ---------------------------------------------------------------------------
 
-def scalar_type(stype: ScalarType) -> Type:
-    """A rank-0 scalar -- just the scalar type itself. Not wrapped in Type."""
-    # Scalars are represented directly as ScalarType, not as Type.
-    # This helper exists for documentation; use ScalarType.X directly.
-    return stype
-
-
 def tensor_type(*extents: int | str, stype: ScalarType = ScalarType.F32) -> Type:
     """Build a tensor type from integer extents (static) or '*'/'~' (dynamic/jagged)."""
 

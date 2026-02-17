@@ -34,6 +34,9 @@ Tests in `run_all_tests.py` are organized by milestone:
 
 GPU tests (require cuTile venv):
 
-- **v4** -- cuTile codegen: smoke tests, gather, codegen
+- **v4** -- cuTile smoke test
 - **v5** -- cuTile end-to-end
-- **v6** -- Cross-leaf neighbors on GPU (cuTile codegen), CIG3 benchmarks
+- **v6** -- Cross-leaf neighbors on GPU (cuTile codegen)
+- **v8+** -- Masked CIG and 3-level CIG end-to-end codegen
+
+See [../HISTORY.md](../HISTORY.md) for the full evolution and what was removed.

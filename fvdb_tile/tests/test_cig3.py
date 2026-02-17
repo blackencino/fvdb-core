@@ -13,78 +13,16 @@ Verifies:
 import numpy as np
 import torch
 
-from fvdb_tile.prototype.cig import CompressedCIG3, build_compressed_cig3, root_lookup
+from fvdb_tile.prototype.cig import (
+    CompressedCIG3,
+    _masked_lookup_numpy,
+    build_compressed_cig3,
+    cig3_ijk_to_index_numpy,
+    root_lookup,
+)
 from fvdb_tile.prototype.dsl_eval import run as dsl_run
 from fvdb_tile.prototype.ops import Value
 from fvdb_tile.prototype.types import Dynamic, ScalarType, Shape, Static, Type
-
-
-# ---------------------------------------------------------------------------
-# Numpy reference: 3-level ijk_to_index
-# ---------------------------------------------------------------------------
-
-
-def cig3_ijk_to_index_numpy(cig: CompressedCIG3, query_np: np.ndarray) -> np.ndarray:
-    """Numpy reference ijk_to_index for 3-level CIG."""
-    root_np = cig.root_coords.cpu().numpy()
-    u_masks = cig.upper_masks.cpu().numpy()
-    u_abs_prefix = cig.upper_abs_prefix.cpu().numpy()
-    l_masks = cig.lower_masks.cpu().numpy()
-    l_abs_prefix = cig.lower_abs_prefix.cpu().numpy()
-    k_masks = cig.leaf_masks.cpu().numpy()
-    k_abs_prefix = cig.leaf_abs_prefix.cpu().numpy()
-
-    N = query_np.shape[0]
-    result = np.full(N, -1, dtype=np.int32)
-
-    for i in range(N):
-        coord = query_np[i]
-        wt = coord >> 12
-        ul = (coord >> 7) & 31
-        ll = (coord >> 3) & 15
-        fl = coord & 7
-
-        # Root: linear scan for matching which_top
-        upper_idx = -1
-        for r in range(root_np.shape[0]):
-            if np.array_equal(root_np[r], wt):
-                upper_idx = r
-                break
-        if upper_idx < 0:
-            continue
-
-        # Upper -> lower
-        flat_ul = int(ul[0]) * 1024 + int(ul[1]) * 32 + int(ul[2])
-        lower_idx = _masked_lookup(u_masks[upper_idx], u_abs_prefix[upper_idx], flat_ul)
-        if lower_idx < 0:
-            continue
-
-        # Lower -> leaf
-        flat_ll = int(ll[0]) * 256 + int(ll[1]) * 16 + int(ll[2])
-        leaf_idx = _masked_lookup(l_masks[lower_idx], l_abs_prefix[lower_idx], flat_ll)
-        if leaf_idx < 0:
-            continue
-
-        # Leaf -> voxel
-        flat_fl = int(fl[0]) * 64 + int(fl[1]) * 8 + int(fl[2])
-        voxel_idx = _masked_lookup(k_masks[leaf_idx], k_abs_prefix[leaf_idx], flat_fl)
-        result[i] = voxel_idx
-
-    return result
-
-
-def _masked_lookup(mask_words, abs_prefix, flat_idx):
-    """Single masked lookup: check bitmask + absolute prefix popcount."""
-    word_idx = flat_idx >> 6
-    bit_pos = flat_idx & 63
-    if word_idx < 0 or word_idx >= len(mask_words):
-        return -1
-    word = int(mask_words[word_idx])
-    if not ((word >> bit_pos) & 1):
-        return -1
-    cum = int(abs_prefix[word_idx])
-    partial = bin(word & ((1 << bit_pos) - 1) & 0xFFFFFFFFFFFFFFFF).count("1")
-    return cum + partial
 
 
 # ---------------------------------------------------------------------------
@@ -225,14 +163,14 @@ def test_cig3_dsl_leaf_level():
             break
     assert upper_idx >= 0
 
-    lower_idx = _masked_lookup(
+    lower_idx = _masked_lookup_numpy(
         cig.upper_masks.cpu().numpy()[upper_idx],
         cig.upper_abs_prefix.cpu().numpy()[upper_idx],
         flat_ul,
     )
     assert lower_idx >= 0
 
-    leaf_idx = _masked_lookup(
+    leaf_idx = _masked_lookup_numpy(
         cig.lower_masks.cpu().numpy()[lower_idx],
         cig.lower_abs_prefix.cpu().numpy()[lower_idx],
         flat_ll,
