@@ -248,6 +248,35 @@ def _emit_decomposed(node: Node, ctx: EmitCtx, input_types: dict[str, Type]) -> 
         ctx.emit(f"{v} = {a} + {b}")
         return v
 
+    if isinstance(node, SubNode):
+        a = _emit_decomposed(node.a, ctx, input_types)
+        b = _emit_decomposed(node.b, ctx, input_types)
+        if isinstance(a, list) and isinstance(b, list):
+            assert len(a) == len(b), f"Axis count mismatch: {len(a)} vs {len(b)}"
+            result = []
+            for i, (ai, bi) in enumerate(zip(a, b)):
+                v = ctx.fresh("sub")
+                ctx.emit(f"{v} = {ai} - {bi}")
+                result.append(v)
+            return result
+        if isinstance(a, list):
+            result = []
+            for i, ai in enumerate(a):
+                v = ctx.fresh("sub")
+                ctx.emit(f"{v} = {ai} - {b}")
+                result.append(v)
+            return result
+        if isinstance(b, list):
+            result = []
+            for i, bi in enumerate(b):
+                v = ctx.fresh("sub")
+                ctx.emit(f"{v} = {a} - {bi}")
+                result.append(v)
+            return result
+        v = ctx.fresh("sub")
+        ctx.emit(f"{v} = {a} - {b}")
+        return v
+
     if isinstance(node, GENode):
         a = _emit_decomposed(node.a, ctx, input_types)
         b = _emit_decomposed(node.b, ctx, input_types)

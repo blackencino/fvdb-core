@@ -161,3 +161,57 @@ w
     result_cpu = exe.run({"x": x_val}, device="cpu")
 
     np.testing.assert_array_equal(result_cpu.output.data, direct_out.data)
+
+
+# ---------------------------------------------------------------------------
+# GPU cutile segment compilation (requires CUDA)
+# ---------------------------------------------------------------------------
+
+import torch
+
+HAS_CUDA = torch.cuda.is_available()
+
+
+def test_pipeline_cutile_pointwise():
+    """Cutile segments compile to cuTile kernels on GPU and match evaluator."""
+    if not HAS_CUDA:
+        print("  SKIP: no CUDA device")
+        return
+
+    source = """
+a = Map(Input("x"), v => Add(v, Const(1)))
+b = Sort(a)
+c = Unique(b)
+d = Map(c, v => Sub(v, Const(1)))
+d
+"""
+    x_np = np.array([5, 3, 3, 2, 9, 2], dtype=np.int32)
+    x_val = Value(Type(Shape(Static(x_np.shape[0])), ScalarType.I32), x_np.copy())
+
+    _, direct_out = run(source, {"x": x_val})
+    exe = compile_source(source)
+    result_cuda = exe.run({"x": x_val}, device="cuda")
+
+    np.testing.assert_array_equal(result_cuda.output.data, direct_out.data)
+
+
+def test_pipeline_cutile_matches_evaluator():
+    """Full pipeline with cutile+collective on GPU matches device=None."""
+    if not HAS_CUDA:
+        print("  SKIP: no CUDA device")
+        return
+
+    source = """
+a = Map(Input("x"), v => Add(v, Const(10)))
+b = Sort(a)
+c = Unique(b)
+c
+"""
+    x_np = np.array([7, 2, 2, 5, 1, 7, 3], dtype=np.int32)
+    x_val = Value(Type(Shape(Static(x_np.shape[0])), ScalarType.I32), x_np.copy())
+
+    exe = compile_source(source)
+    result_none = exe.run({"x": x_val}, device=None)
+    result_cuda = exe.run({"x": x_val}, device="cuda")
+
+    np.testing.assert_array_equal(result_cuda.output.data, result_none.output.data)

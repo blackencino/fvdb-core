@@ -229,3 +229,63 @@ hooks convert numpy to torch, run the op, and convert back.  This keeps
 the existing test infrastructure working.  The hooks mechanism is general:
 any node type can be overridden, enabling future backends (cuTile segment
 compilation) via the same interface.
+
+---
+
+## CuTile Segment Compilation: Feb 17 2026
+
+The pipeline executor now compiles cutile segments to cuTile GPU kernels
+when `device="cuda"`.  Combined with torch-backed collectives, this
+gives full GPU execution: cutile segments as compiled `@ct.kernel`
+launches, collective segments as `torch.sort` / `torch.unique` calls.
+
+### What was added
+
+- **AST rewriting** in `dsl_pipeline.py`: `_segment_external_refs`
+  finds names referenced but not defined within a segment;
+  `_rewrite_refs_to_inputs` rewrites `RefNode` to `InputNode` for
+  those names so the segment can be emitted as a standalone kernel.
+- **`_compile_cutile_segment`**: reconstructs a sub-program from
+  segment bindings, determines the tile input and parallelism pattern
+  automatically, calls `emit_runnable_kernel`, compiles via the
+  file-writing JIT pattern, launches on GPU, and returns the result
+  as a numpy Value.
+- **`_compile_kernel`**: shared file-based JIT helper with caching
+  (cuTile requires `inspect.getsource()`).
+- **`SubNode` emission** in `dsl_to_cutile.py`: mirrors AddNode
+  with per-axis decomposition support.
+- **Modified `run()` loop**: when `device="cuda"`, cutile segments
+  dispatch to `_run_cutile_segment`; all other configurations use
+  the evaluator (backwards compatible).
+- Two GPU-guarded tests in `test_pipeline.py`.
+
+---
+
+## conv_grid: Feb 17 2026
+
+First multi-step pipeline application.  `conv_grid` computes the unique
+output coordinates for a sparse convolution topology.
+
+### Semantic contract
+
+Output coordinate `y` is active iff there exists active input `x` and
+kernel offset `k` such that `x = y * stride + k` (component-wise).
+
+### Implementation
+
+`conv_grid.py` implements:
+1. Broadcast expansion: `active[:, None, :] - offsets[None, :, :]`
+2. Stride filter: keep candidates where `cand % stride == 0`, divide
+3. Dedup via the pipeline executor: `Sort` + `Unique` dispatched to
+   torch ops via `DEDUP_PIPELINE.run(device=...)`
+
+The expansion is a torch broadcast (not DSL-compiled); Sort + Unique
+are DSL collectives dispatched to torch.  This demonstrates the
+pipeline architecture: different stages use different backends, wired
+by the executor.
+
+### Tests
+
+Five tests in `test_conv_grid.py`: correctness vs numpy reference,
+stride semantics, input immutability, torch tensor input, larger scale
+(500 unique active coords -> expanded and deduped).
