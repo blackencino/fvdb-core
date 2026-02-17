@@ -12,19 +12,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Union
 
-from .layouts import (
-    MaskedElement,
-    StructElement,
-    cut_by_size,
-    flatten as flatten_layout,
-    flip as flip_layout,
-    fuse as fuse_layout,
-    indexed as indexed_layout,
-    masked_layout,
-    permute as permute_layout,
-    reshape as reshape_layout,
-    struct_layout,
-)
+from .layouts import MaskedElement, StructElement, cut_by_size
+from .layouts import flatten as flatten_layout
+from .layouts import flip as flip_layout
+from .layouts import fuse as fuse_layout
+from .layouts import indexed as indexed_layout
+from .layouts import masked_layout
+from .layouts import permute as permute_layout
+from .layouts import reshape as reshape_layout
+from .layouts import struct_layout
 from .types import (
     Dynamic,
     Extent,
@@ -53,10 +49,7 @@ def _promote_dynamic_to_jagged(ty: Type) -> Type:
     """
     if ty.rank == 0:
         return ty
-    new_extents = tuple(
-        Jagged() if isinstance(e, Dynamic) else e
-        for e in ty.iteration_shape.extents
-    )
+    new_extents = tuple(Jagged() if isinstance(e, Dynamic) else e for e in ty.iteration_shape.extents)
     if new_extents == ty.iteration_shape.extents:
         return ty
     return Type(Shape(*new_extents), ty.element_type)
@@ -65,6 +58,7 @@ def _promote_dynamic_to_jagged(ty: Type) -> Type:
 # ---------------------------------------------------------------------------
 # Base
 # ---------------------------------------------------------------------------
+
 
 class Node:
     """Base class for all AST nodes."""
@@ -80,9 +74,11 @@ class Node:
 # Connectors
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class InputNode(Node):
     """Reference to an externally-provided named input."""
+
     name: str
 
     def infer_type(self, env: Env, inputs: InputDecls) -> Type:
@@ -97,6 +93,7 @@ class InputNode(Node):
 @dataclass(frozen=True)
 class ConstNode(Node):
     """A literal constant value."""
+
     value: Any
     stype: ScalarType
 
@@ -114,6 +111,7 @@ class ConstNode(Node):
 @dataclass(frozen=True)
 class RefNode(Node):
     """Reference to a bound variable (from Each/Map binding)."""
+
     name: str
 
     def infer_type(self, env: Env, inputs: InputDecls) -> Type:
@@ -129,9 +127,11 @@ class RefNode(Node):
 # Struct field access
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class FieldNode(Node):
     """Project a named field from a struct-typed expression."""
+
     expr: Node
     field_name: str
 
@@ -157,6 +157,7 @@ class FieldNode(Node):
 # ---------------------------------------------------------------------------
 # Scalar / vector primitives
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class AddNode(Node):
@@ -188,6 +189,7 @@ class SubNode(Node):
 @dataclass(frozen=True)
 class GENode(Node):
     """Greater-than-or-equal comparison."""
+
     a: Node
     b: Node
 
@@ -226,6 +228,7 @@ class NotNode(Node):
 @dataclass(frozen=True)
 class InBoundsNode(Node):
     """Check if all components of a coordinate are in [lo, hi)."""
+
     coord: Node
     lo: Node
     hi: Node
@@ -241,9 +244,11 @@ class InBoundsNode(Node):
 # Structural operations
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class MapNode(Node):
     """Map(input, var => body): apply body to each element."""
+
     input: Node
     var: str
     body: Node
@@ -270,6 +275,7 @@ class MapNode(Node):
 @dataclass(frozen=True)
 class EachNode(Node):
     """Each(input, var => body): apply body per outer element, may nest."""
+
     input: Node
     var: str
     body: Node
@@ -374,9 +380,12 @@ class GatherNode(Node):
         # Special case 1: single-point lookup with a vector coordinate.
         # If the indexer is (r,) integer and the target is rank r, treat the
         # entire indexer as one coordinate, returning the target's element type.
-        if (indexer_ty.is_scalar_element and
-                indexer_ty.element_type in (ScalarType.I32, ScalarType.I64) and
-                indexer_ty.rank == 1 and target_ty.rank > 0):
+        if (
+            indexer_ty.is_scalar_element
+            and indexer_ty.element_type in (ScalarType.I32, ScalarType.I64)
+            and indexer_ty.rank == 1
+            and target_ty.rank > 0
+        ):
             lead = indexer_ty.iteration_shape.extents[0]
             if isinstance(lead, Static) and lead.n == target_ty.rank:
                 et = target_ty.element_type
@@ -384,10 +393,12 @@ class GatherNode(Node):
 
         # Special case 2: scalar integer indexing into rank-1 target.
         # Returns the element type directly (unwrapped, not () over E).
-        if (indexer_ty.rank == 0 and
-                isinstance(indexer_ty.element_type, ScalarType) and
-                indexer_ty.element_type in (ScalarType.I32, ScalarType.I64) and
-                target_ty.rank == 1):
+        if (
+            indexer_ty.rank == 0
+            and isinstance(indexer_ty.element_type, ScalarType)
+            and indexer_ty.element_type in (ScalarType.I32, ScalarType.I64)
+            and target_ty.rank == 1
+        ):
             et = target_ty.element_type
             return Type(Shape(), et) if isinstance(et, ScalarType) else et
 
@@ -400,6 +411,7 @@ class GatherNode(Node):
 # ---------------------------------------------------------------------------
 # Grid primitives
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class DecomposeNode(Node):
@@ -557,6 +569,7 @@ class HierarchicalKeyDecodeNode(Node):
 # Layout operations
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class CutNode(Node):
     input: Node
@@ -584,6 +597,7 @@ class ReshapeNode(Node):
 @dataclass(frozen=True)
 class FuseNode(Node):
     """fuse(x): merge the two outermost nesting levels (layout, free)."""
+
     input: Node
 
     def infer_type(self, env: Env, inputs: InputDecls) -> Type:
@@ -596,6 +610,7 @@ class FuseNode(Node):
 @dataclass(frozen=True)
 class FlattenNode(Node):
     """flatten(x): merge ALL nesting levels into one (layout, free)."""
+
     input: Node
 
     def infer_type(self, env: Env, inputs: InputDecls) -> Type:
@@ -608,6 +623,7 @@ class FlattenNode(Node):
 @dataclass(frozen=True)
 class PermuteNode(Node):
     """permute(x, order): reorder axes within the leading shape (layout, free)."""
+
     input: Node
     order: tuple
 
@@ -651,6 +667,7 @@ class MaskedNode(Node):
 # Adverbs (K-style)
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class OverNode(Node):
     """Over(f, xs): reduce the full iteration space with a dyadic verb.
@@ -659,6 +676,7 @@ class OverNode(Node):
     For rank > 1, f must be commutative+associative.
     f is a named verb (e.g. "Add", "Mul") resolved at evaluation time.
     """
+
     verb: str
     input: Node
 
@@ -679,6 +697,7 @@ class ScanNode(Node):
 
     Same shape as input; element i is f applied cumulatively to elements 0..i.
     """
+
     verb: str
     input: Node
 
@@ -695,6 +714,7 @@ class ScanNode(Node):
 @dataclass(frozen=True)
 class EachRightNode(Node):
     """EachRight(f, x, ys): for each y in ys, compute f(x, y). x is fixed."""
+
     verb: str
     left: Node
     right: Node
@@ -706,7 +726,11 @@ class EachRightNode(Node):
         # For arithmetic verbs, result element = left element type
         et = left_ty.element_type if isinstance(left_ty.element_type, ScalarType) else left_ty
         if isinstance(right_ty.element_type, Type):
-            et = right_ty.element_type.element_type if isinstance(right_ty.element_type.element_type, ScalarType) else right_ty.element_type
+            et = (
+                right_ty.element_type.element_type
+                if isinstance(right_ty.element_type.element_type, ScalarType)
+                else right_ty.element_type
+            )
         return Type(right_ty.iteration_shape, et)
 
     def __repr__(self) -> str:
@@ -716,6 +740,7 @@ class EachRightNode(Node):
 @dataclass(frozen=True)
 class EachLeftNode(Node):
     """EachLeft(f, xs, y): for each x in xs, compute f(x, y). y is fixed."""
+
     verb: str
     left: Node
     right: Node
@@ -737,6 +762,7 @@ class PriorNode(Node):
 
     Result length = input length - 1.
     """
+
     verb: str
     input: Node
 
@@ -764,11 +790,11 @@ _ADVERB_NAMES = {"Over", "Scan", "EachRight", "EachLeft", "EachBoth", "Prior", "
 
 # Arity of the function produced by each adverb.
 _ADVERB_ARITY = {
-    "Over": 1,      # Over(f): monadic -- consumes leading shape
-    "Scan": 1,      # Scan(f): monadic -- rank-1 running accumulation
-    "Prior": 1,     # Prior(f): monadic -- rank-1 adjacent pairs
-    "Each": 1,      # Each(f): monadic -- iterate leading shape
-    "EachRight": 2, # EachRight(f): dyadic -- x whole, iterate y
+    "Over": 1,  # Over(f): monadic -- consumes leading shape
+    "Scan": 1,  # Scan(f): monadic -- rank-1 running accumulation
+    "Prior": 1,  # Prior(f): monadic -- rank-1 adjacent pairs
+    "Each": 1,  # Each(f): monadic -- iterate leading shape
+    "EachRight": 2,  # EachRight(f): dyadic -- x whole, iterate y
     "EachLeft": 2,  # EachLeft(f): dyadic -- iterate x, y whole
     "EachBoth": 2,  # EachBoth(f): dyadic -- zip x and y, iterate in lockstep
 }
@@ -780,10 +806,12 @@ class VerbRefNode(Node):
 
     Evaluates to a FnValue at runtime. Type is () / FnType(arity, name).
     """
+
     name: str
 
     def infer_type(self, env: Env, inputs: InputDecls) -> Type:
         from .ops import VERBS
+
         if self.name not in VERBS:
             raise TypeError(f"Unknown verb: {self.name!r}")
         v = VERBS[self.name]
@@ -801,8 +829,9 @@ class AdverbApplyNode(Node):
 
     The result is a function value; no data is consumed.
     """
+
     adverb: str  # one of _ADVERB_NAMES
-    fn: Node     # must evaluate to a FnValue
+    fn: Node  # must evaluate to a FnValue
 
     def infer_type(self, env: Env, inputs: InputDecls) -> Type:
         if self.adverb not in _ADVERB_NAMES:
@@ -825,6 +854,7 @@ class ApplyNode(Node):
     function structurally: it pattern-matches on the fn node to compute
     the output type from the argument types.
     """
+
     fn: Node
     args: tuple  # tuple of Node
 
@@ -860,6 +890,7 @@ def _infer_apply_type(fn_node: Node, arg_types: list[Type], env: Env, inputs: In
     # Case 1: VerbRefNode -- apply a built-in verb directly
     if isinstance(fn_node, VerbRefNode):
         from .ops import VERBS
+
         verb = VERBS[fn_node.name]
         return verb.type_fn(*arg_types)
 
@@ -966,6 +997,7 @@ def _infer_apply_type(fn_node: Node, arg_types: list[Type], env: Env, inputs: In
 # Additional scalar primitives
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class DivNode(Node):
     a: Node
@@ -997,6 +1029,7 @@ class MulNode(Node):
 @dataclass(frozen=True)
 class CountNode(Node):
     """Count(xs): length of the iteration space. Returns scalar i32."""
+
     input: Node
 
     def infer_type(self, env: Env, inputs: InputDecls) -> Type:
@@ -1007,12 +1040,230 @@ class CountNode(Node):
 
 
 # ---------------------------------------------------------------------------
+# Topology / convolution primitives
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ModNode(Node):
+    """Element-wise modulus.  Preserves left operand's type."""
+
+    a: Node
+    b: Node
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        return self.a.infer_type(env, inputs)
+
+    def __repr__(self) -> str:
+        return f"Mod({self.a}, {self.b})"
+
+
+@dataclass(frozen=True)
+class EqNode(Node):
+    """Element-wise equality.  Replaces leaf scalar type with bool.
+
+    Preserves the full nested structure of the left operand's type, so
+    ``Eq((*) / (3,) i32, (3,) i32)`` gives ``(*) / (3,) bool``.
+    """
+
+    a: Node
+    b: Node
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        ta = self.a.infer_type(env, inputs)
+
+        def _scalar_to_bool(t):
+            if isinstance(t, ScalarType):
+                return ScalarType.BOOL
+            if isinstance(t, Type):
+                return Type(t.iteration_shape, _scalar_to_bool(t.element_type))
+            return t
+
+        return Type(ta.iteration_shape, _scalar_to_bool(ta.element_type))
+
+    def __repr__(self) -> str:
+        return f"Eq({self.a}, {self.b})"
+
+
+@dataclass(frozen=True)
+class FloorDivNode(Node):
+    """Integer floor division.  Preserves left operand's type."""
+
+    a: Node
+    b: Node
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        return self.a.infer_type(env, inputs)
+
+    def __repr__(self) -> str:
+        return f"FloorDiv({self.a}, {self.b})"
+
+
+@dataclass(frozen=True)
+class AllNode(Node):
+    """Reduce the innermost bool dimension by AND.
+
+    ``(*) / (3,) bool``  ->  ``(*) / bool``
+    ``(3,) bool``         ->  ``() / bool``
+
+    At the torch level: ``data.all(dim=-1)``.
+    NOT a barrier -- reduces over a small static inner shape, not over
+    the data-dependent leading shape.
+    """
+
+    input: Node
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        input_ty = self.input.infer_type(env, inputs)
+        elem = input_ty.element_type
+        if isinstance(elem, Type) and isinstance(elem.element_type, ScalarType):
+            return Type(input_ty.iteration_shape, elem.element_type)
+        if isinstance(elem, ScalarType):
+            if input_ty.rank <= 1:
+                return Type(Shape(), elem)
+            extents = input_ty.iteration_shape.extents
+            return Type(Shape(*extents[:-1]), elem)
+        raise TypeError(f"All requires bool-like element, got {elem}")
+
+    def __repr__(self) -> str:
+        return f"All({self.input})"
+
+
+@dataclass(frozen=True)
+class ShiftLeftNode(Node):
+    """Bitwise left shift.  Preserves left operand's type."""
+
+    a: Node
+    b: Node
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        return self.a.infer_type(env, inputs)
+
+    def __repr__(self) -> str:
+        return f"ShiftLeft({self.a}, {self.b})"
+
+
+@dataclass(frozen=True)
+class ShiftRightNode(Node):
+    """Bitwise right shift.  Preserves left operand's type."""
+
+    a: Node
+    b: Node
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        return self.a.infer_type(env, inputs)
+
+    def __repr__(self) -> str:
+        return f"ShiftRight({self.a}, {self.b})"
+
+
+@dataclass(frozen=True)
+class BitXorNode(Node):
+    """Bitwise XOR.  Preserves left operand's type."""
+
+    a: Node
+    b: Node
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        return self.a.infer_type(env, inputs)
+
+    def __repr__(self) -> str:
+        return f"BitXor({self.a}, {self.b})"
+
+
+@dataclass(frozen=True)
+class HashMapBuildNode(Node):
+    """Build a hash map from keys.  Collective/barrier.
+
+    Takes (*,) i64 keys, returns (*,) i64 key array (the map).
+    The key array IS the hash map -- an index protocol, not a container.
+    Values are separate tensors indexed by the same slot.
+    """
+
+    keys: Node
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        return Type(Shape(Dynamic()), ScalarType.I64)
+
+    def __repr__(self) -> str:
+        return f"HashMapBuild({self.keys})"
+
+
+@dataclass(frozen=True)
+class HashMapLookupNode(Node):
+    """Look up keys in a hash map.  Tile-parallel.
+
+    Takes the key array and query keys, returns slot indices (i64).
+    Returns NO_SLOT for keys not found.
+    """
+
+    key_arr: Node
+    queries: Node
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        query_ty = self.queries.infer_type(env, inputs)
+        return Type(query_ty.iteration_shape, ScalarType.I64)
+
+    def __repr__(self) -> str:
+        return f"HashMapLookup({self.key_arr}, {self.queries})"
+
+
+@dataclass(frozen=True)
+class ScatterReduceNode(Node):
+    """Scatter values into buckets by key with a reduce verb.
+
+    High-level dialect node -- lowered before pipeline planning.
+    Not directly evaluated; must be rewritten by a lowering pass.
+    """
+
+    keys: Node
+    values: Node
+    reduce_fn: Node  # VerbRefNode (Or, Add, Max, ...)
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        val_ty = self.values.infer_type(env, inputs)
+        return Type(Shape(Dynamic()), val_ty.element_type)
+
+    def __repr__(self) -> str:
+        return f"ScatterReduce({self.keys}, {self.values}, {self.reduce_fn})"
+
+
+@dataclass(frozen=True)
+class ExpandOffsetsNode(Node):
+    """Broadcast-add coordinates with offsets and flatten.
+
+    The leading-shape equivalent of::
+
+        fuse(EachLeft(EachRight(EachBoth(Add)), coords, offsets))
+
+    ``(*) / (3,) i32, (K,) / (3,) i32  ->  (*') / (3,) i32``
+
+    where ``*'`` is ``N * K``.  At the torch level::
+
+        (coords[:, None, :] + offsets[None, :, :]).reshape(-1, 3)
+    """
+
+    coords: Node
+    offsets: Node
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        coord_ty = self.coords.infer_type(env, inputs)
+        elem = coord_ty.element_type
+        return Type(Shape(Dynamic()), elem)
+
+    def __repr__(self) -> str:
+        return f"ExpandOffsets({self.coords}, {self.offsets})"
+
+
+# ---------------------------------------------------------------------------
 # Program: a sequence of let-bindings + an output
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class Program:
     """A sequence of named bindings and a final output expression."""
+
     bindings: list[tuple[str, Node]]  # [(name, expr), ...]
     output: str  # name of the output binding
 

@@ -23,31 +23,40 @@ import re
 from typing import Any
 
 from .dsl_ast import (
+    _ADVERB_NAMES,
     AddNode,
     AdverbApplyNode,
+    AllNode,
     AndNode,
     ApplyNode,
+    BitXorNode,
     ConstNode,
     CountNode,
     CutNode,
     DecomposeNode,
     DivNode,
     EachNode,
+    EqNode,
+    ExpandOffsetsNode,
     FieldNode,
     FindNode,
     FlattenNode,
+    FloorDivNode,
     FuseNode,
     GatherNode,
     GENode,
+    HashMapBuildNode,
+    HashMapLookupNode,
+    HierarchicalKeyDecodeNode,
+    HierarchicalKeyNode,
     InBoundsNode,
     InputNode,
     MapNode,
     MaskedNode,
+    ModNode,
     Morton3dNode,
     Morton3dSignedNode,
     MortonDecode3dNode,
-    HierarchicalKeyNode,
-    HierarchicalKeyDecodeNode,
     MulNode,
     Node,
     NotNode,
@@ -55,12 +64,14 @@ from .dsl_ast import (
     Program,
     RefNode,
     ReshapeNode,
+    ScatterReduceNode,
+    ShiftLeftNode,
+    ShiftRightNode,
     SortNode,
     SubNode,
     UniqueNode,
     VerbRefNode,
     WhereNode,
-    _ADVERB_NAMES,
 )
 from .types import ScalarType
 
@@ -119,6 +130,17 @@ _BUILTINS = {
     "HierarchicalKey",
     "HierarchicalKeyDecode",
     "Find",
+    "Mod",
+    "Eq",
+    "FloorDiv",
+    "All",
+    "ExpandOffsets",
+    "ShiftLeft",
+    "ShiftRight",
+    "BitXor",
+    "HashMapBuild",
+    "HashMapLookup",
+    "ScatterReduce",
     "Input",
     "Const",
     "Apply",
@@ -130,7 +152,7 @@ _BUILTINS = {
 _PARSER_ADVERBS = {"Over", "Scan", "EachRight", "EachLeft", "EachBoth", "Prior"}
 
 # Names that are verbs (function values) when used as bare names.
-_VERB_NAMES = {"Add", "Sub", "Mul", "Div", "GE", "And", "Not", "Min", "Max", "Or"}
+_VERB_NAMES = {"Add", "Sub", "Mul", "Div", "GE", "And", "Not", "Min", "Max", "Or", "Xor", "ShiftLeft", "ShiftRight"}
 
 # Layouts (lowercase) -- zero-cost type reinterpretation, no data movement.
 _LAYOUTS = {
@@ -457,6 +479,39 @@ class Parser:
             if isinstance(order_node, ConstNode) and isinstance(order_node.value, list):
                 return PermuteNode(input_node, tuple(order_node.value))
             raise SyntaxError(f"permute expects list order, got {order_node}")
+
+        if name == "Mod":
+            return ModNode(_expr(args[0]), _expr(args[1]))
+
+        if name == "Eq":
+            return EqNode(_expr(args[0]), _expr(args[1]))
+
+        if name == "FloorDiv":
+            return FloorDivNode(_expr(args[0]), _expr(args[1]))
+
+        if name == "All":
+            return AllNode(_expr(args[0]))
+
+        if name == "ExpandOffsets":
+            return ExpandOffsetsNode(_expr(args[0]), _expr(args[1]))
+
+        if name == "ShiftLeft":
+            return ShiftLeftNode(_expr(args[0]), _expr(args[1]))
+
+        if name == "ShiftRight":
+            return ShiftRightNode(_expr(args[0]), _expr(args[1]))
+
+        if name == "BitXor":
+            return BitXorNode(_expr(args[0]), _expr(args[1]))
+
+        if name == "HashMapBuild":
+            return HashMapBuildNode(_expr(args[0]))
+
+        if name == "HashMapLookup":
+            return HashMapLookupNode(_expr(args[0]), _expr(args[1]))
+
+        if name == "ScatterReduce":
+            return ScatterReduceNode(_expr(args[0]), _expr(args[1]), _expr(args[2]))
 
         # -- Adverbs: function -> function transformers --
         # Adverbs always produce AdverbApplyNode. If data args follow,

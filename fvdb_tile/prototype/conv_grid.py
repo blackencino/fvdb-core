@@ -9,41 +9,50 @@ set of unique output coordinates.  The semantic equation:
     output y is active iff there exists active x and kernel offset k
     such that (x + k) is divisible by stride and y = (x + k) / stride.
 
-**Algorithm (expand + dedup):**
+**Execution is fully DSL-driven.**  The algorithm is expressed as a DSL
+program string, parsed into an AST, planned by the barrier-aware pipeline
+planner, and executed via the pipeline executor.  This demonstrates:
 
-The algorithm decomposes into three composable primitives::
+1. The barrier-based pipeline (cutile + collective segments) works for a
+   real multi-step topology operation.
+2. The DSL can express non-trivial grid operations as small compositions
+   of reusable primitives.
 
-    expanded = expand_offsets(active, offsets)     # N*K candidates
-    filtered = stride_filter(expanded, stride)     # M candidates
-    result   = dedup_coords(filtered, bit_widths)  # unique output
+**Stride=1 DSL program** (5 bindings, 2 barriers)::
 
-In DSL / leading-shape terms::
+    flat    = ExpandOffsets(Input("coords"), Input("offsets"))
+    codes   = HierarchicalKey(flat, Const([3, 4, 5]))
+    sorted  = Sort(codes)                          # barrier
+    unique  = Unique(sorted)                       # barrier
+    result  = HierarchicalKeyDecode(unique, Const([3, 4, 5]))
 
-    expanded  = fuse(EachLeft(EachRight(EachBoth(Add)), coords, offsets))
-    filtered  = stride_filter(expanded, stride)
-    codes     = HierarchicalKey(filtered, bit_widths)
-    sorted    = Sort(codes)
-    unique    = Unique(sorted)
-    result    = HierarchicalKeyDecode(unique, bit_widths)
+**Stride>1 DSL program** (11 bindings, 3 barriers)::
 
-This is the same algorithm used by fVDB's ``BuildGridForConv.cu``:
-for each active voxel, generate all kernel-offset neighbors, filter by
-stride divisibility, divide, then deduplicate via grid construction.
+    flat      = ExpandOffsets(Input("coords"), Input("offsets"))
+    remainder = Mod(flat, Input("stride"))
+    eq_zero   = Eq(remainder, Const([0, 0, 0]))
+    all_div   = All(eq_zero)
+    div_idx   = Where(all_div)                     # barrier
+    filtered  = Gather(flat, div_idx)
+    scaled    = FloorDiv(filtered, Input("stride"))
+    codes     = HierarchicalKey(scaled, Const([3, 4, 5]))
+    sorted    = Sort(codes)                        # barrier
+    unique    = Unique(sorted)                     # barrier
+    result    = HierarchicalKeyDecode(unique, Const([3, 4, 5]))
 
-The algorithm works identically for all strides.  For stride=1 the
-filter is a no-op; the expand + dedup dominates.  Complexity is
-O(N*K * log(N*K)) where N is the number of active voxels and K is
-the kernel volume.
-
-Voxel ordering uses ``hierarchical_key`` with configurable ``bit_widths``
-for CIG-compatible tree-traversal order.
+The pipeline planner partitions these into alternating cutile/collective
+segments.  The executor dispatches collectives to ``torch.sort``,
+``torch.unique``, ``torch.nonzero`` and runs everything else through the
+tree-walk evaluator with vectorized torch ops on the target device.
 """
 
 from __future__ import annotations
 
 import torch
 
-from .ops import dedup_coords, expand_offsets, stride_filter
+from .dsl_pipeline import compile_source, PipelineExecutable
+from .ops import Value
+from .types import Dynamic, ScalarType, Shape, Static, Type
 
 
 # ---------------------------------------------------------------------------
@@ -51,6 +60,47 @@ from .ops import dedup_coords, expand_offsets, stride_filter
 # ---------------------------------------------------------------------------
 
 DEFAULT_BIT_WIDTHS: list[int] = [3, 4, 5]
+
+
+# ---------------------------------------------------------------------------
+# Pipeline cache
+# ---------------------------------------------------------------------------
+
+_PIPELINE_CACHE: dict[str, PipelineExecutable] = {}
+
+
+# ---------------------------------------------------------------------------
+# DSL program builders
+# ---------------------------------------------------------------------------
+
+
+def _conv_grid_source(stride_1: bool, bit_widths: list[int]) -> str:
+    """Build the DSL source string for conv_grid."""
+    bw = repr(bit_widths)
+    lines = [
+        'flat = ExpandOffsets(Input("coords"), Input("offsets"))',
+    ]
+    if not stride_1:
+        lines += [
+            'remainder = Mod(flat, Input("stride"))',
+            "eq_zero = Eq(remainder, Const([0, 0, 0]))",
+            "all_div = All(eq_zero)",
+            "div_idx = Where(all_div)",
+            "filtered = Gather(flat, div_idx)",
+            'scaled = FloorDiv(filtered, Input("stride"))',
+            f"codes = HierarchicalKey(scaled, Const({bw}))",
+        ]
+    else:
+        lines += [
+            f"codes = HierarchicalKey(flat, Const({bw}))",
+        ]
+    lines += [
+        "sorted = Sort(codes)",
+        "unique = Unique(sorted)",
+        f"result = HierarchicalKeyDecode(unique, Const({bw}))",
+        "result",
+    ]
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +139,8 @@ def _kernel_offsets_centered(kernel_size: tuple[int, int, int]) -> torch.Tensor:
 # Public API
 # ---------------------------------------------------------------------------
 
+_COORD_ELEM = Type(Shape(Static(3)), ScalarType.I32)
+
 
 def conv_grid(
     active_coords: torch.Tensor,
@@ -99,8 +151,9 @@ def conv_grid(
 ) -> torch.Tensor:
     """Compute unique output coordinates for a sparse convolution topology.
 
-    Uses expand + stride_filter + dedup_coords, matching the fVDB
-    ``BuildGridForConv.cu`` algorithm.
+    Execution is fully DSL-driven: the algorithm is expressed as a DSL
+    program string, parsed, planned by the barrier-aware pipeline planner,
+    and executed via the pipeline executor.
 
     Args:
         active_coords: (N, 3) i32 active input voxel coordinates.
@@ -134,11 +187,29 @@ def conv_grid(
         raise ValueError(f"stride must be positive, got {st}")
 
     offsets = _kernel_offsets_centered(ks).to(dev)
+    stride_1 = st == (1, 1, 1)
 
-    # Three-step pipeline: expand -> stride_filter -> dedup
-    cand = expand_offsets(active_t, offsets)
-    cand = stride_filter(cand, st)
-    if cand.shape[0] == 0:
-        return torch.empty((0, 3), dtype=torch.int32, device=dev)
+    # --- Compile (cached) ---
+    cache_key = f"{stride_1}_{bit_widths}"
+    if cache_key not in _PIPELINE_CACHE:
+        source = _conv_grid_source(stride_1, bit_widths)
+        _PIPELINE_CACHE[cache_key] = compile_source(source)
+    pipeline = _PIPELINE_CACHE[cache_key]
 
-    return dedup_coords(cand, bit_widths)
+    # --- Build inputs ---
+    n_offsets = offsets.shape[0]
+    inputs: dict[str, Value] = {
+        "coords": Value(Type(Shape(Dynamic()), _COORD_ELEM), active_t),
+        "offsets": Value(Type(Shape(Static(n_offsets)), _COORD_ELEM), offsets),
+    }
+    if not stride_1:
+        stride_t = torch.tensor(st, dtype=torch.int32, device=dev)
+        inputs["stride"] = Value(Type(Shape(Static(3)), ScalarType.I32), stride_t)
+
+    # --- Execute via pipeline (evaluator + collective hooks) ---
+    result = pipeline.run(inputs, device=None)
+    output = result.output.data
+
+    if isinstance(output, torch.Tensor):
+        return output.to(dtype=torch.int32)
+    return torch.empty((0, 3), dtype=torch.int32, device=dev)

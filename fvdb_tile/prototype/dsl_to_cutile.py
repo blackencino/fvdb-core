@@ -21,6 +21,7 @@ from typing import Any, Union
 from .dsl_ast import (
     AddNode,
     AndNode,
+    BitXorNode,
     ConstNode,
     CountNode,
     DecomposeNode,
@@ -43,6 +44,8 @@ from .dsl_ast import (
     NotNode,
     Program,
     RefNode,
+    ShiftLeftNode,
+    ShiftRightNode,
     SubNode,
 )
 from .dsl_parse import parse
@@ -347,6 +350,33 @@ def _emit_decomposed(node: Node, ctx: EmitCtx, input_types: dict[str, Type]) -> 
         b_str = b if isinstance(b, str) else b[0]
         v = ctx.fresh("and")
         ctx.emit(f"{v} = {a_str} & {b_str}")
+        return v
+
+    if isinstance(node, ShiftLeftNode):
+        a = _emit_decomposed(node.a, ctx, input_types)
+        b = _emit_decomposed(node.b, ctx, input_types)
+        a_str = a if isinstance(a, str) else a[0]
+        b_str = b if isinstance(b, str) else b[0]
+        v = ctx.fresh("shl")
+        ctx.emit(f"{v} = {a_str} << {b_str}")
+        return v
+
+    if isinstance(node, ShiftRightNode):
+        a = _emit_decomposed(node.a, ctx, input_types)
+        b = _emit_decomposed(node.b, ctx, input_types)
+        a_str = a if isinstance(a, str) else a[0]
+        b_str = b if isinstance(b, str) else b[0]
+        v = ctx.fresh("shr")
+        ctx.emit(f"{v} = {a_str} >> {b_str}")
+        return v
+
+    if isinstance(node, BitXorNode):
+        a = _emit_decomposed(node.a, ctx, input_types)
+        b = _emit_decomposed(node.b, ctx, input_types)
+        a_str = a if isinstance(a, str) else a[0]
+        b_str = b if isinstance(b, str) else b[0]
+        v = ctx.fresh("xor")
+        ctx.emit(f"{v} = {a_str} ^ {b_str}")
         return v
 
     # -----------------------------------------------------------------

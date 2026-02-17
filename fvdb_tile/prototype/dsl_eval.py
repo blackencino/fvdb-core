@@ -17,6 +17,7 @@ import torch
 from .dsl_ast import (
     AddNode,
     AdverbApplyNode,
+    AllNode,
     AndNode,
     ApplyNode,
     ConstNode,
@@ -27,21 +28,29 @@ from .dsl_ast import (
     EachLeftNode,
     EachNode,
     EachRightNode,
+    EqNode,
+    BitXorNode,
+    ExpandOffsetsNode,
     FieldNode,
     FindNode,
     FlattenNode,
+    FloorDivNode,
     FuseNode,
     GatherNode,
     GENode,
+    HashMapBuildNode,
+    HashMapLookupNode,
+    HierarchicalKeyDecodeNode,
+    ScatterReduceNode,
+    HierarchicalKeyNode,
     InBoundsNode,
     InputNode,
     MapNode,
     MaskedNode,
+    ModNode,
     Morton3dNode,
     Morton3dSignedNode,
     MortonDecode3dNode,
-    HierarchicalKeyNode,
-    HierarchicalKeyDecodeNode,
     MulNode,
     Node,
     NotNode,
@@ -52,6 +61,8 @@ from .dsl_ast import (
     RefNode,
     ReshapeNode,
     ScanNode,
+    ShiftLeftNode,
+    ShiftRightNode,
     SortNode,
     SubNode,
     UniqueNode,
@@ -60,10 +71,17 @@ from .dsl_ast import (
 )
 from .dsl_parse import parse
 from .layouts import MaskedElement
-from .ops import FnValue, StructValue, Value, VERBS
-from .ops import morton3d
+from .ops import (
+    VERBS,
+    FnValue,
+    StructValue,
+    Value,
+    hash_map_build,
+    hash_map_lookup,
+    hash_map_scatter_reduce,
+    morton3d,
+)
 from .types import Dynamic, FnType, Jagged, ScalarType, Shape, Static, Type, coord_type
-
 
 # ---------------------------------------------------------------------------
 # Masked value -- carries bitmask + offset for masked Gather
@@ -122,6 +140,7 @@ class MaskedValue:
         n_active = sum(bin(int(w) & 0xFFFFFFFFFFFFFFFF).count("1") for w in self.mask_data)
         total = len(self.mask_data) * 64
         return f"MaskedValue(active={n_active}/{total})"
+
 
 # ---------------------------------------------------------------------------
 # Evaluation environment
@@ -402,6 +421,7 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
     if isinstance(node, Morton3dSignedNode):
         coord_val = eval_node(node.input, env)
         from .ops import morton3d_signed
+
         result = morton3d_signed(coord_val.data)
         input_types = {k: v.type for k, v in env.inputs.items()}
         type_env = {k: v.type for k, v in {**env.bindings, **env.locals}.items()}
@@ -411,6 +431,7 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
     if isinstance(node, MortonDecode3dNode):
         codes_val = eval_node(node.input, env)
         from .ops import morton3d_decode
+
         result = morton3d_decode(codes_val.data)
         input_types = {k: v.type for k, v in env.inputs.items()}
         type_env = {k: v.type for k, v in {**env.bindings, **env.locals}.items()}
@@ -420,6 +441,7 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
     if isinstance(node, HierarchicalKeyNode):
         coord_val = eval_node(node.input, env)
         from .ops import hierarchical_key
+
         result = hierarchical_key(coord_val.data, node.bit_widths)
         input_types = {k: v.type for k, v in env.inputs.items()}
         type_env = {k: v.type for k, v in {**env.bindings, **env.locals}.items()}
@@ -429,6 +451,7 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
     if isinstance(node, HierarchicalKeyDecodeNode):
         key_val = eval_node(node.input, env)
         from .ops import hierarchical_key_decode
+
         result = hierarchical_key_decode(key_val.data, node.bit_widths)
         input_types = {k: v.type for k, v in env.inputs.items()}
         type_env = {k: v.type for k, v in {**env.bindings, **env.locals}.items()}
@@ -477,10 +500,7 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
         if isinstance(data, torch.Tensor):
             old_rank = input_val.type.rank
             elem_dims = tuple(data.shape[old_rank:])
-            new_iter = tuple(
-                -1 if (isinstance(s, int) and s < 0) or s == "*" else int(s)
-                for s in node.new_shape
-            )
+            new_iter = tuple(-1 if (isinstance(s, int) and s < 0) or s == "*" else int(s) for s in node.new_shape)
             target = new_iter + elem_dims
             data = data.reshape(target)
         return Value(new_type, data)
@@ -493,7 +513,7 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
         data = input_val.data
         if isinstance(data, torch.Tensor):
             fused_shape = tuple(e.n if hasattr(e, "n") else -1 for e in new_type.iteration_shape.extents)
-            remaining = tuple(data.shape[new_type.rank:])
+            remaining = tuple(data.shape[new_type.rank :])
             target = fused_shape
             if remaining:
                 target = fused_shape + remaining
@@ -614,6 +634,98 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
             return Value(Type(Shape(new_lead), result_stype), stacked)
         raise TypeError(f"Cannot Prior over {type(data)}")
 
+    # -- Topology / convolution primitives --
+
+    if isinstance(node, ModNode):
+        a = eval_node(node.a, env)
+        b = eval_node(node.b, env)
+        b_data = b.data.to(device=a.data.device) if isinstance(b.data, torch.Tensor) else b.data
+        return Value(a.type, (a.data % b_data).to(a.data.dtype))
+
+    if isinstance(node, EqNode):
+        a = eval_node(node.a, env)
+        b = eval_node(node.b, env)
+        b_data = b.data.to(device=a.data.device) if isinstance(b.data, torch.Tensor) else b.data
+        result = a.data == b_data
+        input_types = {k: v.type for k, v in env.inputs.items()}
+        type_env = {k: v.type for k, v in {**env.bindings, **env.locals}.items()}
+        result_type = node.infer_type(type_env, input_types)
+        return Value(result_type, result)
+
+    if isinstance(node, FloorDivNode):
+        a = eval_node(node.a, env)
+        b = eval_node(node.b, env)
+        b_data = b.data.to(device=a.data.device) if isinstance(b.data, torch.Tensor) else b.data
+        return Value(a.type, torch.div(a.data, b_data, rounding_mode="floor").to(a.data.dtype))
+
+    if isinstance(node, AllNode):
+        input_val = eval_node(node.input, env)
+        result = input_val.data.all(dim=-1)
+        input_types = {k: v.type for k, v in env.inputs.items()}
+        type_env = {k: v.type for k, v in {**env.bindings, **env.locals}.items()}
+        result_type = node.infer_type(type_env, input_types)
+        return Value(result_type, result)
+
+    if isinstance(node, ExpandOffsetsNode):
+        coords_val = eval_node(node.coords, env)
+        offsets_val = eval_node(node.offsets, env)
+        expanded = (coords_val.data.unsqueeze(1) + offsets_val.data.unsqueeze(0)).reshape(-1, 3)
+        coord_elem = coords_val.type.element_type
+        result_type = Type(Shape(Dynamic()), coord_elem)
+        return Value(result_type, expanded)
+
+    # -- Bitwise shift / xor primitives --
+
+    if isinstance(node, ShiftLeftNode):
+        a = eval_node(node.a, env)
+        b = eval_node(node.b, env)
+        b_data = b.data.to(device=a.data.device) if isinstance(b.data, torch.Tensor) else b.data
+        return Value(a.type, (a.data << b_data).to(a.data.dtype))
+
+    if isinstance(node, ShiftRightNode):
+        a = eval_node(node.a, env)
+        b = eval_node(node.b, env)
+        b_data = b.data.to(device=a.data.device) if isinstance(b.data, torch.Tensor) else b.data
+        return Value(a.type, (a.data >> b_data).to(a.data.dtype))
+
+    if isinstance(node, BitXorNode):
+        a = eval_node(node.a, env)
+        b = eval_node(node.b, env)
+        b_data = b.data.to(device=a.data.device) if isinstance(b.data, torch.Tensor) else b.data
+        return Value(a.type, (a.data ^ b_data).to(a.data.dtype))
+
+    # -- Hash map primitives --
+
+    if isinstance(node, HashMapBuildNode):
+        keys_val = eval_node(node.keys, env)
+        key_arr = hash_map_build(keys_val.data)
+        result_type = Type(Shape(Dynamic()), ScalarType.I64)
+        return Value(result_type, key_arr)
+
+    if isinstance(node, HashMapLookupNode):
+        key_arr_val = eval_node(node.key_arr, env)
+        queries_val = eval_node(node.queries, env)
+        slots = hash_map_lookup(key_arr_val.data, queries_val.data)
+        input_types = {k: v.type for k, v in env.inputs.items()}
+        type_env = {k: v.type for k, v in {**env.bindings, **env.locals}.items()}
+        result_type = node.infer_type(type_env, input_types)
+        return Value(result_type, slots)
+
+    if isinstance(node, ScatterReduceNode):
+        keys_val = eval_node(node.keys, env)
+        values_val = eval_node(node.values, env)
+        # Resolve the reduce function name from the VerbRefNode
+        reduce_node = node.reduce_fn
+        fn_name = reduce_node.name.lower() if isinstance(reduce_node, VerbRefNode) else "or"
+        key_arr = hash_map_build(keys_val.data)
+        result_arr = hash_map_scatter_reduce(key_arr, keys_val.data, values_val.data, reduce_fn=fn_name)
+        # Extract only the non-empty slots as the output
+        empty_key = -1  # HASH_MAP_EMPTY_KEY
+        active_mask = key_arr != empty_key
+        active_result = result_arr[active_mask]
+        result_type = Type(Shape(Dynamic()), values_val.type.element_type)
+        return Value(result_type, active_result)
+
     # -- Additional scalar primitives --
 
     if isinstance(node, DivNode):
@@ -682,7 +794,9 @@ def _gather(target: Value, indexer: Value) -> Value:
 
         in_bounds = all(0 <= coord[i] < target.data.shape[i] for i in range(len(coord)))
         if not in_bounds:
-            return Value(result_type, _sentinel(et) if isinstance(et, ScalarType) else torch.tensor(-1, dtype=torch.int32))
+            return Value(
+                result_type, _sentinel(et) if isinstance(et, ScalarType) else torch.tensor(-1, dtype=torch.int32)
+            )
 
         result_data = target.data[tuple(coord.long())]
         return Value(result_type, result_data)
@@ -798,6 +912,7 @@ def _unwrap_and_promote(result_et):
 def _wrap_adverb(adverb: str, inner_fn: FnValue) -> FnValue:
     """Wrap a FnValue with adverb iteration logic, producing a new FnValue."""
     if adverb == "Over":
+
         def over_apply(xs: Value) -> Value:
             elements = _extract_elements(xs)
             if not elements:
@@ -814,6 +929,7 @@ def _wrap_adverb(adverb: str, inner_fn: FnValue) -> FnValue:
         return FnValue(1, over_apply, over_type, f"Over({inner_fn.name})")
 
     if adverb == "Scan":
+
         def scan_apply(xs: Value) -> Value:
             elements = _extract_elements(xs)
             if not elements:
@@ -831,6 +947,7 @@ def _wrap_adverb(adverb: str, inner_fn: FnValue) -> FnValue:
         return FnValue(1, scan_apply, scan_type, f"Scan({inner_fn.name})")
 
     if adverb == "Prior":
+
         def prior_apply(xs: Value) -> Value:
             elements = _extract_elements(xs)
             results = []
@@ -850,6 +967,7 @@ def _wrap_adverb(adverb: str, inner_fn: FnValue) -> FnValue:
         return FnValue(1, prior_apply, prior_type, f"Prior({inner_fn.name})")
 
     if adverb == "Each":
+
         def each_apply(xs: Value) -> Value:
             elements = _extract_elements(xs)
             results = [inner_fn.apply_fn(e) for e in elements]
@@ -864,6 +982,7 @@ def _wrap_adverb(adverb: str, inner_fn: FnValue) -> FnValue:
         return FnValue(1, each_apply, each_type, f"Each({inner_fn.name})")
 
     if adverb == "EachRight":
+
         def each_right_apply(x: Value, y: Value) -> Value:
             y_elements = _extract_elements(y)
             results = [inner_fn.apply_fn(x, ye) for ye in y_elements]
@@ -878,6 +997,7 @@ def _wrap_adverb(adverb: str, inner_fn: FnValue) -> FnValue:
         return FnValue(2, each_right_apply, each_right_type, f"EachRight({inner_fn.name})")
 
     if adverb == "EachLeft":
+
         def each_left_apply(x: Value, y: Value) -> Value:
             x_elements = _extract_elements(x)
             results = [inner_fn.apply_fn(xe, y) for xe in x_elements]
@@ -892,14 +1012,12 @@ def _wrap_adverb(adverb: str, inner_fn: FnValue) -> FnValue:
         return FnValue(2, each_left_apply, each_left_type, f"EachLeft({inner_fn.name})")
 
     if adverb == "EachBoth":
+
         def each_both_apply(x: Value, y: Value) -> Value:
             x_elements = _extract_elements(x)
             y_elements = _extract_elements(y)
             if len(x_elements) != len(y_elements):
-                raise TypeError(
-                    f"EachBoth: leading shape length mismatch: "
-                    f"{len(x_elements)} vs {len(y_elements)}"
-                )
+                raise TypeError(f"EachBoth: leading shape length mismatch: " f"{len(x_elements)} vs {len(y_elements)}")
             results = [inner_fn.apply_fn(xe, ye) for xe, ye in zip(x_elements, y_elements)]
             return _collect_adverb_results(x.type, results)
 

@@ -159,6 +159,62 @@ def main():
     _run("cross_boundary_neighbor", test_cross_boundary_neighbor)
     _run("batch_cross_leaf", test_batch_cross_leaf)
 
+    # -- hash map + dialect lowering --
+    print()
+    print("=" * 60)
+    print("HashMap: primitives, bitwise ops, dialect lowering")
+    print("=" * 60)
+    from fvdb_tile.tests.test_hashmap import (
+        test_murmurhash3_deterministic,
+        test_murmurhash3_no_trivial_fixpoints,
+        test_murmurhash3_distinct_outputs,
+        test_murmurhash3_bit_spread,
+        test_storage_size_power_of_two,
+        test_build_lookup_roundtrip,
+        test_build_lookup_unique_slots,
+        test_build_with_duplicates,
+        test_build_lookup_scale,
+        test_build_empty,
+        test_scatter_reduce_or,
+        test_scatter_reduce_add,
+        test_bitwise_shift_left,
+        test_bitwise_shift_right,
+        test_bitwise_xor,
+        test_dsl_hashmap_build_lookup,
+        test_dsl_hashmap_miss,
+        test_pipeline_hashmap_barrier,
+        test_pipeline_hashmap_exec,
+        test_lowering_scatter_reduce_structure,
+        test_lowering_passthrough_non_dialect,
+        test_lowering_empty_dialects,
+        test_scatter_reduce_direct_eval,
+        test_compile_with_dialect,
+    )
+    _run("murmurhash3_deterministic", test_murmurhash3_deterministic)
+    _run("murmurhash3_no_trivial_fixpoints", test_murmurhash3_no_trivial_fixpoints)
+    _run("murmurhash3_distinct_outputs", test_murmurhash3_distinct_outputs)
+    _run("murmurhash3_bit_spread", test_murmurhash3_bit_spread)
+    _run("storage_size_power_of_two", test_storage_size_power_of_two)
+    _run("build_lookup_roundtrip", test_build_lookup_roundtrip)
+    _run("build_lookup_unique_slots", test_build_lookup_unique_slots)
+    _run("build_with_duplicates", test_build_with_duplicates)
+    _run("build_lookup_scale", test_build_lookup_scale)
+    _run("build_empty", test_build_empty)
+    _run("scatter_reduce_or", test_scatter_reduce_or)
+    _run("scatter_reduce_add", test_scatter_reduce_add)
+    _run("bitwise_shift_left", test_bitwise_shift_left)
+    _run("bitwise_shift_right", test_bitwise_shift_right)
+    _run("bitwise_xor", test_bitwise_xor)
+    _run("dsl_hashmap_build_lookup", test_dsl_hashmap_build_lookup)
+    _run("dsl_hashmap_miss", test_dsl_hashmap_miss)
+    _run("pipeline_hashmap_barrier", test_pipeline_hashmap_barrier)
+    _run("pipeline_hashmap_exec", test_pipeline_hashmap_exec)
+    _run("lowering_scatter_reduce_structure", test_lowering_scatter_reduce_structure)
+    _run("lowering_passthrough_non_dialect", test_lowering_passthrough_non_dialect)
+    _run("lowering_empty_dialects", test_lowering_empty_dialects)
+    _run("scatter_reduce_direct_eval", test_scatter_reduce_direct_eval)
+    _run("compile_with_dialect", test_compile_with_dialect)
+
     print()
     print("=" * 60)
     print("All tests passed.")

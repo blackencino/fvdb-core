@@ -33,20 +33,30 @@ from dataclasses import dataclass
 import torch
 
 from .dsl_ast import (
+    AllNode,
+    BitXorNode,
     EachNode,
+    EqNode,
+    ExpandOffsetsNode,
+    FloorDivNode,
+    HashMapBuildNode,
+    HashMapLookupNode,
     InputNode,
     MapNode,
+    ModNode,
     Node,
     OverNode,
     Program,
     RefNode,
+    ShiftLeftNode,
+    ShiftRightNode,
     SortNode,
     UniqueNode,
     WhereNode,
 )
 from .dsl_eval import EvalEnv, eval_node
 from .dsl_parse import parse
-from .ops import Value
+from .ops import Value, hash_map_build, hash_map_lookup
 from .types import Dynamic, ScalarType, Shape, Static, Type, coord_type
 
 
@@ -242,12 +252,46 @@ def _node_to_source(node: Node) -> str:
         return f'Input("{node.name}")'
     if isinstance(node, RefNode):
         return node.name
-    from .dsl_ast import ConstNode, AddNode, SubNode, GENode, AndNode, NotNode
-    from .dsl_ast import InBoundsNode, GatherNode, DecomposeNode, FindNode
-    from .dsl_ast import MaskedNode, CutNode, ReshapeNode, FuseNode, FlattenNode, PermuteNode
-    from .dsl_ast import DivNode, MulNode, CountNode, Morton3dNode, Morton3dSignedNode, MortonDecode3dNode, HierarchicalKeyNode, HierarchicalKeyDecodeNode
-    from .dsl_ast import OverNode, ScanNode, EachRightNode, EachLeftNode, PriorNode
-    from .dsl_ast import FieldNode, VerbRefNode, AdverbApplyNode, ApplyNode
+    from .dsl_ast import (
+        AddNode,
+        AdverbApplyNode,
+        AllNode,
+        AndNode,
+        ApplyNode,
+        ConstNode,
+        CountNode,
+        CutNode,
+        DecomposeNode,
+        DivNode,
+        EachLeftNode,
+        EachRightNode,
+        EqNode,
+        ExpandOffsetsNode,
+        FieldNode,
+        FindNode,
+        FlattenNode,
+        FloorDivNode,
+        FuseNode,
+        GatherNode,
+        GENode,
+        HierarchicalKeyDecodeNode,
+        HierarchicalKeyNode,
+        InBoundsNode,
+        MaskedNode,
+        ModNode,
+        Morton3dNode,
+        Morton3dSignedNode,
+        MortonDecode3dNode,
+        MulNode,
+        NotNode,
+        OverNode,
+        PermuteNode,
+        PriorNode,
+        ReshapeNode,
+        ScanNode,
+        SubNode,
+        VerbRefNode,
+    )
 
     if isinstance(node, ConstNode):
         return f"Const({node.value!r})"
@@ -318,6 +362,26 @@ def _node_to_source(node: Node) -> str:
             return f"{node.fn.adverb}({inner_src}, {arg_strs})"
         fn_src = _node_to_source(node.fn)
         return f"Apply({fn_src}, {arg_strs})"
+    if isinstance(node, ModNode):
+        return f"Mod({_node_to_source(node.a)}, {_node_to_source(node.b)})"
+    if isinstance(node, EqNode):
+        return f"Eq({_node_to_source(node.a)}, {_node_to_source(node.b)})"
+    if isinstance(node, FloorDivNode):
+        return f"FloorDiv({_node_to_source(node.a)}, {_node_to_source(node.b)})"
+    if isinstance(node, AllNode):
+        return f"All({_node_to_source(node.input)})"
+    if isinstance(node, ExpandOffsetsNode):
+        return f"ExpandOffsets({_node_to_source(node.coords)}, {_node_to_source(node.offsets)})"
+    if isinstance(node, ShiftLeftNode):
+        return f"ShiftLeft({_node_to_source(node.a)}, {_node_to_source(node.b)})"
+    if isinstance(node, ShiftRightNode):
+        return f"ShiftRight({_node_to_source(node.a)}, {_node_to_source(node.b)})"
+    if isinstance(node, BitXorNode):
+        return f"BitXor({_node_to_source(node.a)}, {_node_to_source(node.b)})"
+    if isinstance(node, HashMapBuildNode):
+        return f"HashMapBuild({_node_to_source(node.keys)})"
+    if isinstance(node, HashMapLookupNode):
+        return f"HashMapLookup({_node_to_source(node.key_arr)}, {_node_to_source(node.queries)})"
     raise TypeError(f"Cannot serialize {type(node).__name__} to DSL source")
 
 
@@ -527,10 +591,49 @@ def _make_collective_hooks(device: str) -> dict:
             return Value(in_ty, unique_t.cpu())
         return val
 
+    def hashmap_build_hook(node, env):
+        keys_val = eval_node(node.keys, EvalEnv(env.inputs, env.bindings))
+        data = keys_val.data
+        if not isinstance(data, torch.Tensor):
+            raise TypeError(f"HashMapBuild requires tensor data, got {type(data)}")
+        result_type = Type(Shape(Dynamic()), ScalarType.I64)
+        if torch_device.type != "cpu":
+            data_gpu = data.to(device=torch_device, dtype=torch.int64)
+            from .hashmap_cuda import gpu_hash_map_build
+            key_arr, _slots = gpu_hash_map_build(data_gpu)
+            return Value(result_type, key_arr.cpu())
+        else:
+            key_arr = hash_map_build(data)
+            return Value(result_type, key_arr)
+
+    def hashmap_lookup_hook(node, env):
+        key_arr_val = eval_node(node.key_arr, EvalEnv(env.inputs, env.bindings))
+        queries_val = eval_node(node.queries, EvalEnv(env.inputs, env.bindings))
+        key_arr_data = key_arr_val.data
+        queries_data = queries_val.data
+        if not isinstance(key_arr_data, torch.Tensor) or not isinstance(queries_data, torch.Tensor):
+            raise TypeError("HashMapLookup requires tensor data")
+        query_ty = node.queries.infer_type(
+            {k: v.type for k, v in {**env.bindings, **getattr(env, 'locals', {})}.items()},
+            {k: v.type for k, v in env.inputs.items()},
+        )
+        result_type = Type(query_ty.iteration_shape, ScalarType.I64)
+        if torch_device.type != "cpu":
+            ka_gpu = key_arr_data.to(device=torch_device, dtype=torch.int64)
+            q_gpu = queries_data.to(device=torch_device, dtype=torch.int64)
+            from .hashmap_cuda import gpu_hash_map_lookup
+            slots = gpu_hash_map_lookup(ka_gpu, q_gpu)
+            return Value(result_type, slots.cpu())
+        else:
+            slots = hash_map_lookup(key_arr_data, queries_data)
+            return Value(result_type, slots)
+
     return {
         WhereNode: where_hook,
         SortNode: sort_hook,
         UniqueNode: unique_hook,
+        HashMapBuildNode: hashmap_build_hook,
+        HashMapLookupNode: hashmap_lookup_hook,
     }
 
 
@@ -539,7 +642,7 @@ def _make_collective_hooks(device: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-_BARRIER_NODE_TYPES = (WhereNode, SortNode, UniqueNode, OverNode)
+_BARRIER_NODE_TYPES = (WhereNode, SortNode, UniqueNode, OverNode, HashMapBuildNode, HashMapLookupNode)
 
 
 def _contains_barrier(node: Node) -> bool:
@@ -564,6 +667,10 @@ def _barrier_reason(node: Node) -> str:
         return "unique_collective"
     if isinstance(node, OverNode):
         return "reduction_barrier"
+    if isinstance(node, HashMapBuildNode):
+        return "hashmap_build_collective"
+    if isinstance(node, HashMapLookupNode):
+        return "hashmap_lookup_collective"
     return "contains_barrier_subgraph"
 
 
@@ -604,12 +711,15 @@ def plan_source(source: str) -> PipelinePlan:
     return plan_program(parse(source))
 
 
-def compile_program(program: Program) -> PipelineExecutable:
+def compile_program(program: Program, dialects=None) -> PipelineExecutable:
+    if dialects:
+        from .dsl_lower import lower_program
+        program = lower_program(program, dialects)
     return PipelineExecutable(plan=plan_program(program), program=program)
 
 
-def compile_source(source: str) -> PipelineExecutable:
-    return compile_program(parse(source))
+def compile_source(source: str, dialects=None) -> PipelineExecutable:
+    return compile_program(parse(source), dialects=dialects)
 
 
 # ---------------------------------------------------------------------------

@@ -14,9 +14,10 @@ from typing import Any, Callable
 
 import torch
 
+from .layouts import StructElement
 from .layouts import flip as flip_layout
 from .layouts import indexed as indexed_layout
-from .layouts import struct_layout, StructElement
+from .layouts import struct_layout
 from .types import (
     Dynamic,
     ElementType,
@@ -31,10 +32,10 @@ from .types import (
     tensor_type,
 )
 
-
 # ---------------------------------------------------------------------------
 # Value -- concrete data with an attached logical type
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class Value:
@@ -99,6 +100,7 @@ _numpy_dtype_to_stype = _torch_dtype_to_stype
 # FnValue -- first-class function values
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class FnValue:
     """Runtime representation of a function (verb or composed adverb).
@@ -123,11 +125,14 @@ class FnValue:
 def _verb_apply_add(a: Value, b: Value) -> Value:
     return Value(a.type, (a.data + b.data).to(a.data.dtype))
 
+
 def _verb_apply_sub(a: Value, b: Value) -> Value:
     return Value(a.type, (a.data - b.data).to(a.data.dtype))
 
+
 def _verb_apply_mul(a: Value, b: Value) -> Value:
     return Value(a.type, (a.data * b.data).to(a.data.dtype))
+
 
 def _verb_apply_div(a: Value, b: Value) -> Value:
     b_data = b.data if isinstance(b.data, torch.Tensor) else float(b.data)
@@ -136,28 +141,46 @@ def _verb_apply_div(a: Value, b: Value) -> Value:
         return Value(Type(Shape(), ScalarType.F32), result)
     return Value(Type(a.type.iteration_shape, ScalarType.F32), result)
 
+
 def _verb_apply_min(a: Value, b: Value) -> Value:
     return Value(a.type, torch.minimum(a.data, b.data))
+
 
 def _verb_apply_max(a: Value, b: Value) -> Value:
     return Value(a.type, torch.maximum(a.data, b.data))
 
+
 def _verb_apply_and(a: Value, b: Value) -> Value:
     return Value(a.type, a.data & b.data)
 
+
 def _verb_apply_or(a: Value, b: Value) -> Value:
     return Value(a.type, a.data | b.data)
+
+
+def _verb_apply_xor(a: Value, b: Value) -> Value:
+    return Value(a.type, a.data ^ b.data)
+
+
+def _verb_apply_shift_left(a: Value, b: Value) -> Value:
+    return Value(a.type, (a.data << b.data).to(a.data.dtype))
+
+
+def _verb_apply_shift_right(a: Value, b: Value) -> Value:
+    return Value(a.type, (a.data >> b.data).to(a.data.dtype))
 
 
 def _verb_type_preserving(ta: Type, tb: Type) -> Type:
     """Type rule for verbs that preserve the left argument's type (Add, Sub, Mul, etc.)."""
     return ta
 
+
 def _verb_type_div(ta: Type, tb: Type) -> Type:
     """Type rule for Div: produces f32."""
     if ta.rank == 0:
         return Type(Shape(), ScalarType.F32)
     return Type(ta.iteration_shape, ScalarType.F32)
+
 
 def _verb_type_bool(ta: Type, tb: Type) -> Type:
     """Type rule for comparison verbs: preserves shape, produces bool."""
@@ -172,7 +195,10 @@ VERBS: dict[str, FnValue] = {
     "Min": FnValue(2, _verb_apply_min, _verb_type_preserving, "Min"),
     "Max": FnValue(2, _verb_apply_max, _verb_type_preserving, "Max"),
     "And": FnValue(2, _verb_apply_and, _verb_type_preserving, "And"),
-    "Or":  FnValue(2, _verb_apply_or,  _verb_type_preserving, "Or"),
+    "Or": FnValue(2, _verb_apply_or, _verb_type_preserving, "Or"),
+    "Xor": FnValue(2, _verb_apply_xor, _verb_type_preserving, "Xor"),
+    "ShiftLeft": FnValue(2, _verb_apply_shift_left, _verb_type_preserving, "ShiftLeft"),
+    "ShiftRight": FnValue(2, _verb_apply_shift_right, _verb_type_preserving, "ShiftRight"),
 }
 
 
@@ -180,12 +206,11 @@ VERBS: dict[str, FnValue] = {
 # Map
 # ---------------------------------------------------------------------------
 
+
 def map_typecheck(input_type: Type, result_stype: ScalarType) -> Type:
     """Map preserves iteration shape, transforms element type."""
     if not input_type.is_scalar_element:
-        raise TypeError(
-            f"Map requires scalar element type, got {input_type.element_type!r}"
-        )
+        raise TypeError(f"Map requires scalar element type, got {input_type.element_type!r}")
     return Type(input_type.iteration_shape, result_stype)
 
 
@@ -200,6 +225,7 @@ def Map(val: Value, fn: Callable) -> Value:
 # ---------------------------------------------------------------------------
 # Where
 # ---------------------------------------------------------------------------
+
 
 def where_typecheck(input_type: Type) -> Type:
     """Where: (S) over bool -> (*) over (rank,) i32."""
@@ -221,6 +247,7 @@ def Where(val: Value) -> Value:
 # ---------------------------------------------------------------------------
 # Gather
 # ---------------------------------------------------------------------------
+
 
 def gather_typecheck(target_type: Type, indexer_type: Type) -> Type:
     """Gather: materialise an Indexed layout."""
@@ -262,6 +289,7 @@ def Gather(target: Value, indexer: Value) -> Value:
 # Each
 # ---------------------------------------------------------------------------
 
+
 def _promote_dynamic_to_jagged(ty: Type) -> Type:
     """Promote Dynamic extents to Jagged in a type's iteration shape.
 
@@ -271,10 +299,7 @@ def _promote_dynamic_to_jagged(ty: Type) -> Type:
     """
     if ty.rank == 0:
         return ty
-    new_extents = tuple(
-        Jagged() if isinstance(e, Dynamic) else e
-        for e in ty.iteration_shape.extents
-    )
+    new_extents = tuple(Jagged() if isinstance(e, Dynamic) else e for e in ty.iteration_shape.extents)
     if new_extents == ty.iteration_shape.extents:
         return ty
     return Type(Shape(*new_extents), ty.element_type)
@@ -323,10 +348,11 @@ def Each(val: Value, fn: Callable[[Value], Value]) -> Value:
     first_type = results[0].type
     inner_type = _promote_dynamic_to_jagged(first_type) if isinstance(first_type, Type) else first_type
 
-    all_same_data_shape = all(
-        isinstance(r.data, torch.Tensor) and r.data.shape == results[0].data.shape
-        for r in results[1:]
-    ) if isinstance(results[0].data, torch.Tensor) else False
+    all_same_data_shape = (
+        all(isinstance(r.data, torch.Tensor) and r.data.shape == results[0].data.shape for r in results[1:])
+        if isinstance(results[0].data, torch.Tensor)
+        else False
+    )
 
     outer_extent = val.type.iteration_shape.extents[0] if val.type.rank > 0 else Static(len(results))
 
@@ -342,6 +368,7 @@ def Each(val: Value, fn: Callable[[Value], Value]) -> Value:
 # ---------------------------------------------------------------------------
 # FlipStruct -- data-level struct-of-arrays -> array-of-structs
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class StructValue:
@@ -397,9 +424,7 @@ def FlipStruct(**fields: Value) -> Value:
         else:
             raise TypeError(f"Cannot determine length of field '{name}'")
         if length != n:
-            raise TypeError(
-                f"Field '{name}' has length {length}, expected {n}"
-            )
+            raise TypeError(f"Field '{name}' has length {length}, expected {n}")
 
     elements = []
     for i in range(n):
@@ -417,6 +442,7 @@ def FlipStruct(**fields: Value) -> Value:
 # ---------------------------------------------------------------------------
 # Decompose -- bitfield coordinate split for hierarchical grids
 # ---------------------------------------------------------------------------
+
 
 def Decompose(coord: Value, bit_widths: list[int]) -> Value:
     """Split a global coordinate into sub-coordinates via bitfield extraction.
@@ -457,15 +483,16 @@ def Decompose(coord: Value, bit_widths: list[int]) -> Value:
 # Morton curve primitives
 # ---------------------------------------------------------------------------
 
+
 def _part1by2(x: torch.Tensor) -> torch.Tensor:
     """Spread bits of x so that there are two zero bits between each."""
     x = x.to(torch.int64)
     x = x & 0x1FFFFF
     x = (x | (x << 32)) & 0x1F00000000FFFF
     x = (x | (x << 16)) & 0x1F0000FF0000FF
-    x = (x | (x << 8))  & 0x100F00F00F00F00F
-    x = (x | (x << 4))  & 0x10C30C30C30C30C3
-    x = (x | (x << 2))  & 0x1249249249249249
+    x = (x | (x << 8)) & 0x100F00F00F00F00F
+    x = (x | (x << 4)) & 0x10C30C30C30C30C3
+    x = (x | (x << 2)) & 0x1249249249249249
     return x
 
 
@@ -473,9 +500,9 @@ def _compact1by2(x: torch.Tensor) -> torch.Tensor:
     """Inverse of _part1by2: extract every third bit."""
     x = x.to(torch.int64)
     x = x & 0x1249249249249249
-    x = (x | (x >> 2))  & 0x10C30C30C30C30C3
-    x = (x | (x >> 4))  & 0x100F00F00F00F00F
-    x = (x | (x >> 8))  & 0x1F0000FF0000FF
+    x = (x | (x >> 2)) & 0x10C30C30C30C30C3
+    x = (x | (x >> 4)) & 0x100F00F00F00F00F
+    x = (x | (x >> 8)) & 0x1F0000FF0000FF
     x = (x | (x >> 16)) & 0x1F00000000FFFF
     x = (x | (x >> 32)) & 0x1FFFFF
     return x.to(torch.int32)
@@ -532,6 +559,21 @@ def morton3d_decode(codes: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
+def _hkey_params(bit_widths: list[int]) -> tuple[int, int]:
+    """Compute (offset, root_bits_per_axis) for signed hierarchical keys.
+
+    The offset shifts all coordinates to non-negative before encoding.
+    root_bits_per_axis is sized so the total key fits in 63 bits (positive
+    i64), ensuring correct sort ordering.
+    """
+    tree_key_bits = sum(3 * bw for bw in bit_widths)
+    remaining = 63 - tree_key_bits
+    root_bits_per_axis = remaining // 3
+    total_bits_per_axis = sum(bit_widths) + root_bits_per_axis
+    offset = 1 << (total_bits_per_axis - 1)
+    return offset, root_bits_per_axis
+
+
 def hierarchical_key(coord: torch.Tensor, bit_widths: list[int]) -> torch.Tensor:
     """Compute a CIG-compatible hierarchical sort key for 3D coordinates.
 
@@ -541,6 +583,10 @@ def hierarchical_key(coord: torch.Tensor, bit_widths: list[int]) -> torch.Tensor
     tree-traversal order: iterate each node's children in row-major order,
     recurse.
 
+    Handles signed coordinates by adding a fixed offset to make all values
+    non-negative before encoding.  The offset is derived from the bit-widths
+    to guarantee the total key fits in 63 bits (positive i64).
+
     Each level uses ``3 * bit_width`` bits for its linear index
     (``x * dim^2 + y * dim + z`` where ``dim = 2^bit_width``).
 
@@ -549,16 +595,18 @@ def hierarchical_key(coord: torch.Tensor, bit_widths: list[int]) -> torch.Tensor
         [level_0 bits] [level_1 bits] ... [level_N-1 bits] [root bits]
 
     For bit_widths=[3,4,5]: level_0 uses 9 bits, level_1 uses 12, level_2
-    uses 15, root gets the rest.  Total non-root: 36 bits.
+    uses 15, root uses 27 bits (9 per axis).  Total: 63 bits.
 
     Args:
-        coord: (3,) i32 or (N, 3) i32 -- voxel coordinates.
+        coord: (3,) i32 or (N, 3) i32 -- voxel coordinates (signed ok).
         bit_widths: leaf-first list, e.g. [3, 4, 5] for 8^3 / 16^3 / 32^3.
 
     Returns:
-        i64 scalar or (N,) i64 tensor -- hierarchical sort key.
+        i64 scalar or (N,) i64 tensor -- hierarchical sort key (non-negative).
     """
-    c = coord.to(torch.int64)
+    offset, root_bits = _hkey_params(bit_widths)
+
+    c = coord.to(torch.int64) + offset
     single = c.ndim == 1
     if single:
         c = c.reshape(1, 3)
@@ -578,10 +626,11 @@ def hierarchical_key(coord: torch.Tensor, bit_widths: list[int]) -> torch.Tensor
         coord_shift += bw
         key_shift += 3 * bw
 
-    rx = c[:, 0] >> coord_shift
-    ry = c[:, 1] >> coord_shift
-    rz = c[:, 2] >> coord_shift
-    root_linear = (rx * (1 << 20) + ry * (1 << 10) + rz).to(torch.int64)
+    root_mask = (1 << root_bits) - 1
+    rx = (c[:, 0] >> coord_shift) & root_mask
+    ry = (c[:, 1] >> coord_shift) & root_mask
+    rz = (c[:, 2] >> coord_shift) & root_mask
+    root_linear = (rx * (1 << (2 * root_bits)) + ry * (1 << root_bits) + rz).to(torch.int64)
     key |= root_linear << key_shift
 
     return key[0] if single else key
@@ -680,15 +729,18 @@ def dedup_coords(coords: torch.Tensor, bit_widths: list[int]) -> torch.Tensor:
 def hierarchical_key_decode(key: torch.Tensor, bit_widths: list[int]) -> torch.Tensor:
     """Decode a hierarchical sort key back to 3D coordinates.
 
-    Inverse of :func:`hierarchical_key`.
+    Inverse of :func:`hierarchical_key`.  Handles signed coordinates by
+    removing the offset that was added during encoding.
 
     Args:
         key: i64 scalar or (N,) i64 tensor -- hierarchical sort keys.
         bit_widths: same list used for encoding, e.g. [3, 4, 5].
 
     Returns:
-        (3,) i32 or (N, 3) i32 -- reconstructed coordinates.
+        (3,) i32 or (N, 3) i32 -- reconstructed signed coordinates.
     """
+    offset, root_bits = _hkey_params(bit_widths)
+
     k = torch.atleast_1d(key).to(torch.int64)
     single = key.ndim == 0
 
@@ -713,16 +765,180 @@ def hierarchical_key_decode(key: torch.Tensor, bit_widths: list[int]) -> torch.T
         key_shift += n_bits
         coord_shift += bw
 
+    root_mask = (1 << root_bits) - 1
     root_linear = k >> key_shift
-    rz = root_linear & ((1 << 10) - 1)
-    ry = (root_linear >> 10) & ((1 << 10) - 1)
-    rx = root_linear >> 20
+    rz = root_linear & root_mask
+    ry = (root_linear >> root_bits) & root_mask
+    rx = (root_linear >> (2 * root_bits)) & root_mask
 
     coord[:, 0] |= rx << coord_shift
     coord[:, 1] |= ry << coord_shift
     coord[:, 2] |= rz << coord_shift
 
-    result = coord.to(torch.int32)
+    result = (coord - offset).to(torch.int32)
     if single:
         return result[0]
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Hash map -- open-addressing with MurmurHash3 finalizer
+# ---------------------------------------------------------------------------
+#
+# Pure-tensor hash map: the "map" is just a flat i64 key array with a
+# sentinel protocol.  Values are separate tensors indexed by the same slot.
+# This is an index protocol, not a container type.
+#
+# The hash function is an implementation detail -- not exposed in the DSL.
+# Deterministic within a build+lookup pair; no ordering guarantees.
+# ---------------------------------------------------------------------------
+
+# Sentinel values.  0xFFFF_FFFF_FFFF_FFFF in unsigned u64, which is -1
+# in signed i64 (two's complement).  Torch uses signed int64.
+HASH_MAP_EMPTY_KEY: int = -1
+HASH_MAP_NO_SLOT: int = -1
+HASH_MAP_LOAD_FACTOR: int = 4
+
+
+def _murmurhash3_fmix64(h: int) -> int:
+    """MurmurHash3 64-bit finalizer.
+
+    Standard GPU hash table hash (used by NVIDIA cuCollections/cuco).
+    Five operations: xor-shift, multiply, xor-shift, multiply, xor-shift.
+    Formally proven avalanche -- every output bit depends on every input bit.
+    """
+    mask64 = 0xFFFF_FFFF_FFFF_FFFF
+    h = (h ^ (h >> 33)) & mask64
+    h = (h * 0xFF51AFD7ED558CCD) & mask64
+    h = (h ^ (h >> 33)) & mask64
+    h = (h * 0xC4CEB9FE1A85EC53) & mask64
+    h = (h ^ (h >> 33)) & mask64
+    return h
+
+
+def hash_map_compute_storage_size(item_count: int) -> int:
+    """Compute power-of-two storage size with load factor headroom."""
+    if item_count == 0:
+        return 0
+    size = 1
+    while size < item_count:
+        size *= 2
+    size *= HASH_MAP_LOAD_FACTOR
+    return size
+
+
+def hash_map_build(keys: torch.Tensor) -> torch.Tensor:
+    """Build hash map from i64 keys.  Returns the key array (the map).
+
+    Sequential reference implementation (no CAS needed on CPU).
+    The key array length IS the storage_size.  Sentinel-filled.
+
+    Args:
+        keys: (N,) i64 tensor of keys.  Must not contain EMPTY_KEY.
+
+    Returns:
+        (storage_size,) i64 key array.
+    """
+    n = keys.shape[0]
+    storage_size = hash_map_compute_storage_size(n)
+    if storage_size == 0:
+        return torch.empty(0, dtype=torch.int64, device=keys.device)
+
+    key_arr = torch.full(
+        (storage_size,), HASH_MAP_EMPTY_KEY, dtype=torch.int64, device=keys.device
+    )
+    mask = storage_size - 1
+
+    for i in range(n):
+        k = int(keys[i].item())
+        assert k != HASH_MAP_EMPTY_KEY, "Key must not be the sentinel value"
+        # Hash using unsigned interpretation for the hash function
+        k_unsigned = k & 0xFFFF_FFFF_FFFF_FFFF
+        slot = _murmurhash3_fmix64(k_unsigned) & mask
+        while True:
+            existing = int(key_arr[slot].item())
+            if existing == HASH_MAP_EMPTY_KEY:
+                key_arr[slot] = k
+                break
+            elif existing == k:
+                break  # duplicate key -- keep first
+            else:
+                slot = (slot + 1) & mask
+
+    return key_arr
+
+
+def hash_map_lookup(key_arr: torch.Tensor, queries: torch.Tensor) -> torch.Tensor:
+    """Look up keys in a hash map.  Returns slot indices.
+
+    Args:
+        key_arr: (storage_size,) i64 key array from hash_map_build.
+        queries: (M,) i64 query keys.
+
+    Returns:
+        (M,) i64 tensor of slot indices.  HASH_MAP_NO_SLOT for misses.
+    """
+    storage_size = key_arr.shape[0]
+    if storage_size == 0:
+        return torch.full(
+            (queries.shape[0],), HASH_MAP_NO_SLOT, dtype=torch.int64, device=queries.device
+        )
+
+    mask = storage_size - 1
+    result = torch.full((queries.shape[0],), HASH_MAP_NO_SLOT, dtype=torch.int64, device=queries.device)
+
+    for i in range(queries.shape[0]):
+        k = int(queries[i].item())
+        assert k != HASH_MAP_EMPTY_KEY, "Query must not be the sentinel value"
+        k_unsigned = k & 0xFFFF_FFFF_FFFF_FFFF
+        slot = _murmurhash3_fmix64(k_unsigned) & mask
+        for _ in range(storage_size):
+            existing = int(key_arr[slot].item())
+            if existing == k:
+                result[i] = slot
+                break
+            elif existing == HASH_MAP_EMPTY_KEY:
+                break  # not found
+            else:
+                slot = (slot + 1) & mask
+
+    return result
+
+
+def hash_map_scatter_reduce(
+    key_arr: torch.Tensor,
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    reduce_fn: str = "or",
+) -> torch.Tensor:
+    """Scatter values into hash map slots, combining with a reduce function.
+
+    Args:
+        key_arr: (storage_size,) i64 key array from hash_map_build.
+        keys: (N,) i64 keys to scatter.
+        values: (N, ...) values to scatter.
+        reduce_fn: "or", "add", "max" -- combining function for collisions.
+
+    Returns:
+        (storage_size, ...) value array with reduced values at each slot.
+    """
+    storage_size = key_arr.shape[0]
+    value_shape = values.shape[1:]
+    result = torch.zeros((storage_size, *value_shape), dtype=values.dtype, device=values.device)
+
+    slots = hash_map_lookup(key_arr, keys)
+
+    for i in range(keys.shape[0]):
+        slot = int(slots[i].item())
+        if slot == HASH_MAP_NO_SLOT:
+            continue
+        if reduce_fn == "or":
+            result[slot] = result[slot] | values[i]
+        elif reduce_fn == "add":
+            result[slot] = result[slot] + values[i]
+        elif reduce_fn == "max":
+            result[slot] = torch.maximum(result[slot], values[i])
+        else:
+            raise ValueError(f"Unknown reduce_fn: {reduce_fn}")
+
     return result
