@@ -546,14 +546,22 @@ def emit_runnable_kernel(
 
         # Decompose the tile input into per-axis tile gathers
         tile_param = param_map[tile_input]
-        tile_axes = []
-        for ax in range(tile_input_rank):
+        if tile_input_rank == 0:
+            # Scalar 1D array: single gather at query_idx
             v = ctx.fresh("qi")
-            ctx.emit(f"{v} = ct.gather({tile_param}, ({query_idx}, {ax}), check_bounds=True, padding_value=0)")
-            tile_axes.append(v)
-        ctx.input_params[tile_input] = "__decomposed__"
-        ctx.locals[tile_input] = tile_axes  # type: ignore[assignment]
-        ctx.bindings[tile_input] = tile_axes  # type: ignore[assignment]
+            ctx.emit(f"{v} = ct.gather({tile_param}, {query_idx}, check_bounds=True, padding_value=0)")
+            ctx.input_params[tile_input] = "__decomposed__"
+            ctx.locals[tile_input] = v
+            ctx.bindings[tile_input] = v
+        else:
+            tile_axes = []
+            for ax in range(tile_input_rank):
+                v = ctx.fresh("qi")
+                ctx.emit(f"{v} = ct.gather({tile_param}, ({query_idx}, {ax}), check_bounds=True, padding_value=0)")
+                tile_axes.append(v)
+            ctx.input_params[tile_input] = "__decomposed__"
+            ctx.locals[tile_input] = tile_axes  # type: ignore[assignment]
+            ctx.bindings[tile_input] = tile_axes  # type: ignore[assignment]
         ctx.emit("")
 
         # Pre-gather explicitly listed scalar inputs at query_idx.

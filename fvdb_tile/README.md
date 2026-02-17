@@ -1042,43 +1042,44 @@ Read this document top-to-bottom for the thesis, vocabulary, layout wrappers,
 adverb semantics, and worked examples. Then:
 
 - **Prototype code**: `fvdb_tile/prototype/`
-- **Run all tests**: `python fvdb_tile/prototype/run_all_tests.py` (20 tests, ~2s)
+- **Tests**: `fvdb_tile/tests/` -- run via `python fvdb_tile/tests/run_all_tests.py`
+- **Benchmarks**: `fvdb_tile/benchmarks/`
 - **Design doc**: this file (`fvdb_tile/README.md`)
+- **Decision trail**: `fvdb_tile/HISTORY.md` (append-only)
+- **Semantic contracts**: `fvdb_tile/prototype/SEMANTICS.md`
 
 File inventory:
 
 | File | Role |
 |------|------|
-| `types.py` | Extent kinds (Static/Dynamic/Jagged), Shape, Type, ScalarType |
-| `layouts.py` | Layout wrappers (lowercase): cut, indexed, tuple, struct, flip, jagged, masked |
-| `ops.py` | Python-level operations: Map, Each, Where, Gather, FlipStruct, Decompose, morton3d |
-| `dsl_ast.py` | AST node classes (~25 nodes) with `infer_type` methods |
-| `dsl_parse.py` | Recursive-descent parser: string -> AST |
-| `dsl_eval.py` | Tree-walk evaluator: type-check pass then numpy execution |
-| `test_where.py` | v0: Map, Where, Gather pipeline (DSL strings) |
-| `test_neighbors.py` | v0: neighbor finding, jagged emergence (DSL strings) |
-| `test_indexed_flip.py` | v1: multi-leaf cut, indexed, Struct+Flip (DSL + API tests) |
-| `test_two_level.py` | v2: hierarchical chain, Decompose, morton (DSL strings) |
-| `test_dsl.py` | v3: DSL validation (parser + evaluator correctness) |
-| `test_mesh.py` | mesh: triangle mesh, centroids via Over+Div (DSL strings) |
-| `dsl_to_cutile.py` | v4: DSL AST -> cuTile Python source emitter |
-| `test_cutile_smoke.py` | v4: cuTile toolchain validation (gather/scatter) |
-| `test_cutile_gather.py` | v4: hand-written neighbor predicate kernel vs numpy |
-| `test_cutile_codegen.py` | v4: emitter output validation + numpy vs cuTile |
-| `test_cutile_e2e.py` | v5: end-to-end DSL string -> GPU execution -> verify |
-| `bench_cutile.py` | v5: performance benchmark (cuTile vs numpy vs PyTorch) |
-| `test_cross_leaf.py` | v5: cross-leaf neighbor finding via hierarchical chain |
-| `test_cutile_cross_leaf.py` | v6: cross-leaf GPU codegen, compile, launch, verify |
-| `bench_cutile_cross_leaf.py` | v6: cross-leaf scale benchmark (cuTile vs numpy vs PyTorch) |
-| `cig.py` | v7: CIG format definition, builder, PyTorch ijk_to_index |
-| `cig_cutile.py` | v7: cuTile kernel for CIG ijk_to_index |
-| `test_cig.py` | v7: CIG builder and ijk_to_index correctness tests |
-| `bench_cig_vs_fvdb.py` | v7/v8: head-to-head CIG vs fVDB comparison |
-| `cig_masked_cutile.py` | v8: hand-written cuTile kernels with bitmask + popcount (i32 ref + u64) |
-| `test_masked.py` | v8: masked layout DSL tests (updated for abs-prefix in v11) |
-| `test_cutile_masked_e2e.py` | v9/v11: end-to-end DSL -> cuTile codegen for masked CIG ijk_to_index |
-| `test_cig3.py` | v10: 3-level CIG builder, root lookup, numpy reference tests |
-| `test_cutile_cig3_e2e.py` | v10/v11: end-to-end 3-level CIG DSL -> cuTile codegen (fused Find) |
+| `prototype/types.py` | Extent kinds (Static/Dynamic/Jagged), Shape, Type, ScalarType |
+| `prototype/layouts.py` | Layout wrappers (lowercase): cut, indexed, tuple, struct, flip, jagged, masked |
+| `prototype/ops.py` | Python-level operations: Map, Each, Where, Gather, FlipStruct, Decompose, morton3d |
+| `prototype/dsl_ast.py` | AST node classes (~25 nodes) with `infer_type` methods |
+| `prototype/dsl_parse.py` | Recursive-descent parser: string -> AST |
+| `prototype/dsl_eval.py` | Tree-walk evaluator with hooks: type-check pass then numpy execution |
+| `prototype/dsl_pipeline.py` | Barrier-aware pipeline planner, GPU collective dispatch, cutile segment compilation |
+| `prototype/dsl_to_cutile.py` | DSL AST -> cuTile Python source emitter (`emit_runnable_kernel`) |
+| `prototype/cig.py` | 3-level CompressedCIG3 builder, root lookup, numpy reference query |
+| `prototype/conv_grid.py` | conv_grid topology expansion via pipeline (expand + Sort + Unique) |
+| `tests/test_where.py` | v0: Map, Where, Gather pipeline (DSL strings) |
+| `tests/test_neighbors.py` | v0: neighbor finding, jagged emergence |
+| `tests/test_indexed_flip.py` | v1: multi-leaf cut, indexed, Struct+Flip |
+| `tests/test_two_level.py` | v2: hierarchical chain, Decompose, morton |
+| `tests/test_dsl.py` | v3: DSL validation (parser + evaluator correctness) |
+| `tests/test_mesh.py` | mesh: triangle mesh, centroids via Over+Div |
+| `tests/test_sort_unique.py` | Sort/Unique DSL primitive correctness |
+| `tests/test_pipeline.py` | Pipeline planning, collective dispatch, cutile segment compilation |
+| `tests/test_conv_grid.py` | conv_grid correctness, stride semantics, immutability |
+| `tests/test_masked.py` | v8: masked layout DSL tests |
+| `tests/test_cig3.py` | v10: 3-level CIG builder, root lookup, numpy reference |
+| `tests/test_cross_leaf.py` | v5: cross-leaf neighbors via DSL evaluator |
+| `tests/test_cutile_smoke.py` | v4: cuTile toolchain validation (gather/scatter) |
+| `tests/test_cutile_e2e.py` | v5: end-to-end DSL -> GPU execution -> verify |
+| `tests/test_cutile_cross_leaf.py` | v6: cross-leaf GPU codegen, compile, launch, verify |
+| `tests/test_cutile_cig3_e2e.py` | v10/v11: 3-level CIG DSL -> cuTile codegen (fused Find) |
+| `benchmarks/bench_cig3_vs_fvdb.py` | v11: 3-level CIG vs fVDB head-to-head |
+| `benchmarks/bench_cutile_cross_leaf.py` | v6: cross-leaf scale benchmark |
 | `bench_cig3_vs_fvdb.py` | v11: 3-level CIG vs fVDB head-to-head benchmark |
 | `verify_memory.py` | v11: detailed byte-level memory comparison CIG3 vs fVDB |
 | `run_all_tests.py` | Single entry point for non-GPU tests |
@@ -1181,42 +1182,70 @@ Key semantic rules:
   Gather across leaf boundaries cleanly. See `test_cross_leaf.py`.
 - **GPU codegen loop** (v5): done. DSL string -> emitted `@ct.kernel` ->
   cuTile JIT -> GPU launch -> correct results. See `test_cutile_e2e.py`.
-- **First performance number** (v5): done. cuTile 4.4x faster than
-  PyTorch GPU, 214x faster than numpy. See `bench_cutile.py`.
 - **Cross-leaf GPU codegen** (v6): done. Emitter extended with Decompose,
   field, and chained Gather fusion. DSL string -> GPU execution for
-  hierarchical traversal. See `test_cutile_cross_leaf.py`.
-- **Scale benchmark** (v6): done. cuTile 4.9-8.3x faster than PyTorch GPU
-  at 4-256 leaf scale (up to 79K voxels, 475K lookups). Excellent GPU
-  scaling. See `bench_cutile_cross_leaf.py`.
-- **CIG format + builder** (v7): done. Concrete 2-level CIG as two tensors,
-  programmatic builder from coordinates, three ijk_to_index implementations.
-  See `cig.py`, `cig_cutile.py`, `test_cig.py`.
-- **fVDB head-to-head** (v7): done. CIG cuTile 1.3-1.5x faster than NanoVDB
-  for ijk_to_index queries. NanoVDB 8-12x smaller in memory (bitmask
-  compression). See `bench_cig_vs_fvdb.py`.
-- **`masked` layout + compressed CIG** (v8): done. Bitmask-compressed leaves
-  with popcount access. Compressed CIG is 0.22-0.73x NanoVDB memory at
-  typical sparsities AND 1.27-1.34x faster. The `masked` layout is a
-  first-class type-system concept. See `cig_masked_cutile.py`, `test_masked.py`.
-- **Masked codegen + u64 consolidation** (v9): done. The 4-line masked CIG
-  DSL expression now compiles to a cuTile kernel via the extended emitter.
-  `MaskedNode` emission, masked-Gather idiom detection (u64 popcount chain),
-  and tile-parallel `emit_runnable_kernel`. u64 is the primary path; i32
-  retained as reference. See `test_cutile_masked_e2e.py`, `dsl_to_cutile.py`.
-- **3-level CIG + prefix-sum masked** (v10): done. Prefix-sum popcounts
-  replace unrolled chain (O(1) per level). 3-level CIG with root linear
-  scan + fused cuTile 3-level chain. Configurable bit-widths. See
+  hierarchical traversal. See `test_cutile_cross_leaf.py`,
+  `bench_cutile_cross_leaf.py`.
+- **`masked` layout + compressed CIG** (v8): done. Bitmask-compressed
+  nodes with popcount access. See `test_masked.py`.
+- **Masked codegen** (v9): done. The 4-line masked CIG DSL expression
+  compiles to a cuTile kernel. `MaskedNode` emission, masked-Gather
+  idiom detection (u64 popcount chain). See `dsl_to_cutile.py`.
+- **3-level CIG** (v10): done. Prefix-sum popcounts (O(1) per level).
+  3-level CIG with root linear scan + fused cuTile chain. See
   `test_cig3.py`, `test_cutile_cig3_e2e.py`.
-- **Fused root + abs prefix + CSE** (v11): done. Find primitive fuses root
-  into cuTile. Absolute prefix sums eliminate offset gathers. Hamming
-  weight constants CSE'd. 3-level CIG within 6-20% of NanoVDB at 25-30x
-  less memory. See `bench_cig3_vs_fvdb.py`.
+- **Fused root + abs prefix + CSE** (v11): done. Find primitive fuses
+  root into cuTile. Absolute prefix sums. 3-level CIG within 22-24%
+  of NanoVDB query speed at 20-30x less memory. See
+  `bench_cig3_vs_fvdb.py`.
+
+**Latest benchmark** (50K queries, [0, 4096)^3, RTX PRO 6000 Blackwell):
+
+| Voxels | CIG3 (us) | fVDB (us) | CIG3/fVDB | CIG3 memory |
+|--------|-----------|-----------|-----------|-------------|
+| 1,000  | 134       | 102       | 0.77x     | 0.03x fVDB  |
+| 10,000 | 131       | 103       | 0.78x     | 0.03x fVDB  |
+| 50,000 | 136       | 107       | 0.78x     | 0.04x fVDB  |
+| 200,000| 143       | 108       | 0.76x     | 0.05x fVDB  |
+
+### Completed since v11
+
+**Multi-step compilation (barrier-based pipeline).**  The pipeline
+planner (`dsl_pipeline.py`) partitions programs into `cutile`
+(kernel-fusible) and `collective` (torch GPU barrier) segments.  The
+executor dispatches: collective segments to `torch.sort` /
+`torch.unique` / `torch.nonzero`; cutile segments to compiled cuTile
+`@ct.kernel` launches (when `device="cuda"`).  AST rewriting promotes
+inter-segment references to kernel inputs automatically.  The hooks
+mechanism on `EvalEnv` makes the dispatch pluggable.
+
+**conv_grid.**  First multi-step pipeline application.  Computes unique
+output coordinates for sparse convolution topology: broadcast expansion
+of active coords by kernel offsets, stride filtering, then Sort + Unique
+dedup via the pipeline executor.  Correctness verified against numpy
+reference at multiple scales.
 
 ### Recommended next steps
 
-**1. Close the query performance gap (6-20% vs NanoVDB).**  The 3-level
-CIG is within 6-20% of NanoVDB.  Sources of the remaining gap:
+**1. Next fVDB operations.**  Broaden from `ijk_to_index` and
+`conv_grid` to other `GridBatch` operations:
+
+- `neighbor_indexes(ijk, extent)`: given query coords + extent, return
+  neighbor voxel indices.  The cross-leaf neighbor pattern from v5/v6 is
+  already demonstrated in the DSL; this is a formalisation for the
+  3-level CIG.
+- `dilated_grid(dilation)`: structurally similar to conv_grid but simpler
+  (fixed extent).
+- `sample_trilinear(points, voxel_data)`: interpolation at continuous
+  coordinates.  Requires world-to-voxel transform, 8-corner Gather for
+  trilinear weights, weighted sum.
+- `inject_from` / `inject_to`: map data between grids with different
+  topologies.  Uses `ijk_to_index` on both grids -- largely a
+  composition of existing primitives.
+
+**2. Close the query performance gap (22-24% vs NanoVDB).**  The 3-level
+CIG is within 22-24% of NanoVDB at 20-30x less memory.  Sources of the
+remaining gap:
 
 - Software Hamming weight (4 bit-manipulation steps per popcount) vs
   NanoVDB's `__popcll()` (single PTX instruction).  Investigate whether
@@ -1226,61 +1255,15 @@ CIG is within 6-20% of NanoVDB.  Sources of the remaining gap:
 - The `Find` scan for R=1 emits a comparison + conditional select that
   could be strength-reduced to a constant `upper_idx = 0` when R is
   known to be 1 at emit time.
-- Three data-dependent masked-Gather blocks in sequence.  Each block is
-  already O(1) (2 gathers + 1 popcount), but the chain is serial.
-  Investigate whether cuTile/TileIR interleaves the arithmetic across
-  blocks (memory latency hiding).
-
-**2. Next fVDB operations.**  Broaden from `ijk_to_index` to other
-`GridBatch` operations to test composability:
-
-- `neighbor_indexes(ijk, extent)`: given query coords + extent, return
-  neighbor voxel indices.  The cross-leaf neighbor pattern from v5/v6 is
-  already demonstrated in the DSL; this is a formalisation for the
-  3-level CIG.
-- `conv_grid(kernel_size, stride)`: topology expansion.  Requires
-  multi-step compilation: expand active voxels by kernel offsets -> sort
-  -> unique -> build output CIG.  This is the first use of the
-  barrier-based pipeline architecture (see Multi-Step Compilation above).
-- `dilated_grid(dilation)`: structurally similar to conv_grid but simpler
-  (fixed extent).
-- `sample_trilinear(points, voxel_data)`: interpolation at continuous
-  coordinates.  Requires world-to-voxel transform, 8-corner Gather for
-  trilinear weights, weighted sum.  The Gather + arithmetic pattern
-  exists; the new elements are the coordinate transform and the
-  reduction over corners.
-- `inject_from` / `inject_to`: map data between grids with different
-  topologies.  Uses `ijk_to_index` on both grids -- largely a
-  composition of existing primitives.
 
 **3. Batch dimension.**  fVDB's `GridBatch` wraps multiple grids.
-`ijk_to_index` takes `JaggedTensor` (per-grid jagged coordinates) and
-returns per-grid jagged indices.  The CIG currently has no batch
-dimension.  Options:
+Can be handled externally (one kernel launch per grid) without framework
+changes.  More advanced options: jagged outer `Each`, or packed
+contiguous storage with per-grid offsets.
 
-- **Simplest first**: one kernel launch per grid.  The caller iterates
-  over grids and calls the CIG3 query for each.  No framework changes.
-- **Jagged outer dimension**: `cut` the query array by batch offsets,
-  then `Each` over grids.  The DSL already has `Each` and `cut`.  The
-  emitter would handle the outer `Each` as a grid-level loop or multiple
-  kernel launches.
-- **Packed batch**: store all grids' CIG3 arrays contiguously with
-  per-grid offsets (like NanoVDB's buffer).  The root `Find` table
-  includes a batch index column.  More complex but avoids per-grid
-  launch overhead.
-
-**4. Multi-step compilation (barrier-based pipeline).**  The pipeline
-planner (`dsl_pipeline.py`) now exists: it partitions programs into
-`cutile` (kernel-fusible) and `collective` (torch GPU barrier) segments,
-with `Sort` and `Unique` as first-class DSL primitives.  Next: implement
-`Where` on GPU as a two-pass pipeline (count cuTile kernel ->
-`torch.cumsum` -> scatter cuTile kernel).  This unlocks variable-length
-output and is the prerequisite for conv_grid and grid construction.
-
-**5. Per-node bounds (half-open intervals).**  Store `[min, max)` per
+**4. Per-node bounds (half-open intervals).**  Store `[min, max)` per
 node.  Derivable from node position and bit-widths, but explicit storage
-enables ray-box intersection without recomputing decomposition.  ~24
-bytes per node.
+enables ray-box intersection without recomputing decomposition.
 
 ### cuTile backend notes
 

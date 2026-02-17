@@ -34,7 +34,9 @@ import numpy as np
 import torch
 
 from .dsl_ast import (
+    EachNode,
     InputNode,
+    MapNode,
     Node,
     OverNode,
     Program,
@@ -123,18 +125,25 @@ _GEN_DIR = os.path.join(os.path.dirname(__file__), "_generated")
 _KERNEL_CACHE: dict[str, object] = {}
 
 
-def _collect_refs(node: Node) -> set[str]:
-    """Collect all RefNode names reachable from a node."""
+def _collect_refs(node: Node, bound: set[str] | None = None) -> set[str]:
+    """Collect all RefNode names reachable from a node, excluding lambda-bound variables."""
+    if bound is None:
+        bound = set()
     refs: set[str] = set()
-    if isinstance(node, RefNode):
+    if isinstance(node, RefNode) and node.name not in bound:
         refs.add(node.name)
+    if isinstance(node, (MapNode, EachNode)):
+        inner_bound = bound | {node.var}
+        refs |= _collect_refs(node.input, bound)
+        refs |= _collect_refs(node.body, inner_bound)
+        return refs
     for child in vars(node).values():
         if isinstance(child, Node):
-            refs |= _collect_refs(child)
+            refs |= _collect_refs(child, bound)
         elif isinstance(child, list):
             for elem in child:
                 if isinstance(elem, Node):
-                    refs |= _collect_refs(elem)
+                    refs |= _collect_refs(elem, bound)
     return refs
 
 
@@ -236,6 +245,70 @@ def _compile_kernel(code: str, kernel_name: str):
     return fn
 
 
+def _node_to_source(node: Node) -> str:
+    """Serialize an AST node to a parseable DSL source string.
+
+    Unlike ``repr()``, this produces strings the DSL parser can consume.
+    The key difference: ``RefNode("v")`` emits ``v``, not ``Ref(v)``.
+    """
+    if isinstance(node, InputNode):
+        return f'Input("{node.name}")'
+    if isinstance(node, RefNode):
+        return node.name
+    from .dsl_ast import ConstNode, AddNode, SubNode, GENode, AndNode, NotNode
+    from .dsl_ast import InBoundsNode, GatherNode, DecomposeNode, FindNode
+    from .dsl_ast import MaskedNode, CutNode, ReshapeNode
+    from .dsl_ast import DivNode, MulNode, CountNode, Morton3dNode
+    from .dsl_ast import OverNode, ScanNode, EachRightNode, EachLeftNode, PriorNode
+    from .dsl_ast import FieldNode
+
+    if isinstance(node, ConstNode):
+        return f"Const({node.value!r})"
+    if isinstance(node, FieldNode):
+        return f"field({_node_to_source(node.expr)}, {node.field_name!r})"
+    if isinstance(node, AddNode):
+        return f"Add({_node_to_source(node.a)}, {_node_to_source(node.b)})"
+    if isinstance(node, SubNode):
+        return f"Sub({_node_to_source(node.a)}, {_node_to_source(node.b)})"
+    if isinstance(node, GENode):
+        return f"GE({_node_to_source(node.a)}, {_node_to_source(node.b)})"
+    if isinstance(node, AndNode):
+        return f"And({_node_to_source(node.a)}, {_node_to_source(node.b)})"
+    if isinstance(node, NotNode):
+        return f"Not({_node_to_source(node.a)})"
+    if isinstance(node, InBoundsNode):
+        return f"InBounds({_node_to_source(node.coord)}, {_node_to_source(node.lo)}, {_node_to_source(node.hi)})"
+    if isinstance(node, MapNode):
+        return f"Map({_node_to_source(node.input)}, {node.var} => {_node_to_source(node.body)})"
+    if isinstance(node, EachNode):
+        return f"Each({_node_to_source(node.input)}, {node.var} => {_node_to_source(node.body)})"
+    if isinstance(node, WhereNode):
+        return f"Where({_node_to_source(node.input)})"
+    if isinstance(node, SortNode):
+        return f"Sort({_node_to_source(node.input)})"
+    if isinstance(node, UniqueNode):
+        return f"Unique({_node_to_source(node.input)})"
+    if isinstance(node, GatherNode):
+        return f"Gather({_node_to_source(node.target)}, {_node_to_source(node.indexer)})"
+    if isinstance(node, DecomposeNode):
+        return f"Decompose({_node_to_source(node.input)}, Const({node.bit_widths!r}))"
+    if isinstance(node, FindNode):
+        return f"Find({_node_to_source(node.table)}, {_node_to_source(node.key)})"
+    if isinstance(node, MaskedNode):
+        return f"masked({_node_to_source(node.mask)}, {_node_to_source(node.abs_prefix)})"
+    if isinstance(node, DivNode):
+        return f"Div({_node_to_source(node.a)}, {_node_to_source(node.b)})"
+    if isinstance(node, MulNode):
+        return f"Mul({_node_to_source(node.a)}, {_node_to_source(node.b)})"
+    if isinstance(node, CountNode):
+        return f"Count({_node_to_source(node.input)})"
+    if isinstance(node, OverNode):
+        return f"Over({node.verb}, {_node_to_source(node.input)})"
+    if isinstance(node, Morton3dNode):
+        return f"Morton3d({_node_to_source(node.input)})"
+    raise TypeError(f"Cannot serialize {type(node).__name__} to DSL source")
+
+
 def _run_cutile_segment(
     segment: PipelineSegment,
     env: EvalEnv,
@@ -274,10 +347,10 @@ def _run_cutile_segment(
 
     last_name = segment.bindings[-1].name
 
-    # Serialize to DSL source
+    # Serialize to parseable DSL source
     lines = []
     for name, node in rewritten_bindings:
-        lines.append(f"{name} = {repr(node)}")
+        lines.append(f"{name} = {_node_to_source(node)}")
     lines.append(last_name)
     source = "\n".join(lines)
 
