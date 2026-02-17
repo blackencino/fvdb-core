@@ -213,100 +213,95 @@ def emit_program(source: str, input_map: dict[str, str], kernel_name: str = "gen
 # ---------------------------------------------------------------------------
 
 
-def _emit_masked_gather_u64(ctx: EmitCtx, masked_val: dict, coord: EmitVal) -> str:
-    """Emit u64 bitmask check + popcount for Gather through a masked layout.
+def _emit_masked_gather_prefix(ctx: EmitCtx, masked_val: dict, coord: EmitVal) -> str:
+    """Emit prefix-sum masked gather: 2 gathers + 1 popcount, any mask size.
 
-    Produces code structurally identical to the hand-written
-    cig_masked_u64_kernel in cig_masked_cutile.py.
+    Uses pre-computed prefix-sum popcounts for O(1) lookup regardless of
+    the number of mask words. Works for 8x8x8 leaf (8 words), 16x16x16
+    lower (64 words), 32x32x32 upper (512 words), or any other shape.
 
     Args:
         ctx: Emitter context.
         masked_val: Masked sentinel dict with keys:
-            mask_arr  -- cuTile param name for (K, 8) i64 mask array
-            leaf_idx  -- emitted variable holding the gathered leaf index
-            base      -- emitted variable holding the gathered base offset
-        coord: Per-axis decomposed coordinate [l0_x, l0_y, l0_z].
+            mask_arr   -- cuTile param name for (K, W) i64 mask array
+            prefix_arr -- cuTile param name for (K, W) i32 prefix-sum array
+            node_idx   -- emitted variable holding the gathered node index
+            base       -- emitted variable holding the gathered base offset
+            bit_width  -- int, bits per axis (3 for 8^3, 4 for 16^3, 5 for 32^3)
+        coord: Per-axis decomposed coordinate [x, y, z].
 
     Returns:
-        Variable name holding the result (i32 voxel index or -1).
+        Variable name holding the result (i32 index or -1).
     """
     if not isinstance(coord, list) or len(coord) != 3:
         raise TypeError(f"Masked gather requires 3D decomposed coord, got {type(coord)}")
 
     mask_arr = masked_val["mask_arr"]
-    leaf_idx = masked_val["leaf_idx"]
+    prefix_arr = masked_val["prefix_arr"]
+    node_idx = masked_val["node_idx"]
     base_var = masked_val["base"]
+    bw = masked_val["bit_width"]
     l0_x, l0_y, l0_z = coord
 
-    ctx.emit("# --- Masked gather: u64 bitmask check + popcount ---")
+    # Flat-index strides depend on the node shape (2^bw per axis)
+    axis_size = 1 << bw
+    stride_y = axis_size
+    stride_x = axis_size * axis_size
 
-    # Flat bit index within the 512-bit leaf mask
+    ctx.emit(f"# --- Masked gather (prefix-sum, {axis_size}^3 node) ---")
+
+    # Flat bit index
     bit_idx = ctx.fresh("bit_idx")
-    ctx.emit(f"{bit_idx} = {l0_x} * 64 + {l0_y} * 8 + {l0_z}")
+    ctx.emit(f"{bit_idx} = {l0_x} * {stride_x} + {l0_y} * {stride_y} + {l0_z}")
 
-    # Which u64 word (0-7) and bit position (0-63)
+    # Word index and bit position (u64 words)
     word_idx = ctx.fresh("word_idx")
-    ctx.emit(f"{word_idx} = ({bit_idx} >> 6) & 7")
+    n_words = (axis_size ** 3) // 64
+    word_mask = n_words - 1
+    ctx.emit(f"{word_idx} = ({bit_idx} >> 6) & {word_mask}")
     bit_pos = ctx.fresh("bit_pos")
     ctx.emit(f"{bit_pos} = ct.astype({bit_idx} & 63, ct.uint64)")
 
-    # Gather the target mask word
+    # Gather the target mask word (1 gather)
     tgt_word = ctx.fresh("tgt_word")
     ctx.emit(
         f"{tgt_word} = ct.astype("
-        f"ct.gather({mask_arr}, ({leaf_idx}, {word_idx}), check_bounds=True, padding_value=0), ct.uint64)"
+        f"ct.gather({mask_arr}, ({node_idx}, {word_idx}), check_bounds=True, padding_value=0), ct.uint64)"
     )
 
-    # Bitmask check: is this voxel active?
+    # Bitmask check: is this position active?
     is_active_u = ctx.fresh("is_active_u")
     is_active = ctx.fresh("is_active")
     ctx.emit(f"{is_active_u} = ({tgt_word} >> {bit_pos}) & ct.uint64(1)")
     ctx.emit(f"{is_active} = ct.astype({is_active_u}, ct.int32)")
 
-    # Partial word: mask out bits >= bit_pos
+    # Gather cumulative popcount from prefix-sum array (1 gather)
+    cum_popc = ctx.fresh("cum_popc")
+    ctx.emit(f"{cum_popc} = ct.gather({prefix_arr}, ({node_idx}, {word_idx}), check_bounds=True, padding_value=0)")
+
+    # Partial word popcount: count bits below bit_pos in the target word
     partial_mask = ctx.fresh("pmask")
     ctx.emit(f"{partial_mask} = {tgt_word} & ((ct.uint64(1) << {bit_pos}) - ct.uint64(1))")
 
-    # u64 Hamming weight constants (emitted once)
+    # Hamming weight of partial word (single u64 popcount)
     ctx.emit("m1_u64 = ct.uint64(0x5555555555555555)")
     ctx.emit("m2_u64 = ct.uint64(0x3333333333333333)")
     ctx.emit("m4_u64 = ct.uint64(0x0F0F0F0F0F0F0F0F)")
     ctx.emit("h01_u64 = ct.uint64(0x0101010101010101)")
+    v1 = ctx.fresh("pc")
+    ctx.emit(f"{v1} = {partial_mask} - (({partial_mask} >> ct.uint64(1)) & m1_u64)")
+    v2 = ctx.fresh("pc")
+    ctx.emit(f"{v2} = ({v1} & m2_u64) + (({v1} >> ct.uint64(2)) & m2_u64)")
+    v3 = ctx.fresh("pc")
+    ctx.emit(f"{v3} = ({v2} + ({v2} >> ct.uint64(4))) & m4_u64")
+    partial_popc = ctx.fresh("pc")
+    ctx.emit(f"{partial_popc} = ct.astype(({v3} * h01_u64) >> ct.uint64(56), ct.int32)")
 
-    def emit_popc64(w_var: str) -> str:
-        """Emit inline u64 Hamming weight, return result variable name."""
-        v1 = ctx.fresh("pc")
-        ctx.emit(f"{v1} = {w_var} - (({w_var} >> ct.uint64(1)) & m1_u64)")
-        v2 = ctx.fresh("pc")
-        ctx.emit(f"{v2} = ({v1} & m2_u64) + (({v1} >> ct.uint64(2)) & m2_u64)")
-        v3 = ctx.fresh("pc")
-        ctx.emit(f"{v3} = ({v2} + ({v2} >> ct.uint64(4))) & m4_u64")
-        result = ctx.fresh("pc")
-        ctx.emit(f"{result} = ct.astype(({v3} * h01_u64) >> ct.uint64(56), ct.int32)")
-        return result
-
-    partial_popc = emit_popc64(partial_mask)
-
-    # Gather and popcount all 8 u64 words, accumulate for words before word_idx
-    terms = []
-    for i in range(8):
-        w = ctx.fresh("mw")
-        ctx.emit(
-            f"{w} = ct.astype("
-            f"ct.gather({mask_arr}, ({leaf_idx}, {i}), check_bounds=True, padding_value=0), ct.uint64)"
-        )
-        p = emit_popc64(w)
-        t = ctx.fresh("pt")
-        ctx.emit(f"{t} = {p} * ({word_idx} > {i})")
-        terms.append(t)
-
-    full_popc = ctx.fresh("full_popc")
-    ctx.emit(f"{full_popc} = " + " + ".join(terms))
-
+    # Total = base + prefix cumulative + partial
     total_popc = ctx.fresh("total_popc")
-    ctx.emit(f"{total_popc} = {full_popc} + {partial_popc}")
+    ctx.emit(f"{total_popc} = {cum_popc} + {partial_popc}")
 
-    # Result: active -> base + popcount, inactive -> -1
+    # Result: active -> base + total, inactive -> -1
     result = ctx.fresh("masked_idx")
     ctx.emit(f"{result} = ({base_var} + {total_popc}) * {is_active} + (-1) * (1 - {is_active})")
 
@@ -441,25 +436,55 @@ def _emit_decomposed(node: Node, ctx: EmitCtx, input_types: dict[str, Type]) -> 
     # Masked layout: deferred computation (no code emitted yet)
     # -----------------------------------------------------------------
     if isinstance(node, MaskedNode):
-        # Pattern-match: masked(Gather(Input("mask_arr"), idx), Gather(Input("offset_arr"), idx))
-        # Extract the underlying array names and the shared leaf index.
+        # Pattern-match: masked(Gather(Input("masks"), idx),
+        #                       Gather(Input("prefix"), idx),
+        #                       Gather(Input("offsets"), idx))
+        # Extract the underlying array names and the shared node index.
         # The actual popcount code is emitted when a GatherNode targets this.
         if not isinstance(node.mask, GatherNode) or not isinstance(node.mask.target, InputNode):
             raise TypeError("masked() mask argument must be Gather(Input(...), idx)")
+        if not isinstance(node.prefix, GatherNode) or not isinstance(node.prefix.target, InputNode):
+            raise TypeError("masked() prefix argument must be Gather(Input(...), idx)")
         if not isinstance(node.offset, GatherNode) or not isinstance(node.offset.target, InputNode):
             raise TypeError("masked() offset argument must be Gather(Input(...), idx)")
 
         mask_arr_name = ctx.input_params[node.mask.target.name]
-        leaf_idx_val = _emit_decomposed(node.mask.indexer, ctx, input_types)
-        leaf_idx_str = leaf_idx_val if isinstance(leaf_idx_val, str) else leaf_idx_val[0]
+        prefix_arr_name = ctx.input_params[node.prefix.target.name]
+        node_idx_val = _emit_decomposed(node.mask.indexer, ctx, input_types)
+        node_idx_str = node_idx_val if isinstance(node_idx_val, str) else node_idx_val[0]
 
         offset_arr_name = ctx.input_params[node.offset.target.name]
 
         # Emit the base offset gather (we need the scalar value at runtime)
         base_var = ctx.fresh("mbase")
-        ctx.emit(f"{base_var} = ct.gather({offset_arr_name}, {leaf_idx_str}, check_bounds=True, padding_value=0)")
+        ctx.emit(f"{base_var} = ct.gather({offset_arr_name}, {node_idx_str}, check_bounds=True, padding_value=0)")
 
-        return {"__masked__": True, "mask_arr": mask_arr_name, "leaf_idx": leaf_idx_str, "base": base_var}
+        # Determine bit_width from the mask array's type (W words -> axis = (W*64)^(1/3))
+        mask_input_name = node.mask.target.name
+        if mask_input_name in input_types:
+            mask_type = input_types[mask_input_name]
+            # mask_type is (*) over (W,) i64 -- extract W from the element shape
+            if isinstance(mask_type.element_type, Type):
+                w_extent = mask_type.element_type.iteration_shape.extents[0]
+                if isinstance(w_extent, Static):
+                    total_bits = w_extent.n * 64
+                    axis_size = round(total_bits ** (1 / 3))
+                    bit_width = axis_size.bit_length() - 1
+                else:
+                    bit_width = 3  # default to leaf
+            else:
+                bit_width = 3
+        else:
+            bit_width = 3
+
+        return {
+            "__masked__": True,
+            "mask_arr": mask_arr_name,
+            "prefix_arr": prefix_arr_name,
+            "node_idx": node_idx_str,
+            "base": base_var,
+            "bit_width": bit_width,
+        }
 
     # -----------------------------------------------------------------
     # Gather -- with masked-target and chain flattening (idiom detection)
@@ -472,7 +497,7 @@ def _emit_decomposed(node: Node, ctx: EmitCtx, input_types: dict[str, Type]) -> 
             val = ctx.lookup(node.target.name)
             if isinstance(val, dict) and val.get("__masked__"):
                 indexer = _emit_decomposed(node.indexer, ctx, input_types)
-                return _emit_masked_gather_u64(ctx, val, indexer)
+                return _emit_masked_gather_prefix(ctx, val, indexer)
 
         # Detect chained gathers: Gather(Gather(source, idx1), idx2).
         # Fuse into a single ct.gather(source, (idx1..., idx2...)).
@@ -538,6 +563,7 @@ def emit_runnable_kernel(
     tile_input: str | None = None,
     tile_input_rank: int = 0,
     tile_size: int = 256,
+    tile_scalar_inputs: list[str] | None = None,
 ) -> tuple[str, int, int]:
     """Emit a complete, compilable @ct.kernel from a DSL program.
 
@@ -583,6 +609,17 @@ def emit_runnable_kernel(
         ctx.input_params[tile_input] = "__decomposed__"
         ctx.locals[tile_input] = tile_axes  # type: ignore[assignment]
         ctx.bindings[tile_input] = tile_axes  # type: ignore[assignment]
+        ctx.emit("")
+
+        # Pre-gather explicitly listed scalar inputs at query_idx.
+        # These are 1D per-query inputs (e.g. upper_idx from torch root lookup)
+        # that should be gathered once at query_idx, not used as raw arrays.
+        for name in (tile_scalar_inputs or []):
+            p = param_map[name]
+            v = ctx.fresh("ti")
+            ctx.emit(f"{v} = ct.gather({p}, {query_idx}, check_bounds=True, padding_value=-1)")
+            ctx.input_params[name] = "__decomposed__"
+            ctx.bindings[name] = v
         ctx.emit("")
 
         # Emit the program body

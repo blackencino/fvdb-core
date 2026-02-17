@@ -167,14 +167,16 @@ class CompressedCIG:
     Physical storage:
       lower:        (16, 16, 16) i32  -- maps lower-level 3D coords to leaf index
       leaf_masks:   (K, 8)       i64  -- 512-bit bitmask per leaf (8 x 64-bit words)
+      leaf_prefix:  (K, 8)       i32  -- cumulative popcount before each word
       leaf_offsets: (K,)         i64  -- base offset per leaf into voxel_data
       voxel_data:   (N_active,)  i32  -- flat contiguous voxel indices
 
-    Per-leaf cost: 72 bytes (vs 2,048 bytes dense, vs NanoVDB's 96 bytes).
+    Per-leaf cost: 100 bytes (64 mask + 32 prefix + 4 offset).
     """
 
     lower: torch.Tensor
     leaf_masks: torch.Tensor
+    leaf_prefix: torch.Tensor
     leaf_offsets: torch.Tensor
     voxel_data: torch.Tensor
     n_active: int
@@ -183,7 +185,7 @@ class CompressedCIG:
     @property
     def num_bytes(self) -> int:
         total = 0
-        for t in [self.lower, self.leaf_masks, self.leaf_offsets, self.voxel_data]:
+        for t in [self.lower, self.leaf_masks, self.leaf_prefix, self.leaf_offsets, self.voxel_data]:
             total += t.nelement() * t.element_size()
         return total
 
@@ -197,6 +199,7 @@ class CompressedCIG:
         return CompressedCIG(
             lower=self.lower.cuda(),
             leaf_masks=self.leaf_masks.cuda(),
+            leaf_prefix=self.leaf_prefix.cuda(),
             leaf_offsets=self.leaf_offsets.cuda(),
             voxel_data=self.voxel_data.cuda(),
             n_active=self.n_active,
@@ -255,12 +258,16 @@ def build_compressed_cig(ijk: torch.Tensor) -> CompressedCIG:
     if K > 1:
         leaf_offsets[1:] = counts[:-1].cumsum(0)
 
+    # Build prefix-sum popcounts per leaf
+    leaf_prefix = _build_prefix_sums(leaf_masks)
+
     # Voxel data: sequential indices [0, N_unique)
     voxel_data = torch.arange(N_unique, dtype=torch.int32, device=device)
 
     return CompressedCIG(
         lower=lower,
         leaf_masks=leaf_masks,
+        leaf_prefix=leaf_prefix,
         leaf_offsets=leaf_offsets,
         voxel_data=voxel_data,
         n_active=int(N_unique),
@@ -280,6 +287,263 @@ def _popcount_i64(x: torch.Tensor) -> torch.Tensor:
     u = (u & m2) + ((u >> 2) & m2)
     u = (u + (u >> 4)) & m4
     return ((u * h01) >> 56).int()
+
+
+def _build_prefix_sums(masks: torch.Tensor) -> torch.Tensor:
+    """Build prefix-sum popcount array from mask words.
+
+    Input:  (K, W) i64  -- W packed u64 words per node
+    Output: (K, W) i32  -- prefix[k, i] = sum(popcount(masks[k, 0..i-1]))
+
+    prefix[k, 0] = 0 always. prefix[k, i] = cumulative popcount of
+    words before word i for node k.
+    """
+    per_word_popc = _popcount_i64(masks)  # (K, W) i32
+    cum = per_word_popc.cumsum(dim=1)  # (K, W) i32
+    # Shift right: prefix[0] = 0, prefix[i] = cum[i-1]
+    prefix = torch.zeros_like(cum)
+    if cum.shape[1] > 1:
+        prefix[:, 1:] = cum[:, :-1]
+    return prefix
+
+
+def _build_masked_level(node_of_child, child_local_flat, n_nodes, n_words, device):
+    """Build bitmasks, prefix sums, and offsets for one masked level.
+
+    Generic across node sizes (8 words for 8^3, 64 for 16^3, 512 for 32^3).
+
+    Args:
+        node_of_child: (M,) i64 -- which node each child belongs to
+        child_local_flat: (M,) i64 -- flat local position within the node
+        n_nodes: int -- number of nodes at this level
+        n_words: int -- number of u64 words per node mask
+        device: torch device
+
+    Returns:
+        masks: (N, W) i64, prefix: (N, W) i32, offsets: (N,) i64
+    """
+    M = node_of_child.shape[0]
+
+    # Sort by (node, flat_local)
+    total_positions = n_words * 64
+    sort_key = node_of_child * total_positions + child_local_flat
+    sort_order = torch.argsort(sort_key)
+    sorted_node = node_of_child[sort_order]
+    sorted_flat = child_local_flat[sort_order]
+
+    # Build bitmasks
+    masks = torch.zeros(n_nodes, n_words, dtype=torch.int64, device=device)
+    for i in range(M):
+        ni = int(sorted_node[i])
+        fl = int(sorted_flat[i])
+        word_idx = fl >> 6
+        bit_pos = fl & 63
+        masks[ni, word_idx] |= 1 << bit_pos
+
+    # Prefix sums
+    prefix = _build_prefix_sums(masks)
+
+    # Offsets: cumulative child counts
+    counts = torch.zeros(n_nodes, dtype=torch.int64, device=device)
+    counts.scatter_add_(0, sorted_node.long(), torch.ones(M, dtype=torch.int64, device=device))
+    offsets = torch.zeros(n_nodes, dtype=torch.int64, device=device)
+    if n_nodes > 1:
+        offsets[1:] = counts[:-1].cumsum(0)
+
+    return masks, prefix, offsets
+
+
+# ---------------------------------------------------------------------------
+# 3-level Compressed CIG: upper (32^3) + lower (16^3) + leaf (8^3)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class CompressedCIG3:
+    """A 3-level CIG with bitmask-compressed nodes at every level.
+
+    Bit-widths [3, 4, 5]:  leaf=8^3, lower=16^3, upper=32^3.
+    Total coordinate range: 2^(3+4+5) = 4096 per axis.
+
+    Root level: variable number of upper nodes, identified by their
+    which_top coordinates. Root lookup is external (torch linear scan).
+    """
+
+    # Root
+    root_coords: torch.Tensor  # (R, 3) i32 -- which_top coords of each upper node
+
+    # Upper nodes (32^3 = 32768 positions per node, 512 u64 words)
+    upper_masks: torch.Tensor  # (U, 512) i64
+    upper_prefix: torch.Tensor  # (U, 512) i32
+    upper_offsets: torch.Tensor  # (U,) i64
+
+    # Lower nodes (16^3 = 4096 positions per node, 64 u64 words)
+    lower_masks: torch.Tensor  # (L, 64) i64
+    lower_prefix: torch.Tensor  # (L, 64) i32
+    lower_offsets: torch.Tensor  # (L,) i64
+
+    # Leaf nodes (8^3 = 512 positions per node, 8 u64 words)
+    leaf_masks: torch.Tensor  # (K, 8) i64
+    leaf_prefix: torch.Tensor  # (K, 8) i32
+    leaf_offsets: torch.Tensor  # (K,) i64
+
+    n_active: int
+    n_leaves: int
+    n_lower: int
+    n_upper: int
+
+    @property
+    def num_bytes(self) -> int:
+        total = 0
+        for t in [
+            self.root_coords,
+            self.upper_masks, self.upper_prefix, self.upper_offsets,
+            self.lower_masks, self.lower_prefix, self.lower_offsets,
+            self.leaf_masks, self.leaf_prefix, self.leaf_offsets,
+        ]:
+            total += t.nelement() * t.element_size()
+        return total
+
+    @property
+    def device(self) -> torch.device:
+        return self.root_coords.device
+
+    def cuda(self) -> "CompressedCIG3":
+        if self.root_coords.is_cuda:
+            return self
+        return CompressedCIG3(
+            root_coords=self.root_coords.cuda(),
+            upper_masks=self.upper_masks.cuda(),
+            upper_prefix=self.upper_prefix.cuda(),
+            upper_offsets=self.upper_offsets.cuda(),
+            lower_masks=self.lower_masks.cuda(),
+            lower_prefix=self.lower_prefix.cuda(),
+            lower_offsets=self.lower_offsets.cuda(),
+            leaf_masks=self.leaf_masks.cuda(),
+            leaf_prefix=self.leaf_prefix.cuda(),
+            leaf_offsets=self.leaf_offsets.cuda(),
+            n_active=self.n_active,
+            n_leaves=self.n_leaves,
+            n_lower=self.n_lower,
+            n_upper=self.n_upper,
+        )
+
+
+def build_compressed_cig3(ijk: torch.Tensor) -> CompressedCIG3:
+    """Build a 3-level bitmask-compressed CIG from voxel coordinates.
+
+    Bit-widths [3, 4, 5]:
+      level_0 (leaf-local):  coord & 7              (3 bits)
+      level_1 (lower-local): (coord >> 3) & 15      (4 bits)
+      level_2 (upper-local): (coord >> 7) & 31      (5 bits)
+      which_top:             coord >> 12             (root key)
+
+    Children at every level are contiguous: prefix sums slice perfectly.
+    """
+    assert ijk.ndim == 2 and ijk.shape[1] == 3, f"Expected (N, 3), got {ijk.shape}"
+    device = ijk.device
+
+    # Decompose coordinates at bit-widths [3, 4, 5]
+    leaf_local = ijk & 7  # (N, 3) -- 3 bits
+    lower_local = (ijk >> 3) & 15  # (N, 3) -- 4 bits
+    upper_local = (ijk >> 7) & 31  # (N, 3) -- 5 bits
+    which_top = ijk >> 12  # (N, 3) -- remaining bits
+
+    # Deduplicate voxels
+    all_parts = torch.cat([which_top, upper_local, lower_local, leaf_local], dim=1)  # (N, 12)
+    unique_parts, _ = torch.unique(all_parts, dim=0, return_inverse=True)
+    wt = unique_parts[:, :3]
+    ul = unique_parts[:, 3:6]
+    ll = unique_parts[:, 6:9]
+    fl = unique_parts[:, 9:]
+    N_voxels = unique_parts.shape[0]
+
+    # --- Upper nodes: unique which_top values ---
+    unique_wt, wt_inverse = torch.unique(wt, dim=0, return_inverse=True)
+    U = unique_wt.shape[0]
+    root_coords = unique_wt.int()
+
+    # --- Lower nodes: unique (which_top, upper_local) pairs ---
+    wt_ul = torch.cat([wt, ul], dim=1)  # (N_voxels, 6)
+    unique_wt_ul, wt_ul_inverse = torch.unique(wt_ul, dim=0, return_inverse=True)
+    L = unique_wt_ul.shape[0]
+
+    # Which upper node does each lower node belong to?
+    lower_wt = unique_wt_ul[:, :3]
+    lower_ul = unique_wt_ul[:, 3:]
+    _, lower_to_upper = torch.unique(lower_wt, dim=0, return_inverse=True)
+
+    # Flat local position of each lower node within its upper node (32^3)
+    lower_flat_in_upper = lower_ul[:, 0] * 1024 + lower_ul[:, 1] * 32 + lower_ul[:, 2]
+
+    upper_masks, upper_prefix, upper_offsets = _build_masked_level(
+        lower_to_upper, lower_flat_in_upper, U, 512, device
+    )
+
+    # --- Leaf nodes: unique (which_top, upper_local, lower_local) triples ---
+    wt_ul_ll = torch.cat([wt, ul, ll], dim=1)  # (N_voxels, 9)
+    unique_wt_ul_ll, wt_ul_ll_inverse = torch.unique(wt_ul_ll, dim=0, return_inverse=True)
+    K = unique_wt_ul_ll.shape[0]
+
+    # Which lower node does each leaf belong to?
+    leaf_wt_ul = unique_wt_ul_ll[:, :6]
+    leaf_ll = unique_wt_ul_ll[:, 6:]
+    _, leaf_to_lower = torch.unique(leaf_wt_ul, dim=0, return_inverse=True)
+
+    # Flat local position of each leaf within its lower node (16^3)
+    leaf_flat_in_lower = leaf_ll[:, 0] * 256 + leaf_ll[:, 1] * 16 + leaf_ll[:, 2]
+
+    lower_masks, lower_prefix, lower_offsets = _build_masked_level(
+        leaf_to_lower, leaf_flat_in_lower, L, 64, device
+    )
+
+    # --- Voxels: which leaf does each voxel belong to? ---
+    voxel_wt_ul_ll = torch.cat([wt, ul, ll], dim=1)  # (N_voxels, 9)
+    _, voxel_to_leaf = torch.unique(voxel_wt_ul_ll, dim=0, return_inverse=True)
+
+    # Flat local position of each voxel within its leaf (8^3)
+    voxel_flat_in_leaf = fl[:, 0] * 64 + fl[:, 1] * 8 + fl[:, 2]
+
+    leaf_masks, leaf_prefix, leaf_offsets = _build_masked_level(
+        voxel_to_leaf, voxel_flat_in_leaf, K, 8, device
+    )
+
+    return CompressedCIG3(
+        root_coords=root_coords,
+        upper_masks=upper_masks,
+        upper_prefix=upper_prefix,
+        upper_offsets=upper_offsets,
+        lower_masks=lower_masks,
+        lower_prefix=lower_prefix,
+        lower_offsets=lower_offsets,
+        leaf_masks=leaf_masks,
+        leaf_prefix=leaf_prefix,
+        leaf_offsets=leaf_offsets,
+        n_active=int(N_voxels),
+        n_leaves=int(K),
+        n_lower=int(L),
+        n_upper=int(U),
+    )
+
+
+def root_lookup(root_coords: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
+    """Root-level linear scan: find which upper node each query belongs to.
+
+    Args:
+        root_coords: (R, 3) i32 -- which_top coordinates of each upper node
+        query: (N, 3) i32 -- full query coordinates
+
+    Returns:
+        (N,) i32 tensor of upper node indices, -1 for no match.
+    """
+    which_top = query >> 12  # (N, 3) -- extract root-level bits
+    R = root_coords.shape[0]
+    # Vectorized: (N, 1, 3) == (1, R, 3) -> (N, R) all-match -> argmax
+    match = (which_top.unsqueeze(1) == root_coords.unsqueeze(0)).all(dim=2)  # (N, R) bool
+    any_match = match.any(dim=1)  # (N,) bool
+    upper_idx = match.int().argmax(dim=1).int()  # (N,) i32
+    upper_idx[~any_match] = -1
+    return upper_idx
 
 
 def compressed_cig_ijk_to_index(cig: CompressedCIG, query: torch.Tensor) -> torch.Tensor:

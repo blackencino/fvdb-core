@@ -379,7 +379,7 @@ class Parser:
             raise SyntaxError(f"reshape expects list shape, got {shape_node}")
 
         if name == "masked":
-            return MaskedNode(_expr(args[0]), _expr(args[1]))
+            return MaskedNode(_expr(args[0]), _expr(args[1]), _expr(args[2]))
 
         # -- Adverbs --
 

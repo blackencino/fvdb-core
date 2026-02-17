@@ -816,6 +816,73 @@ specifying the implementation (how to compute it). The algorithm is
 portable, analyzable, and type-checked; the kernel is fast, fused, and
 hardware-specific. The emitter is the bridge.
 
+### v10: 3-Level CIG -- Structural Parity with NanoVDB Index Tree
+
+Extends the CIG from 2 levels to 3, achieving structural parity with
+NanoVDB's leaf/lower/upper hierarchy.  Bit-widths `[3, 4, 5]` give
+8^3 leaves, 16^3 lower nodes, 32^3 upper nodes, covering 4096^3 per
+axis.  A root level with variable upper nodes and a torch linear-scan
+lookup completes the tree.
+
+1. **Prefix-sum masked layout**: the `masked` layout gains a third
+   argument (prefix-sum popcounts) replacing the v8/v9 unrolled popcount
+   chain.  Query cost is now O(1) regardless of mask size: one gather
+   from the prefix array, one gather from the mask, one partial popcount.
+   The emitter produces ~20 lines per masked level instead of ~70.
+   Works for any node shape (8^3, 16^3, 32^3, or any other).
+
+2. **CompressedCIG3** (`cig.py`): 3-level data structure with per-level
+   masks, prefix sums, and offsets.  `build_compressed_cig3(ijk)` builds
+   from voxel coordinates.  `_build_masked_level` is generic across node
+   sizes.  `root_lookup(root_coords, query)` provides the torch-side
+   linear scan for the root level.
+
+3. **Two-step pipeline**: torch resolves the root (linear scan of
+   `root_coords`), then a single fused cuTile kernel handles the 3-level
+   masked chain.  The torch barrier is between the root lookup and the
+   cuTile kernel; the entire upper -> lower -> leaf -> voxel chain is
+   fused.
+
+4. **DSL expression** for 3-level `ijk_to_index`:
+
+   ```
+   parts = Decompose(query, [3, 4, 5])
+   upper = masked(Gather(upper_masks, upper_idx), Gather(upper_prefix, upper_idx), Gather(upper_offsets, upper_idx))
+   lower_idx = Gather(upper, field(parts, "level_2"))
+   lower = masked(Gather(lower_masks, lower_idx), Gather(lower_prefix, lower_idx), Gather(lower_offsets, lower_idx))
+   leaf_idx = Gather(lower, field(parts, "level_1"))
+   leaf = masked(Gather(leaf_masks, leaf_idx), Gather(leaf_prefix, leaf_idx), Gather(leaf_offsets, leaf_idx))
+   voxel_idx = Gather(leaf, field(parts, "level_0"))
+   ```
+
+   Nine lines.  Three masked levels, each using the same prefix-sum
+   Gather pattern.  The bit-widths `[3, 4, 5]` are parameters, not
+   hard-coded -- changing them (e.g. four layers of 8^3 with
+   `[3, 3, 3, 3]`) requires only a different `Decompose` and one more
+   masked level in the chain.
+
+5. **Generated kernel**: 104 lines of cuTile, with three masked-gather
+   blocks (32^3, 16^3, 8^3).  Verified against numpy reference for both
+   single-upper and multi-upper grids.
+
+**Key findings:**
+
+- The prefix-sum approach scales to any node shape without changing the
+  emitter.  The old unrolled approach was O(W) gathers per level (W=8
+  for leaves); the new approach is O(1) per level via 2 gathers + 1
+  popcount.
+- The 3-level chain composes cleanly: the DSL is a repetition of the
+  same `masked(Gather, Gather, Gather)` + `Gather(masked, field)`
+  pattern.  Adding a fourth level is one more copy of the pattern.
+- The root lookup lives outside the cuTile kernel (torch step) by
+  design.  This avoids introducing a search primitive into the DSL while
+  keeping the heavy computation (3 levels of masked Gather) fully fused.
+- The `[3, 4, 5]` configuration matches NanoVDB exactly.  But the
+  framework does not hard-code it: `[3, 3, 3, 3]` (four 8^3 layers),
+  `[4, 4, 4]` (three 16^3 layers), or any other stacking is equally
+  valid.  This generality over level configurations is a structural
+  advantage over NanoVDB's fixed tree.
+
 ---
 
 ## Working Theory
@@ -964,6 +1031,8 @@ File inventory:
 | `cig_masked_cutile.py` | v8: cuTile kernels with bitmask + popcount (i32 reference + u64 primary) |
 | `test_masked.py` | v8: masked layout DSL tests |
 | `test_cutile_masked_e2e.py` | v9: end-to-end DSL -> cuTile codegen for masked CIG ijk_to_index |
+| `test_cig3.py` | v10: 3-level CIG builder, root lookup, numpy reference tests |
+| `test_cutile_cig3_e2e.py` | v10: end-to-end 3-level CIG DSL -> cuTile codegen + GPU verify |
 | `run_all_tests.py` | Single entry point for non-GPU tests |
 
 ### Current state
@@ -1040,6 +1109,16 @@ Key semantic rules:
 25. Tile-parallel emission: `emit_runnable_kernel` generalised to handle
     flat query parallelism (`query_idx = bid * TILE + arange`) alongside
     the existing batch+Map pattern. The masked CIG uses tile-parallel.
+26. Prefix-sum masked layout: `masked` extended to 3 args (mask, prefix,
+    offset). Query cost O(1) per level via 2 gathers + 1 popcount,
+    regardless of mask width. Replaces the O(W) unrolled chain.
+27. 3-level CIG: upper (32^3) + lower (16^3) + leaf (8^3) with
+    bit-widths [3, 4, 5]. Root linear scan via torch, 3-level masked
+    chain fused in a single 104-line cuTile kernel. Verified against
+    numpy reference for single-upper and multi-upper grids.
+28. Configurable level stacking: the `[3, 4, 5]` bit-widths are
+    parameters, not hard-coded. Any stacking (e.g. `[3, 3, 3, 3]`)
+    works with the same masked Gather pattern.
 
 ### Completed milestones (previously "next steps")
 
@@ -1070,17 +1149,18 @@ Key semantic rules:
   `MaskedNode` emission, masked-Gather idiom detection (u64 popcount chain),
   and tile-parallel `emit_runnable_kernel`. u64 is the primary path; i32
   retained as reference. See `test_cutile_masked_e2e.py`, `dsl_to_cutile.py`.
+- **3-level CIG + prefix-sum masked** (v10): done. Prefix-sum popcounts
+  replace unrolled chain (O(1) per level). 3-level CIG with root linear
+  scan + fused cuTile 3-level chain. Configurable bit-widths. See
+  `test_cig3.py`, `test_cutile_cig3_e2e.py`.
 
 ### Recommended next steps
 
-**1. Third CIG level (upper, 32x32x32).** Bit-widths `[3, 4, 5]` = 12
-bits = 4096 voxels per axis. The Decompose + chained Gather pattern
-already generalises to N levels (proven in v2). The `masked` layout
-applies at all levels. This is the structural gap that limits the current
-CIG to 128^3 grids -- real fVDB workloads need thousands of voxels per
-axis. Adding one more Gather step in the chain (and one more `masked`
-level for the upper nodes) is straightforward; the benchmark harness and
-fVDB comparison infrastructure already exist.
+**1. Head-to-head benchmark: 3-level CIG vs fVDB.** The 3-level CIG is
+structurally complete; it needs benchmarking at scale against fVDB's
+`ijk_to_index` with the same coordinates. The benchmark harness from v7/v8
+already exists. Key questions: does the prefix-sum approach maintain the
+1.3x query speed advantage? What is the memory ratio at 3 levels?
 
 **2. Multi-step compilation (barrier-based pipeline).** Implement the
 architecture described in the Multi-Step Compilation section above. Start

@@ -18,14 +18,24 @@ from docs.wip.prototype.ops import Value
 from docs.wip.prototype.types import ScalarType, Shape, Static, Type
 
 
-def _pack_mask(active_positions):
-    """Pack a list of flat positions (0-511) into an (8,) i64 bitmask."""
-    words = np.zeros(8, dtype=np.int64)
+def _pack_mask(active_positions, n_words=8):
+    """Pack a list of flat positions into an (n_words,) i64 bitmask."""
+    words = np.zeros(n_words, dtype=np.int64)
     for pos in active_positions:
         word_idx = pos >> 6
         bit_pos = pos & 63
         words[word_idx] |= np.int64(1) << np.int64(bit_pos)
     return words
+
+
+def _build_prefix(words):
+    """Build prefix-sum popcount array from mask words."""
+    prefix = np.zeros(len(words), dtype=np.int32)
+    cum = 0
+    for i in range(len(words)):
+        prefix[i] = cum
+        cum += bin(int(words[i]) & 0xFFFFFFFFFFFFFFFF).count("1")
+    return prefix
 
 
 def _popcount_before(words, flat_idx):
@@ -46,7 +56,7 @@ def _popcount_before(words, flat_idx):
 
 
 MASKED_GATHER_PROGRAM = """
-leaf = masked(Input("leaf_mask"), Input("leaf_offset"))
+leaf = masked(Input("leaf_mask"), Input("leaf_prefix"), Input("leaf_offset"))
 idx = Gather(leaf, Input("coord"))
 idx
 """
@@ -57,9 +67,11 @@ def test_masked_gather_active():
     # Create a leaf with specific active positions
     active_positions = [0, 1, 5, 64, 65, 100, 200, 300, 400, 511]
     mask = _pack_mask(active_positions)
+    prefix = _build_prefix(mask)
     base_offset = np.int64(1000)
 
     mask_val = Value(Type(Shape(Static(8)), ScalarType.I64), mask)
+    prefix_val = Value(Type(Shape(Static(8)), ScalarType.I32), prefix)
     offset_val = Value(Type(Shape(), ScalarType.I64), base_offset)
 
     # Query position 100: flat_idx = ?
@@ -69,6 +81,7 @@ def test_masked_gather_active():
 
     _, result = run(MASKED_GATHER_PROGRAM, {
         "leaf_mask": mask_val,
+        "leaf_prefix": prefix_val,
         "leaf_offset": offset_val,
         "coord": coord_val,
     })
@@ -86,9 +99,11 @@ def test_masked_gather_inactive():
     """Gather from a masked layout at an inactive position returns -1."""
     active_positions = [0, 100, 511]
     mask = _pack_mask(active_positions)
+    prefix = _build_prefix(mask)
     base_offset = np.int64(0)
 
     mask_val = Value(Type(Shape(Static(8)), ScalarType.I64), mask)
+    prefix_val = Value(Type(Shape(Static(8)), ScalarType.I32), prefix)
     offset_val = Value(Type(Shape(), ScalarType.I64), base_offset)
 
     # Query position 50: x=0, y=6, z=2 (50 = 0*64 + 6*8 + 2) -- NOT active
@@ -97,6 +112,7 @@ def test_masked_gather_inactive():
 
     _, result = run(MASKED_GATHER_PROGRAM, {
         "leaf_mask": mask_val,
+        "leaf_prefix": prefix_val,
         "leaf_offset": offset_val,
         "coord": coord_val,
     })
@@ -113,7 +129,7 @@ def test_masked_gather_inactive():
 MASKED_CIG_PROGRAM = """
 parts = Decompose(Input("query"), Const([3, 4]))
 leaf_idx = Gather(Input("lower"), field(parts, "level_1"))
-leaf = masked(Gather(Input("leaf_masks"), leaf_idx), Gather(Input("leaf_offsets"), leaf_idx))
+leaf = masked(Gather(Input("leaf_masks"), leaf_idx), Gather(Input("leaf_prefix"), leaf_idx), Gather(Input("leaf_offsets"), leaf_idx))
 voxel_idx = Gather(leaf, field(parts, "level_0"))
 voxel_idx
 """
@@ -129,12 +145,15 @@ def test_masked_cig_chain():
     # Leaf 0: active at local positions (0,0,0), (1,2,3), (7,7,7)
     leaf0_positions = [0 * 64 + 0 * 8 + 0, 1 * 64 + 2 * 8 + 3, 7 * 64 + 7 * 8 + 7]
     mask0 = _pack_mask(leaf0_positions)
+    prefix0 = _build_prefix(mask0)
 
     # Leaf 1: active at local positions (0,0,0), (0,0,1)
     leaf1_positions = [0, 1]
     mask1 = _pack_mask(leaf1_positions)
+    prefix1 = _build_prefix(mask1)
 
     leaf_masks = np.stack([mask0, mask1])  # (2, 8) i64
+    leaf_prefix = np.stack([prefix0, prefix1])  # (2, 8) i32
     leaf_offsets = np.array([0, 3], dtype=np.int64)  # leaf 0 starts at 0, leaf 1 at 3
 
     # Type declarations
@@ -145,6 +164,10 @@ def test_masked_cig_chain():
     masks_val = Value(
         Type(Shape(Static(2)), Type(Shape(Static(8)), ScalarType.I64)),
         leaf_masks,
+    )
+    prefix_val = Value(
+        Type(Shape(Static(2)), Type(Shape(Static(8)), ScalarType.I32)),
+        leaf_prefix,
     )
     offsets_val = Value(
         Type(Shape(Static(2)), ScalarType.I64),
@@ -160,6 +183,7 @@ def test_masked_cig_chain():
         "query": query_val,
         "lower": lower_val,
         "leaf_masks": masks_val,
+        "leaf_prefix": prefix_val,
         "leaf_offsets": offsets_val,
     })
 
@@ -177,6 +201,7 @@ def test_masked_cig_chain():
         "query": query_val2,
         "lower": lower_val,
         "leaf_masks": masks_val,
+        "leaf_prefix": prefix_val,
         "leaf_offsets": offsets_val,
     })
 
@@ -194,6 +219,7 @@ def test_masked_cig_chain():
         "query": query_val3,
         "lower": lower_val,
         "leaf_masks": masks_val,
+        "leaf_prefix": prefix_val,
         "leaf_offsets": offsets_val,
     })
 
@@ -208,6 +234,7 @@ def test_masked_cig_chain():
         "query": query_val4,
         "lower": lower_val,
         "leaf_masks": masks_val,
+        "leaf_prefix": prefix_val,
         "leaf_offsets": offsets_val,
     })
 

@@ -60,7 +60,7 @@ def _compile_kernel(code: str, kernel_name: str):
 MASKED_CIG_PROGRAM = """
 parts = Decompose(Input("query"), Const([3, 4]))
 leaf_idx = Gather(Input("lower"), field(parts, "level_1"))
-leaf = masked(Gather(Input("leaf_masks"), leaf_idx), Gather(Input("leaf_offsets"), leaf_idx))
+leaf = masked(Gather(Input("leaf_masks"), leaf_idx), Gather(Input("leaf_prefix"), leaf_idx), Gather(Input("leaf_offsets"), leaf_idx))
 voxel_idx = Gather(leaf, field(parts, "level_0"))
 voxel_idx
 """
@@ -69,6 +69,7 @@ INPUT_TYPES = {
     "query": Type(Shape(Dynamic()), Type(Shape(Static(3)), ScalarType.I32)),
     "lower": Type(Shape(Static(16), Static(16), Static(16)), ScalarType.I32),
     "leaf_masks": Type(Shape(Dynamic()), Type(Shape(Static(8)), ScalarType.I64)),
+    "leaf_prefix": Type(Shape(Dynamic()), Type(Shape(Static(8)), ScalarType.I32)),
     "leaf_offsets": Type(Shape(Dynamic()), ScalarType.I32),
 }
 
@@ -168,13 +169,16 @@ def test_generated_vs_handwritten():
         queries_cuda, ccig_cuda.lower, ccig_cuda.leaf_masks, ccig_cuda.leaf_offsets.int()
     )
 
-    # --- Generated kernel ---
+    # --- Generated kernel (prefix-sum version) ---
     result_t = torch.full((n_blocks * TILE,), -1, dtype=torch.int32, device="cuda")
     ct.launch(
         torch.cuda.current_stream(),
         (n_blocks,),
         kernel_fn,
-        (queries_cuda, ccig_cuda.lower, ccig_cuda.leaf_masks, ccig_cuda.leaf_offsets.int(), result_t, TILE),
+        (
+            queries_cuda, ccig_cuda.lower, ccig_cuda.leaf_masks,
+            ccig_cuda.leaf_prefix.int(), ccig_cuda.leaf_offsets.int(), result_t, TILE,
+        ),
     )
     gen_result = result_t[:N]
 
@@ -224,13 +228,17 @@ def test_generated_vs_numpy_eval():
         torch.cuda.current_stream(),
         (n_blocks,),
         kernel_fn,
-        (queries_cuda, ccig_cuda.lower, ccig_cuda.leaf_masks, ccig_cuda.leaf_offsets.int(), result_t, TILE),
+        (
+            queries_cuda, ccig_cuda.lower, ccig_cuda.leaf_masks,
+            ccig_cuda.leaf_prefix.int(), ccig_cuda.leaf_offsets.int(), result_t, TILE,
+        ),
     )
     gpu_result = result_t[:N].cpu().numpy()
 
     # --- Numpy DSL evaluator (per-query) ---
     lower_np = ccig.lower.cpu().numpy()
     masks_np = ccig.leaf_masks.cpu().numpy()
+    prefix_np = ccig.leaf_prefix.cpu().numpy()
     offsets_np = ccig.leaf_offsets.cpu().numpy()
     queries_np = queries.numpy()
 
@@ -243,11 +251,18 @@ def test_generated_vs_numpy_eval():
             Type(Shape(Static(ccig.n_leaves)), Type(Shape(Static(8)), ScalarType.I64)),
             masks_np,
         )
+        prefix_val = Value(
+            Type(Shape(Static(ccig.n_leaves)), Type(Shape(Static(8)), ScalarType.I32)),
+            prefix_np,
+        )
         offsets_val = Value(Type(Shape(Static(ccig.n_leaves)), ScalarType.I64), offsets_np)
 
         _, result = dsl_run(
             MASKED_CIG_PROGRAM,
-            {"query": query_val, "lower": lower_val, "leaf_masks": masks_val, "leaf_offsets": offsets_val},
+            {
+                "query": query_val, "lower": lower_val,
+                "leaf_masks": masks_val, "leaf_prefix": prefix_val, "leaf_offsets": offsets_val,
+            },
         )
         dsl_result[i] = int(result.data)
 

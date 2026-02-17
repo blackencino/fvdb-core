@@ -58,44 +58,62 @@ from .types import Dynamic, Jagged, ScalarType, Shape, Static, Type, coord_type
 
 
 class MaskedValue:
-    """Runtime representation of a masked layout: bitmask + base offset."""
+    """Runtime representation of a masked layout: bitmask + prefix popcounts + base offset.
 
-    def __init__(self, mask_data, offset_data):
-        self.mask_data = mask_data  # numpy array (8,) i64 -- packed 512-bit mask
-        self.offset_data = offset_data  # numpy scalar i64 -- base offset
+    Works for any mask size: 8 words (leaf 8^3), 64 words (lower 16^3),
+    512 words (upper 32^3), or any other width.
+    """
+
+    def __init__(self, mask_data, prefix_data, offset_data):
+        self.mask_data = mask_data  # numpy array (W,) i64 -- packed u64 mask
+        self.prefix_data = prefix_data  # numpy array (W,) i32 -- cumulative popcounts
+        self.offset_data = offset_data  # numpy scalar -- base offset
 
     def lookup(self, coord):
         """Check bitmask and compute dense index for a 3D coordinate.
 
+        The coordinate's flat index determines the word and bit position.
+        Uses the prefix-sum array for O(1) lookup regardless of mask width.
+
         Args:
-            coord: (3,) i32 array -- leaf-local coordinate
+            coord: (3,) i32 array -- node-local coordinate
 
         Returns:
-            int: base_offset + popcount if active, else -1
+            int: base_offset + prefix[word] + partial_popcount if active, else -1
         """
-        flat_idx = int(coord[0]) * 64 + int(coord[1]) * 8 + int(coord[2])
+        # Guard: if offset is negative, this masked value was constructed from
+        # sentinel data (the parent lookup returned -1). Return -1 immediately.
+        if int(self.offset_data) < 0:
+            return np.int64(-1)
+
+        n_words = len(self.mask_data)
+        bits_per_word = 64
+        total_bits = n_words * bits_per_word
+        # Derive axis size from total bits (cube root)
+        axis_size = round(total_bits ** (1 / 3))
+        flat_idx = int(coord[0]) * axis_size * axis_size + int(coord[1]) * axis_size + int(coord[2])
         word_idx = flat_idx >> 6
         bit_pos = flat_idx & 63
 
-        if word_idx < 0 or word_idx >= len(self.mask_data):
+        if word_idx < 0 or word_idx >= n_words:
             return np.int64(-1)
 
         word = int(self.mask_data[word_idx])
         if not ((word >> bit_pos) & 1):
             return np.int64(-1)
 
-        # Popcount: count set bits before flat_idx
-        total = 0
-        for w in range(word_idx):
-            total += bin(int(self.mask_data[w]) & 0xFFFFFFFFFFFFFFFF).count("1")
+        # Prefix sum gives popcount of all words before word_idx
+        cum = int(self.prefix_data[word_idx])
+        # Partial popcount within the target word
         partial_mask = word & ((1 << bit_pos) - 1)
-        total += bin(partial_mask & 0xFFFFFFFFFFFFFFFF).count("1")
+        partial = bin(partial_mask & 0xFFFFFFFFFFFFFFFF).count("1")
 
-        return np.int64(int(self.offset_data) + total)
+        return np.int64(int(self.offset_data) + cum + partial)
 
     def __repr__(self):
         n_active = sum(bin(int(w) & 0xFFFFFFFFFFFFFFFF).count("1") for w in self.mask_data)
-        return f"MaskedValue(offset={self.offset_data}, active={n_active}/512)"
+        total = len(self.mask_data) * 64
+        return f"MaskedValue(offset={self.offset_data}, active={n_active}/{total})"
 
 # ---------------------------------------------------------------------------
 # Evaluation environment
@@ -321,11 +339,12 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
 
     if isinstance(node, MaskedNode):
         mask_val = eval_node(node.mask, env)
+        prefix_val = eval_node(node.prefix, env)
         offset_val = eval_node(node.offset, env)
         input_types = {k: v.type for k, v in env.inputs.items()}
         type_env = {k: v.type for k, v in {**env.bindings, **env.locals}.items()}
         result_type = node.infer_type(type_env, input_types)
-        return Value(result_type, MaskedValue(mask_val.data, offset_val.data))
+        return Value(result_type, MaskedValue(mask_val.data, prefix_val.data, offset_val.data))
 
     # -- Layout operations --
 
