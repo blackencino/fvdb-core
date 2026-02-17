@@ -18,7 +18,7 @@ import cuda.tile as ct
 
 from fvdb_tile.prototype.cig import build_compressed_cig3
 from fvdb_tile.prototype.dsl_to_cutile import emit_runnable_kernel
-from fvdb_tile.prototype.test_cig3 import cig3_ijk_to_index_numpy
+from fvdb_tile.tests.test_cig3 import cig3_ijk_to_index_numpy
 from fvdb_tile.prototype.types import Dynamic, ScalarType, Shape, Static, Type
 
 _GEN_DIR = os.path.join(os.path.dirname(__file__), "_generated")

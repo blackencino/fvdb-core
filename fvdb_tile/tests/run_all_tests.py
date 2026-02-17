@@ -32,7 +32,7 @@ def main():
     print("=" * 60)
     print("v0: Single leaf -- Map, Where, Gather, Each")
     print("=" * 60)
-    from fvdb_tile.prototype.test_where import (
+    from fvdb_tile.tests.test_where import (
         test_map_preserves_shape,
         test_where_type,
         test_where_data,
@@ -48,7 +48,7 @@ def main():
     _run("full_pipeline", test_full_pipeline)
 
     print()
-    from fvdb_tile.prototype.test_neighbors import (
+    from fvdb_tile.tests.test_neighbors import (
         test_neighbor_types,
         test_neighbor_data,
         test_jagged_type_emerges,
@@ -62,7 +62,7 @@ def main():
     print("=" * 60)
     print("v1: Multiple leaves, Indexed, Struct + Flip")
     print("=" * 60)
-    from fvdb_tile.prototype.test_indexed_flip import (
+    from fvdb_tile.tests.test_indexed_flip import (
         test_multi_leaf_cut,
         test_multi_leaf_where,
         test_indexed_type_then_gather,
@@ -80,7 +80,7 @@ def main():
     print("=" * 60)
     print("v2: Two-level grid -- Decompose, chained Gather, morton")
     print("=" * 60)
-    from fvdb_tile.prototype.test_two_level import (
+    from fvdb_tile.tests.test_two_level import (
         test_3d_chain_single_coord,
         test_3d_chain_batch,
         test_morton_chain_batch,
@@ -96,7 +96,7 @@ def main():
     print("=" * 60)
     print("v3: Micro DSL -- string -> parse -> type-check -> execute")
     print("=" * 60)
-    from fvdb_tile.prototype.test_dsl import (
+    from fvdb_tile.tests.test_dsl import (
         test_where_program,
         test_neighbor_program,
         test_chain_program,
@@ -106,7 +106,7 @@ def main():
     _run("dsl_chain_program", test_chain_program)
 
     print()
-    from fvdb_tile.prototype.test_sort_unique import (
+    from fvdb_tile.tests.test_sort_unique import (
         test_sort_unique_coords_correctness_and_types,
         test_sort_unique_value_semantics_and_referential_transparency,
         test_unique_idempotence_law,
@@ -118,7 +118,7 @@ def main():
     _run("dsl_sort_multiset_preservation", test_sort_preserves_multiset)
 
     print()
-    from fvdb_tile.prototype.test_pipeline import (
+    from fvdb_tile.tests.test_pipeline import (
         test_pipeline_partitions_collectives,
         test_pipeline_marks_nested_barrier,
         test_pipeline_executable_matches_direct_run,
@@ -134,7 +134,7 @@ def main():
     print("=" * 60)
     print("Mesh: Triangle mesh -- layouts over tensors, scheduling")
     print("=" * 60)
-    from fvdb_tile.prototype.test_mesh import (
+    from fvdb_tile.tests.test_mesh import (
         test_mesh_types,
         test_mesh_centroids,
         test_mesh_dsl,
@@ -148,7 +148,7 @@ def main():
     print("=" * 60)
     print("v5: Cross-leaf neighbors -- Decompose + chained Gather (DSL)")
     print("=" * 60)
-    from fvdb_tile.prototype.test_cross_leaf import (
+    from fvdb_tile.tests.test_cross_leaf import (
         test_single_coord_cross_leaf,
         test_cross_boundary_neighbor,
         test_batch_cross_leaf,

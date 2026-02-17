@@ -15,7 +15,7 @@ import torch
 
 import cuda.tile as ct
 
-from fvdb_tile.prototype.test_cutile_gather import (
+from fvdb_tile.tests.test_cutile_gather import (
     FACE_OFFSETS,
     TILE_OFFSETS,
     neighbor_predicate_kernel,

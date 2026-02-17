@@ -9,7 +9,7 @@ Run all tests:
 
 ```
 source ~/.venvs/fvdb_cutile/bin/activate   # for GPU/cuTile tests
-python fvdb_tile/prototype/run_all_tests.py
+python fvdb_tile/tests/run_all_tests.py
 ```
 
 ## Semantic contract
