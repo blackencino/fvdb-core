@@ -1287,6 +1287,42 @@ class ShiftLeafMaskNode(Node):
 
 
 @dataclass(frozen=True)
+class DilateLeafMasksNode(Node):
+    """Fused leaf-mask dilation: shift + hash probe + atomicOr accumulate.
+
+    System-level primitive for the 8x8x8 leaf bitmask.  For each
+    (leaf, voxel_offset) pair, shifts the leaf mask with boundary
+    decomposition, probes the hash map for the target leaf slot, and
+    atomically OR's the shifted bits into an output mask buffer.
+
+    This is a typed DSL primitive, not an escape hatch.  The 8x8x8 leaf
+    representation is a core concept with (8, 8, 8) shaping over an i64
+    base tensor (8 words of 64 bits).
+
+    Barrier: the operation performs cross-thread atomic writes.
+    GPU backend: dispatched to the hand-fused conv_grid_dilate_kernel
+    via NVRTC (last-resort CUDA path, justified by atomics).
+    CPU backend: sequential shift + hash_map_scatter_reduce.
+    """
+
+    leaf_masks: Node       # (L, 8) i64 -- input leaf occupancy masks
+    leaf_coords: Node      # (L, 3) i32 -- leaf coords in leaf space
+    offsets: Node          # (K, 3) i32 -- voxel-space kernel offsets
+    hash_map_keys: Node    # (S,) i64 -- pre-built hash map key array
+    storage_size: Node     # scalar i64 -- hash map storage size
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        # Returns (S, 8) i64 -- accumulated output masks in hash map order.
+        return Type(Shape(Dynamic()), Type(Shape(Static(8)), ScalarType.I64))
+
+    def __repr__(self) -> str:
+        return (
+            f"DilateLeafMasks({self.leaf_masks}, {self.leaf_coords}, "
+            f"{self.offsets}, {self.hash_map_keys}, {self.storage_size})"
+        )
+
+
+@dataclass(frozen=True)
 class MaskToCoordsNode(Node):
     """Extract voxel coordinates from (L, 8) i64 leaf masks.
 

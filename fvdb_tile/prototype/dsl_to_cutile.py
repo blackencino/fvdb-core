@@ -26,6 +26,7 @@ from .dsl_ast import (
     CountNode,
     DecomposeNode,
     DivNode,
+    EachNode,
     FieldNode,
     FindNode,
     GatherNode,
@@ -42,6 +43,7 @@ from .dsl_ast import (
     MulNode,
     Node,
     NotNode,
+    OverNode,
     Program,
     RefNode,
     ShiftLeftNode,
@@ -575,6 +577,47 @@ def _emit_decomposed(node: Node, ctx: EmitCtx, input_types: dict[str, Type]) -> 
         result = _emit_decomposed(node.body, ctx, input_types)
         ctx.locals = old_locals
         return result
+
+    if isinstance(node, EachNode):
+        input_val = _emit_decomposed(node.input, ctx, input_types)
+        old_locals = ctx.locals.copy()
+        ctx.emit(f"# Each: {node.var} => ...")
+        ctx.locals[node.var] = input_val
+        result = _emit_decomposed(node.body, ctx, input_types)
+        ctx.locals = old_locals
+        return result
+
+    # -----------------------------------------------------------------
+    # OverNode: inline reduction for small static-extent inputs
+    # -----------------------------------------------------------------
+    if isinstance(node, OverNode):
+        input_val = _emit_decomposed(node.input, ctx, input_types)
+        verb = node.verb
+        _VERB_OPS = {"Add": "+", "Mul": "*", "Or": "|"}
+        _VERB_FUNCS = {"Max": "ct.maximum", "Min": "ct.minimum"}
+        ctx.emit(f"# Over({verb})")
+        if isinstance(input_val, list):
+            if verb in _VERB_OPS:
+                op = _VERB_OPS[verb]
+                acc = input_val[0]
+                for v in input_val[1:]:
+                    new_acc = ctx.fresh("ov")
+                    ctx.emit(f"{new_acc} = {acc} {op} {v}")
+                    acc = new_acc
+                return acc
+            elif verb in _VERB_FUNCS:
+                fn = _VERB_FUNCS[verb]
+                acc = input_val[0]
+                for v in input_val[1:]:
+                    new_acc = ctx.fresh("ov")
+                    ctx.emit(f"{new_acc} = {fn}({acc}, {v})")
+                    acc = new_acc
+                return acc
+        raise TypeError(
+            f"Over({verb}) in cuTile emitter requires decomposed (list) input; "
+            f"got {type(input_val).__name__}. Standalone reductions over dynamic "
+            f"extents should be a collective (torch) segment, not cuTile."
+        )
 
     # -----------------------------------------------------------------
     # MulNode: axis-decomposed multiplication

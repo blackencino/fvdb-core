@@ -38,6 +38,7 @@ from .dsl_ast import (
     FuseNode,
     GatherNode,
     GENode,
+    DilateLeafMasksNode,
     HashMapBuildNode,
     HashMapLookupNode,
     HierarchicalKeyDecodeNode,
@@ -81,6 +82,8 @@ from .ops import (
     hash_map_build,
     hash_map_lookup,
     hash_map_scatter_reduce,
+    hierarchical_key,
+    hierarchical_key_decode,
     mask_to_coords,
     morton3d,
     shift_leaf_masks,
@@ -444,8 +447,6 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
 
     if isinstance(node, HierarchicalKeyNode):
         coord_val = eval_node(node.input, env)
-        from .ops import hierarchical_key
-
         result = hierarchical_key(coord_val.data, node.bit_widths)
         input_types = {k: v.type for k, v in env.inputs.items()}
         type_env = {k: v.type for k, v in {**env.bindings, **env.locals}.items()}
@@ -454,8 +455,6 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
 
     if isinstance(node, HierarchicalKeyDecodeNode):
         key_val = eval_node(node.input, env)
-        from .ops import hierarchical_key_decode
-
         result = hierarchical_key_decode(key_val.data, node.bit_widths)
         input_types = {k: v.type for k, v in env.inputs.items()}
         type_env = {k: v.type for k, v in {**env.bindings, **env.locals}.items()}
@@ -748,6 +747,37 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
             Type(Shape(Dynamic()), Type(Shape(Static(8)), ScalarType.I64)),
             result_list,
         )
+
+    if isinstance(node, DilateLeafMasksNode):
+        leaf_masks_val = eval_node(node.leaf_masks, env)
+        leaf_coords_val = eval_node(node.leaf_coords, env)
+        offsets_val = eval_node(node.offsets, env)
+        hash_map_keys_val = eval_node(node.hash_map_keys, env)
+        storage_size_val = eval_node(node.storage_size, env)
+        lm = leaf_masks_val.data
+        lc = leaf_coords_val.data
+        offs = offsets_val.data
+        ka = hash_map_keys_val.data
+        ss_data = storage_size_val.data
+        ss = int(ss_data.item()) if isinstance(ss_data, torch.Tensor) else int(ss_data)
+        output_masks = torch.zeros(ss, 8, dtype=torch.int64, device=lm.device)
+        # CPU reference: loop over offsets, shift masks, scatter-reduce with OR.
+        # This is the CPU-only reference path; GPU dispatches via hook to the
+        # fused CUDA kernel (no CPU inner loops in the GPU path).
+        for oi in range(offs.shape[0]):
+            ox, oy, oz = int(offs[oi, 0]), int(offs[oi, 1]), int(offs[oi, 2])
+            pairs = shift_leaf_masks(lm, ox, oy, oz)
+            for shifted_mask, (dx, dy, dz) in pairs:
+                delta = torch.tensor([[dx, dy, dz]], dtype=torch.int32, device=lc.device)
+                target_lc = lc + delta
+                keys = hierarchical_key(target_lc, [4, 5])
+                slots = hash_map_lookup(ka, keys)
+                for li in range(lm.shape[0]):
+                    slot = int(slots[li].item())
+                    if slot >= 0:
+                        output_masks[slot] |= shifted_mask[li]
+        result_type = Type(Shape(Dynamic()), Type(Shape(Static(8)), ScalarType.I64))
+        return Value(result_type, output_masks)
 
     if isinstance(node, MaskToCoordsNode):
         masks_val = eval_node(node.masks, env)

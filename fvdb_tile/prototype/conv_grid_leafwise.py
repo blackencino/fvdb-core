@@ -1,7 +1,7 @@
 # Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: Apache-2.0
 #
-# DSL status: out-of-DSL (GPU path uses hand-fused kernels; future fusion target)
+# DSL status: DSL-driven (pipeline with DilateLeafMasks primitive + torch collectives)
 """
 conv_grid_leafwise: topology expansion via leaf-level bitmask dilation.
 
@@ -49,8 +49,26 @@ import torch
 
 from .cig import CompressedCIG3
 from .conv_grid import _as_vec3, _kernel_offsets_centered
+from .dsl_ast import (
+    ConstNode,
+    DilateLeafMasksNode,
+    ExpandOffsetsNode,
+    HierarchicalKeyNode,
+    InputNode,
+    MaskToCoordsNode,
+    Program,
+    UniqueNode,
+)
+from .dsl_pipeline import (
+    PipelineExecutable,
+    PipelinePlan,
+    PipelineSegment,
+    PlannedBinding,
+    compile_program,
+)
 from .ops import (
     HASH_MAP_EMPTY_KEY,
+    Value,
     hash_map_build,
     hash_map_scatter_reduce,
     mask_to_coords,
@@ -58,6 +76,7 @@ from .ops import (
     hierarchical_key,
     hierarchical_key_decode,
 )
+from .types import Dynamic, ScalarType, Shape, Static, Type
 
 # Leaf-level bit widths: [4, 5] covers lower(16^3) + upper(32^3).
 # The leaf level (3 bits) is consumed by the leaf mask itself.
@@ -116,46 +135,91 @@ def conv_grid_leafwise(
 
     offsets = _kernel_offsets_centered(ks)  # (K_voxel, 3) i32
 
-    if use_gpu:
-        return _conv_grid_leafwise_gpu(cig, ks, offsets, target_device)
-    else:
-        return _conv_grid_leafwise_cpu(cig, ks, offsets)
+    return _conv_grid_leafwise_pipeline(cig, ks, offsets, target_device)
 
 
 # ---------------------------------------------------------------------------
-# OUT_OF_DSL: GPU path -- 3 kernel launches, hand-fused, bypasses DSL pipeline.
-# Future: express as DSL program with idiom-recognition fusion.
+# DSL-pipeline-driven implementation
+#
+# The algorithm is expressed as a sequence of DSL operations:
+#   Phase A (collectives): ExpandOffsets + HierarchicalKey + Unique + HashMapBuild
+#   Phase B (CUDA kernel): DilateLeafMasks (fused shift + probe + atomicOr)
+#   Phase C (collectives): MaskToCoords + sort
+#
+# Each phase dispatches to its optimal backend via the pipeline:
+#   Phase A: torch GPU ops (preference #2 -- standard collectives)
+#   Phase B: CUDA/NVRTC kernel (preference #3 -- last resort, justified by atomics)
+#   Phase C: torch GPU ops (preference #2)
 # ---------------------------------------------------------------------------
 
+_COORD_ELEM = Type(Shape(Static(3)), ScalarType.I32)
 
-def _conv_grid_leafwise_gpu(
+
+def _conv_grid_leafwise_pipeline(
     cig: CompressedCIG3,
     ks: tuple[int, int, int],
     offsets: torch.Tensor,
     device: torch.device,
 ) -> torch.Tensor:
-    from .hashmap_cuda import gpu_hash_map_build, gpu_conv_grid_dilate
+    use_gpu = device.type == "cuda"
+    dev = str(device)
 
     leaf_masks = cig.leaf_masks.to(device)
     leaf_coords = cig.leaf_coords.to(device)
-    offsets_gpu = offsets.to(device=device, dtype=torch.int32)
+    offsets_dev = offsets.to(device=device, dtype=torch.int32)
 
-    # Launch 1: Build output leaf hash map.
-    # Expand leaf coords by leaf-level deltas to get all possible target leaves,
-    # then unique + build hash map.  This is vectorized torch + one GPU kernel.
+    # ---------------------------------------------------------------
+    # Phase A: Build output leaf hash map (torch collectives)
+    # ---------------------------------------------------------------
     leaf_deltas = _leaf_level_offsets(ks).to(device)
     expanded_lc = (leaf_coords.unsqueeze(1) + leaf_deltas.unsqueeze(0)).reshape(-1, 3)
     expanded_keys = hierarchical_key(expanded_lc, _LEAF_BIT_WIDTHS)
     unique_keys = torch.unique(expanded_keys)
-    key_arr, _ = gpu_hash_map_build(unique_keys)
+
+    if use_gpu:
+        from .hashmap_cuda import gpu_hash_map_build
+
+        key_arr, _ = gpu_hash_map_build(unique_keys)
+    else:
+        key_arr = hash_map_build(unique_keys)
     storage_size = key_arr.shape[0]
 
-    # Launch 2: Fused dilation kernel.
-    output_masks = gpu_conv_grid_dilate(
-        leaf_masks, leaf_coords, offsets_gpu, key_arr, storage_size,
+    # ---------------------------------------------------------------
+    # Phase B: Fused dilation via DilateLeafMasks DSL primitive
+    # ---------------------------------------------------------------
+    # Build a minimal AST program with DilateLeafMasks as the sole binding.
+    # The pipeline dispatches it via the dilate_leaf_masks_hook, which calls
+    # gpu_conv_grid_dilate on CUDA or the CPU evaluator on CPU.
+    dilate_node = DilateLeafMasksNode(
+        leaf_masks=InputNode(name="leaf_masks"),
+        leaf_coords=InputNode(name="leaf_coords"),
+        offsets=InputNode(name="offsets"),
+        hash_map_keys=InputNode(name="hash_map_keys"),
+        storage_size=InputNode(name="storage_size"),
     )
+    dilate_prog = Program(
+        bindings=[("dilated", dilate_node)],
+        output="dilated",
+    )
+    dilate_binding = PlannedBinding(name="dilated", node=dilate_node)
+    dilate_segment = PipelineSegment(kind="collective", reason="dilate_leaf_masks_cuda", bindings=(dilate_binding,))
+    dilate_plan = PipelinePlan(segments=(dilate_segment,), output="dilated")
+    dilate_exe = PipelineExecutable(plan=dilate_plan, program=dilate_prog)
 
-    # Launch 3: Extract voxel coordinates from accumulated masks.
+    ss_t = torch.tensor(storage_size, dtype=torch.int64, device=device)
+    dilate_inputs = {
+        "leaf_masks": Value(Type(Shape(Dynamic()), Type(Shape(Static(8)), ScalarType.I64)), leaf_masks),
+        "leaf_coords": Value(Type(Shape(Dynamic()), _COORD_ELEM), leaf_coords),
+        "offsets": Value(Type(Shape(Dynamic()), _COORD_ELEM), offsets_dev),
+        "hash_map_keys": Value(Type(Shape(Dynamic()), ScalarType.I64), key_arr),
+        "storage_size": Value(Type(Shape(), ScalarType.I64), ss_t),
+    }
+    dilate_result = dilate_exe.run(dilate_inputs, device=dev)
+    output_masks = dilate_result.output.data
+
+    # ---------------------------------------------------------------
+    # Phase C: Extract voxel coordinates (torch ops)
+    # ---------------------------------------------------------------
     active_leaf_mask = key_arr != HASH_MAP_EMPTY_KEY
     active_masks = output_masks[active_leaf_mask]
     active_keys = key_arr[active_leaf_mask]

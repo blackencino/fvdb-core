@@ -33,8 +33,11 @@ from dataclasses import dataclass
 import torch
 
 from .dsl_ast import (
+    AdverbApplyNode,
     AllNode,
+    ApplyNode,
     BitXorNode,
+    DilateLeafMasksNode,
     EachNode,
     EqNode,
     ExpandOffsetsNode,
@@ -54,6 +57,7 @@ from .dsl_ast import (
     ShiftRightNode,
     SortNode,
     UniqueNode,
+    VerbRefNode,
     WhereNode,
 )
 from .dsl_eval import EvalEnv, eval_node
@@ -115,6 +119,8 @@ class PipelineExecutable:
         for segment in self.plan.segments:
             if segment.kind == "cutile" and device == "cuda":
                 _run_cutile_segment(segment, env, input_types, all_types, device)
+            elif segment.kind == "cuda" and device == "cuda":
+                _run_cuda_segment(segment, env, input_types, all_types, device)
             else:
                 for binding in segment.bindings:
                     env.bindings[binding.name] = eval_node(binding.node, env)
@@ -384,6 +390,12 @@ def _node_to_source(node: Node) -> str:
         return f"HashMapBuild({_node_to_source(node.keys)})"
     if isinstance(node, HashMapLookupNode):
         return f"HashMapLookup({_node_to_source(node.key_arr)}, {_node_to_source(node.queries)})"
+    if isinstance(node, DilateLeafMasksNode):
+        return (
+            f"DilateLeafMasks({_node_to_source(node.leaf_masks)}, "
+            f"{_node_to_source(node.leaf_coords)}, {_node_to_source(node.offsets)}, "
+            f"{_node_to_source(node.hash_map_keys)}, {_node_to_source(node.storage_size)})"
+        )
     raise TypeError(f"Cannot serialize {type(node).__name__} to DSL source")
 
 
@@ -488,6 +500,109 @@ def _run_cutile_segment(
     if result_type is None:
         result_type = Type(Shape(Dynamic()), ScalarType.I32)
     env.bindings[last_name] = Value(result_type, result_trimmed)
+
+    for binding in segment.bindings[:-1]:
+        if binding.name not in env.bindings:
+            env.bindings[binding.name] = eval_node(binding.node, env)
+
+
+def _run_cuda_segment(
+    segment: PipelineSegment,
+    env: EvalEnv,
+    original_input_types: dict[str, Type],
+    all_types: dict[str, Type],
+    device: str,
+):
+    """Compile a CUDA segment to a CUDA C++ kernel, launch it, store result.
+
+    Last-resort backend for operations requiring atomics or control flow that
+    cuTile cannot express.  Preference order: cuTile > torch > CUDA.
+    """
+    from .cuda_launch import compile_and_get_function, launch_kernel
+    from .dsl_to_cuda import emit_cuda_kernel, _BLOCK_SIZE
+
+    external_names = _segment_external_refs(segment)
+
+    segment_input_types: dict[str, Type] = {}
+    for name in external_names:
+        if name in original_input_types:
+            segment_input_types[name] = original_input_types[name]
+        elif name in all_types:
+            segment_input_types[name] = all_types[name]
+        elif name in env.bindings:
+            segment_input_types[name] = env.bindings[name].type
+        else:
+            raise TypeError(f"Cannot resolve type for external ref {name!r}")
+
+    for binding in segment.bindings:
+        for name in _collect_input_names(binding.node):
+            if name not in segment_input_types and name in original_input_types:
+                segment_input_types[name] = original_input_types[name]
+
+    rewritten_bindings = []
+    for binding in segment.bindings:
+        new_node = _rewrite_refs_to_inputs(binding.node, external_names)
+        rewritten_bindings.append((binding.name, new_node))
+
+    last_name = segment.bindings[-1].name
+
+    lines = []
+    for name, node in rewritten_bindings:
+        lines.append(f"{name} = {_node_to_source(node)}")
+    lines.append(last_name)
+    source = "\n".join(lines)
+
+    tile_input, tile_input_rank = _determine_tile_input(segment_input_types)
+
+    import hashlib
+
+    seg_hash = hashlib.md5(source.encode()).hexdigest()[:8]
+    kernel_name = f"cuda_seg_{last_name}_{seg_hash}"
+
+    code = emit_cuda_kernel(
+        source,
+        segment_input_types,
+        kernel_name=kernel_name,
+        tile_input=tile_input,
+        tile_input_rank=tile_input_rank,
+    )
+
+    func = compile_and_get_function(code, kernel_name)
+
+    torch_device = torch.device(device)
+    input_tensors = {}
+    tile_N = 0
+    for name, ty in segment_input_types.items():
+        if name in env.inputs:
+            data = env.inputs[name].data
+        elif name in env.bindings:
+            data = env.bindings[name].data
+        else:
+            raise TypeError(f"No data for input {name!r}")
+        if isinstance(data, torch.Tensor):
+            t = data.to(torch_device)
+        else:
+            t = torch.as_tensor(data).to(torch_device)
+        input_tensors[name] = t
+        if name == tile_input:
+            tile_N = t.shape[0]
+
+    result_t = torch.full((tile_N,), -1, dtype=torch.int32, device=torch_device)
+
+    launch_args = []
+    for name in segment_input_types:
+        launch_args.append(input_tensors[name])
+    launch_args.append(result_t)
+    launch_args.append(tile_N)
+
+    grid = (max(1, (tile_N + _BLOCK_SIZE - 1) // _BLOCK_SIZE),)
+    block = (_BLOCK_SIZE,)
+    launch_kernel(func, grid, block, launch_args)
+
+    result_type = all_types.get(last_name)
+    if result_type is None:
+        result_type = Type(Shape(Dynamic()), ScalarType.I32)
+    env.bindings[last_name] = Value(result_type, result_t)
 
     for binding in segment.bindings[:-1]:
         if binding.name not in env.bindings:
@@ -621,10 +736,72 @@ def _make_collective_hooks(device: str) -> dict:
             slots = hash_map_lookup(key_arr_data, queries_data)
             return Value(result_type, slots)
 
+    # Adverb-to-GPU-pattern mapping for Over (torch collectives, preference #2).
+    # Each verb maps to a torch reduction op.  For verbs not listed here,
+    # Over falls through to the evaluator (CPU).
+    #
+    # Mapping table (see also the CUDA emitter for last-resort atomics):
+    #   Over(Add)  -> torch.sum     | ct.sum (cuTile)    | atomicAdd (CUDA)
+    #   Over(Mul)  -> torch.prod    | (not available)    | (not available)
+    #   Over(Max)  -> torch.amax    | ct.maximum (cuTile)| atomicMax (CUDA)
+    #   Over(Min)  -> torch.amin    | ct.minimum (cuTile)| (not available)
+    #   Over(Or)   -> bitwise_or    | (not available)    | atomicOr (CUDA)
+    #   Scan(Add)  -> torch.cumsum  | (not available)    | CUB prefix sum
+    _OVER_TORCH_OPS = {
+        "Add": lambda t, d: torch.sum(t, dim=0).to(d),
+        "Mul": lambda t, d: torch.prod(t, dim=0).to(d),
+        "Max": lambda t, d: (t.amax(dim=0) if t.ndim > 1 else t.max()).to(d),
+        "Min": lambda t, d: (t.amin(dim=0) if t.ndim > 1 else t.min()).to(d),
+        "Or": lambda t, d: _reduce_bitwise_or(t).to(d),
+    }
+
+    def _reduce_bitwise_or(t: torch.Tensor) -> torch.Tensor:
+        acc = t[0]
+        for i in range(1, t.shape[0]):
+            acc = torch.bitwise_or(acc, t[i])
+        return acc
+
+    def over_hook(node, env):
+        input_val = eval_node(node.input, EvalEnv(env.inputs, env.bindings))
+        data = input_val.data
+        if not isinstance(data, torch.Tensor):
+            raise TypeError(f"Over requires tensor data, got {type(data)}")
+        t = data.to(torch_device)
+        op = _OVER_TORCH_OPS.get(node.verb)
+        if op is None:
+            raise TypeError(f"Over({node.verb}) not supported as GPU collective")
+        result_data = op(t, torch_device)
+        et = input_val.type.element_type
+        result_type = et if isinstance(et, Type) else Type(Shape(), et)
+        return Value(result_type, result_data)
+
+    def dilate_leaf_masks_hook(node, env):
+        leaf_masks_val = eval_node(node.leaf_masks, EvalEnv(env.inputs, env.bindings))
+        leaf_coords_val = eval_node(node.leaf_coords, EvalEnv(env.inputs, env.bindings))
+        offsets_val = eval_node(node.offsets, EvalEnv(env.inputs, env.bindings))
+        hash_map_keys_val = eval_node(node.hash_map_keys, EvalEnv(env.inputs, env.bindings))
+        storage_size_val = eval_node(node.storage_size, EvalEnv(env.inputs, env.bindings))
+        ss_data = storage_size_val.data
+        ss = int(ss_data.item()) if isinstance(ss_data, torch.Tensor) else int(ss_data)
+        result_type = Type(Shape(Dynamic()), Type(Shape(Static(8)), ScalarType.I64))
+        if torch_device.type != "cpu":
+            from .hashmap_cuda import gpu_conv_grid_dilate
+
+            lm = leaf_masks_val.data.to(torch_device)
+            lc = leaf_coords_val.data.to(torch_device)
+            offs = offsets_val.data.to(device=torch_device, dtype=torch.int32)
+            ka = hash_map_keys_val.data.to(torch_device)
+            output_masks = gpu_conv_grid_dilate(lm, lc, offs, ka, ss)
+            return Value(result_type, output_masks)
+        else:
+            return eval_node(node, EvalEnv(env.inputs, env.bindings))
+
     return {
         WhereNode: where_hook,
         SortNode: sort_hook,
         UniqueNode: unique_hook,
+        OverNode: over_hook,
+        DilateLeafMasksNode: dilate_leaf_masks_hook,
         HashMapBuildNode: hashmap_build_hook,
         HashMapLookupNode: hashmap_lookup_hook,
     }
@@ -638,19 +815,33 @@ def _make_collective_hooks(device: str) -> dict:
 _BARRIER_NODE_TYPES = (
     WhereNode, SortNode, UniqueNode, OverNode,
     HashMapBuildNode, HashMapLookupNode,
+    DilateLeafMasksNode,
     ShiftLeafMaskNode, MaskToCoordsNode,
 )
 
+# Barrier types that can be emitted inline when nested inside a Map/Each body
+# (they operate on per-element tile-sized data, not global collectives).
+_CUTILE_EMITTABLE_IN_BODY = (OverNode,)
+
 
 def _contains_barrier(node: Node) -> bool:
+    return _check_barriers(node, in_map_body=False)
+
+
+def _check_barriers(node: Node, in_map_body: bool) -> bool:
     if isinstance(node, _BARRIER_NODE_TYPES):
-        return True
-    for child in vars(node).values():
-        if isinstance(child, Node) and _contains_barrier(child):
+        if in_map_body and isinstance(node, _CUTILE_EMITTABLE_IN_BODY):
+            pass  # safe for cuTile: tile-level reduction inside per-element body
+        else:
             return True
-        if isinstance(child, list):
+    for name, child in vars(node).items():
+        child_in_body = in_map_body or (isinstance(node, (MapNode, EachNode)) and name == "body")
+        if isinstance(child, Node):
+            if _check_barriers(child, child_in_body):
+                return True
+        elif isinstance(child, list):
             for elem in child:
-                if isinstance(elem, Node) and _contains_barrier(elem):
+                if isinstance(elem, Node) and _check_barriers(elem, child_in_body):
                     return True
     return False
 
@@ -668,11 +859,64 @@ def _barrier_reason(node: Node) -> str:
         return "hashmap_build_collective"
     if isinstance(node, HashMapLookupNode):
         return "hashmap_lookup_collective"
+    if isinstance(node, DilateLeafMasksNode):
+        return "dilate_leaf_masks_cuda"
     if isinstance(node, ShiftLeafMaskNode):
         return "shift_leaf_mask_collective"
     if isinstance(node, MaskToCoordsNode):
         return "mask_to_coords_collective"
     return "contains_barrier_subgraph"
+
+
+def _normalize_adverb_node(node: Node) -> Node:
+    """Rewrite Apply(AdverbApply("Over", VerbRef(v)), [input]) -> OverNode(v, input).
+
+    The parser creates the composed form for Over(Add, xs).  The pipeline
+    planner and hooks expect the canonical OverNode.  This normalization
+    bridges the gap so barrier detection and GPU dispatch work correctly.
+    """
+    import dataclasses as _dc
+
+    if (
+        isinstance(node, ApplyNode)
+        and isinstance(node.fn, AdverbApplyNode)
+        and node.fn.adverb == "Over"
+        and isinstance(node.fn.fn, VerbRefNode)
+        and len(node.args) == 1
+    ):
+        return OverNode(verb=node.fn.fn.name, input=_normalize_adverb_node(node.args[0]))
+
+    changes = {}
+    for f in _dc.fields(node):
+        val = getattr(node, f.name)
+        if isinstance(val, Node):
+            new_val = _normalize_adverb_node(val)
+            if new_val is not val:
+                changes[f.name] = new_val
+        elif isinstance(val, (list, tuple)):
+            new_list = []
+            changed = False
+            for elem in val:
+                if isinstance(elem, Node):
+                    new_elem = _normalize_adverb_node(elem)
+                    new_list.append(new_elem)
+                    if new_elem is not elem:
+                        changed = True
+                else:
+                    new_list.append(elem)
+            if changed:
+                changes[f.name] = type(val)(new_list)
+    if changes:
+        return _dc.replace(node, **changes)
+    return node
+
+
+def _normalize_adverbs(program: Program) -> Program:
+    """Normalize adverb patterns in a program before planning."""
+    new_bindings = []
+    for name, node in program.bindings:
+        new_bindings.append((name, _normalize_adverb_node(node)))
+    return Program(bindings=tuple(new_bindings), output=program.output)
 
 
 def plan_program(program: Program) -> PipelinePlan:
@@ -709,13 +953,14 @@ def plan_program(program: Program) -> PipelinePlan:
 
 
 def plan_source(source: str) -> PipelinePlan:
-    return plan_program(parse(source))
+    return plan_program(_normalize_adverbs(parse(source)))
 
 
 def compile_program(program: Program, dialects=None) -> PipelineExecutable:
     if dialects:
         from .dsl_lower import lower_program
         program = lower_program(program, dialects)
+    program = _normalize_adverbs(program)
     return PipelineExecutable(plan=plan_program(program), program=program)
 
 
