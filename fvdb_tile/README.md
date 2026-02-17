@@ -1080,9 +1080,8 @@ File inventory:
 | `tests/test_cutile_cig3_e2e.py` | v10/v11: 3-level CIG DSL -> cuTile codegen (fused Find) |
 | `benchmarks/bench_cig3_vs_fvdb.py` | v11: 3-level CIG vs fVDB head-to-head |
 | `benchmarks/bench_cutile_cross_leaf.py` | v6: cross-leaf scale benchmark |
-| `bench_cig3_vs_fvdb.py` | v11: 3-level CIG vs fVDB head-to-head benchmark |
-| `verify_memory.py` | v11: detailed byte-level memory comparison CIG3 vs fVDB |
-| `run_all_tests.py` | Single entry point for non-GPU tests |
+| `prototype/verify_memory.py` | v11: detailed byte-level memory comparison CIG3 vs fVDB |
+| `tests/run_all_tests.py` | Single entry point for non-GPU tests |
 
 ### Current state
 

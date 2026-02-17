@@ -15,7 +15,7 @@ GPU tests (require `source ~/.venvs/fvdb_cutile/bin/activate`):
   v4  -- test_cutile_smoke.py
   v5  -- test_cutile_e2e.py
   v6  -- test_cutile_cross_leaf.py
-  v8+ -- test_cutile_masked_e2e.py, test_cutile_cig3_e2e.py
+  v8+ -- test_cutile_cig3_e2e.py
 """
 
 import sys
