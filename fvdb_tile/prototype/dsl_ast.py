@@ -507,6 +507,52 @@ class MortonDecode3dNode(Node):
         return f"MortonDecode3d({self.input})"
 
 
+@dataclass(frozen=True)
+class HierarchicalKeyNode(Node):
+    """CIG-compatible hierarchical sort key from coordinates + bit_widths.
+
+    Concatenates per-level row-major linear indices (outermost=MSB,
+    innermost=LSB).  Matches the CIG builder's tree-traversal order.
+
+    (3,) i32 -> () i64, or (*,) / (3,) i32 -> (*,) i64.
+    """
+
+    input: Node
+    bit_widths: list[int]
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        input_ty = self.input.infer_type(env, inputs)
+        if isinstance(input_ty.element_type, Type):
+            return Type(input_ty.iteration_shape, ScalarType.I64)
+        return Type(Shape(), ScalarType.I64)
+
+    def __repr__(self) -> str:
+        return f"HierarchicalKey({self.input}, {self.bit_widths})"
+
+
+@dataclass(frozen=True)
+class HierarchicalKeyDecodeNode(Node):
+    """Decode a hierarchical sort key back to 3D coordinates.
+
+    Inverse of HierarchicalKey.
+
+    () i64 -> (3,) i32, or (*,) i64 -> (*,) / (3,) i32.
+    """
+
+    input: Node
+    bit_widths: list[int]
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        input_ty = self.input.infer_type(env, inputs)
+        coord_elem = Type(Shape(Static(3)), ScalarType.I32)
+        if input_ty.rank > 0:
+            return Type(input_ty.iteration_shape, coord_elem)
+        return coord_elem
+
+    def __repr__(self) -> str:
+        return f"HierarchicalKeyDecode({self.input}, {self.bit_widths})"
+
+
 # ---------------------------------------------------------------------------
 # Layout operations
 # ---------------------------------------------------------------------------

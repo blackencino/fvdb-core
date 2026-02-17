@@ -18,11 +18,10 @@ from __future__ import annotations
 
 import time
 
-import numpy as np
 import torch
 
 from fvdb_tile.prototype.conv_grid import conv_grid
-from fvdb_tile.prototype.ops import morton3d_signed
+from fvdb_tile.prototype.ops import hierarchical_key
 
 try:
     import fvdb
@@ -75,17 +74,17 @@ def _time_cpu_fn(fn, warmup=1, repeats=5):
 # ---------------------------------------------------------------------------
 
 
-def _generate_sparse_coords(n_voxels: int, extent: int = 256, seed: int = 42) -> np.ndarray:
+def _generate_sparse_coords(n_voxels: int, extent: int = 256, seed: int = 42) -> torch.Tensor:
     """Generate *n_voxels* unique random coordinates in [0, extent)^3."""
-    rng = np.random.RandomState(seed)
+    gen = torch.Generator().manual_seed(seed)
     coords_set: set[tuple[int, int, int]] = set()
     while len(coords_set) < n_voxels:
-        batch = rng.randint(0, extent, (n_voxels * 2, 3))
+        batch = torch.randint(0, extent, (n_voxels * 2, 3), generator=gen)
         for row in batch:
             coords_set.add((int(row[0]), int(row[1]), int(row[2])))
             if len(coords_set) >= n_voxels:
                 break
-    arr = np.array(sorted(coords_set)[:n_voxels], dtype=np.int32)
+    arr = torch.tensor(sorted(coords_set)[:n_voxels], dtype=torch.int32)
     return arr
 
 
@@ -94,17 +93,20 @@ def _generate_sparse_coords(n_voxels: int, extent: int = 256, seed: int = 42) ->
 # ---------------------------------------------------------------------------
 
 
-def _assert_same_coord_set(actual_np: np.ndarray, expected_np: np.ndarray, label: str = "") -> bool:
+_BIT_WIDTHS = [3, 4, 5]
+
+
+def _assert_same_coord_set(actual_t: torch.Tensor, expected_t: torch.Tensor, label: str = "") -> bool:
     """Check that two (N, 3) coordinate arrays are the same SET."""
-    if actual_np.shape[0] != expected_np.shape[0]:
-        print(f"  MISMATCH {label}: count {actual_np.shape[0]} vs {expected_np.shape[0]}")
+    if actual_t.shape[0] != expected_t.shape[0]:
+        print(f"  MISMATCH {label}: count {actual_t.shape[0]} vs {expected_t.shape[0]}")
         return False
-    a_codes = morton3d_signed(actual_np)
-    e_codes = morton3d_signed(expected_np)
-    a_sorted = actual_np[np.argsort(a_codes, kind="stable")]
-    e_sorted = expected_np[np.argsort(e_codes, kind="stable")]
-    if not np.array_equal(a_sorted, e_sorted):
-        n_diff = np.sum(np.any(a_sorted != e_sorted, axis=1))
+    a_codes = hierarchical_key(actual_t, _BIT_WIDTHS)
+    e_codes = hierarchical_key(expected_t, _BIT_WIDTHS)
+    a_sorted = actual_t[torch.argsort(a_codes, stable=True)]
+    e_sorted = expected_t[torch.argsort(e_codes, stable=True)]
+    if not torch.equal(a_sorted, e_sorted):
+        n_diff = torch.sum(torch.any(a_sorted != e_sorted, dim=1)).item()
         print(f"  MISMATCH {label}: {n_diff} differing rows")
         return False
     return True
@@ -121,7 +123,7 @@ def bench_one(
     stride: tuple[int, int, int],
 ) -> dict:
     """Benchmark a single (voxels, kernel, stride) configuration."""
-    active_np = _generate_sparse_coords(n_voxels)
+    active_t = _generate_sparse_coords(n_voxels)
     kernel_volume = kernel_size[0] * kernel_size[1] * kernel_size[2]
 
     results: dict = {
@@ -133,27 +135,27 @@ def bench_one(
 
     # --- fvdb_tile path ---
     # Run once to get result + verify
-    tile_result = conv_grid(active_np, kernel_size=kernel_size, stride=stride, device="cpu")
+    tile_result = conv_grid(active_t, kernel_size=kernel_size, stride=stride, device="cpu")
     results["dst_voxels"] = tile_result.shape[0]
 
-    # Time (CPU evaluator path)
+    # Time tile path
     t_tile = _time_cpu_fn(
-        lambda: conv_grid(active_np, kernel_size=kernel_size, stride=stride, device="cpu"),
-        warmup=1,
-        repeats=5,
+        lambda: conv_grid(active_t, kernel_size=kernel_size, stride=stride, device="cpu"),
+        warmup=0,
+        repeats=3,
     )
     results["tile_us"] = t_tile
 
     # --- fVDB path ---
     if HAS_FVDB:
         dev = torch.device("cuda")
-        coords_t = torch.tensor(active_np, dtype=torch.int32, device=dev)
+        coords_t = active_t.to(device=dev, dtype=torch.int32)
         ijks = JaggedTensor(coords_t)
         grid = GridBatch.from_ijk(ijks, device=dev)
 
         # Run once to get result
         dst_grid = grid.conv_grid(kernel_size=kernel_size, stride=stride)
-        fvdb_coords = dst_grid.ijk.jdata.cpu().numpy().astype(np.int32)
+        fvdb_coords = dst_grid.ijk.jdata.cpu().to(torch.int32)
 
         # Verify agreement
         ok = _assert_same_coord_set(tile_result, fvdb_coords, f"n={n_voxels} k={kernel_size} s={stride}")
@@ -188,8 +190,8 @@ def main():
     print("=" * 90)
 
     configs = []
-    sizes = [1_000, 10_000, 50_000, 200_000]
-    kernels = [(3, 3, 3), (3, 5, 7)]
+    sizes = [1_000, 10_000]
+    kernels = [(3, 3, 3)]
     strides = [(1, 1, 1), (2, 2, 2)]
 
     for n in sizes:

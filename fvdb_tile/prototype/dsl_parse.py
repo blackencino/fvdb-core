@@ -46,6 +46,8 @@ from .dsl_ast import (
     Morton3dNode,
     Morton3dSignedNode,
     MortonDecode3dNode,
+    HierarchicalKeyNode,
+    HierarchicalKeyDecodeNode,
     MulNode,
     Node,
     NotNode,
@@ -114,6 +116,8 @@ _BUILTINS = {
     "Morton3d",
     "Morton3dSigned",
     "MortonDecode3d",
+    "HierarchicalKey",
+    "HierarchicalKeyDecode",
     "Find",
     "Input",
     "Const",
@@ -399,6 +403,20 @@ class Parser:
 
         if name == "MortonDecode3d":
             return MortonDecode3dNode(_expr(args[0]))
+
+        if name == "HierarchicalKey":
+            input_node = _expr(args[0])
+            bw_node = _expr(args[1])
+            if isinstance(bw_node, ConstNode) and isinstance(bw_node.value, list):
+                return HierarchicalKeyNode(input_node, bw_node.value)
+            raise SyntaxError(f"HierarchicalKey expects list of bit_widths, got {bw_node}")
+
+        if name == "HierarchicalKeyDecode":
+            input_node = _expr(args[0])
+            bw_node = _expr(args[1])
+            if isinstance(bw_node, ConstNode) and isinstance(bw_node.value, list):
+                return HierarchicalKeyDecodeNode(input_node, bw_node.value)
+            raise SyntaxError(f"HierarchicalKeyDecode expects list of bit_widths, got {bw_node}")
 
         if name == "Find":
             return FindNode(_expr(args[0]), _expr(args[1]))

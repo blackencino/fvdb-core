@@ -11,7 +11,7 @@ Verifies:
   5. The full CIG ijk_to_index chain works with masked leaves
 """
 
-import numpy as np
+import torch
 
 from fvdb_tile.prototype.dsl_eval import run
 from fvdb_tile.prototype.ops import Value
@@ -20,21 +20,21 @@ from fvdb_tile.prototype.types import ScalarType, Shape, Static, Type
 
 def _pack_mask(active_positions, n_words=8):
     """Pack a list of flat positions into an (n_words,) i64 bitmask."""
-    words = np.zeros(n_words, dtype=np.int64)
+    words = torch.zeros(n_words, dtype=torch.int64)
     for pos in active_positions:
         word_idx = pos >> 6
         bit_pos = pos & 63
-        words[word_idx] |= np.int64(1) << np.int64(bit_pos)
+        words[word_idx] = words[word_idx] | (1 << bit_pos)
     return words
 
 
 def _build_prefix(words):
     """Build relative prefix-sum popcount array from mask words."""
-    prefix = np.zeros(len(words), dtype=np.int32)
+    prefix = torch.zeros(len(words), dtype=torch.int32)
     cum = 0
     for i in range(len(words)):
         prefix[i] = cum
-        cum += bin(int(words[i]) & 0xFFFFFFFFFFFFFFFF).count("1")
+        cum += bin(int(words[i].item()) & 0xFFFFFFFFFFFFFFFF).count("1")
     return prefix
 
 
@@ -49,8 +49,8 @@ def _popcount_before(words, flat_idx):
     bit_pos = flat_idx & 63
     total = 0
     for w in range(word_idx):
-        total += bin(int(words[w]) & 0xFFFFFFFFFFFFFFFF).count("1")
-    partial = int(words[word_idx]) & ((1 << bit_pos) - 1)
+        total += bin(int(words[w].item()) & 0xFFFFFFFFFFFFFFFF).count("1")
+    partial = int(words[word_idx].item()) & ((1 << bit_pos) - 1)
     total += bin(partial & 0xFFFFFFFFFFFFFFFF).count("1")
     return total
 
@@ -77,7 +77,7 @@ def test_masked_gather_active():
     mask_val = Value(Type(Shape(Static(8)), ScalarType.I64), mask)
     abs_prefix_val = Value(Type(Shape(Static(8)), ScalarType.I32), abs_prefix)
 
-    coord = np.array([1, 4, 4], dtype=np.int32)
+    coord = torch.tensor([1, 4, 4], dtype=torch.int32)
     coord_val = Value(Type(Shape(Static(3)), ScalarType.I32), coord)
 
     _, result = run(MASKED_GATHER_PROGRAM, {
@@ -102,7 +102,7 @@ def test_masked_gather_inactive():
     mask_val = Value(Type(Shape(Static(8)), ScalarType.I64), mask)
     abs_prefix_val = Value(Type(Shape(Static(8)), ScalarType.I32), abs_prefix)
 
-    coord = np.array([0, 6, 2], dtype=np.int32)
+    coord = torch.tensor([0, 6, 2], dtype=torch.int32)
     coord_val = Value(Type(Shape(Static(3)), ScalarType.I32), coord)
 
     _, result = run(MASKED_GATHER_PROGRAM, {
@@ -132,7 +132,7 @@ voxel_idx
 def test_masked_cig_chain():
     """Full ijk_to_index with masked leaves via DSL."""
     # Build a tiny 2-level grid with 2 leaves
-    lower_data = np.full((16, 16, 16), -1, dtype=np.int32)
+    lower_data = torch.full((16, 16, 16), -1, dtype=torch.int32)
     lower_data[3, 4, 5] = 0  # leaf 0
     lower_data[3, 4, 6] = 1  # leaf 1
 
@@ -146,8 +146,8 @@ def test_masked_cig_chain():
     mask1 = _pack_mask(leaf1_positions)
     abs_prefix1 = _build_abs_prefix(mask1, 3)  # leaf 1 starts at offset 3
 
-    leaf_masks = np.stack([mask0, mask1])  # (2, 8) i64
-    leaf_abs_prefix = np.stack([abs_prefix0, abs_prefix1])  # (2, 8) i32
+    leaf_masks = torch.stack([mask0, mask1])  # (2, 8) i64
+    leaf_abs_prefix = torch.stack([abs_prefix0, abs_prefix1])  # (2, 8) i32
 
     # Type declarations
     lower_val = Value(
@@ -164,7 +164,7 @@ def test_masked_cig_chain():
     )
 
     # Test 1: Query an active voxel in leaf 0
-    query = np.array([25, 34, 43], dtype=np.int32)
+    query = torch.tensor([25, 34, 43], dtype=torch.int32)
     query_val = Value(Type(Shape(Static(3)), ScalarType.I32), query)
 
     _, result = run(MASKED_CIG_PROGRAM, {
@@ -179,7 +179,7 @@ def test_masked_cig_chain():
     assert actual == expected, f"Expected {expected}, got {actual}"
 
     # Test 2: Query an active voxel in leaf 1
-    query2 = np.array([24, 32, 49], dtype=np.int32)
+    query2 = torch.tensor([24, 32, 49], dtype=torch.int32)
     query_val2 = Value(Type(Shape(Static(3)), ScalarType.I32), query2)
 
     _, result2 = run(MASKED_CIG_PROGRAM, {
@@ -194,7 +194,7 @@ def test_masked_cig_chain():
     assert actual2 == expected2, f"Expected {expected2}, got {actual2}"
 
     # Test 3: Query an inactive position
-    query3 = np.array([29, 37, 45], dtype=np.int32)
+    query3 = torch.tensor([29, 37, 45], dtype=torch.int32)
     query_val3 = Value(Type(Shape(Static(3)), ScalarType.I32), query3)
 
     _, result3 = run(MASKED_CIG_PROGRAM, {
@@ -208,7 +208,7 @@ def test_masked_cig_chain():
     assert actual3 == -1, f"Expected -1 for inactive voxel, got {actual3}"
 
     # Test 4: Query a coord in an empty lower node
-    query4 = np.array([0, 0, 0], dtype=np.int32)
+    query4 = torch.tensor([0, 0, 0], dtype=torch.int32)
     query_val4 = Value(Type(Shape(Static(3)), ScalarType.I32), query4)
 
     _, result4 = run(MASKED_CIG_PROGRAM, {

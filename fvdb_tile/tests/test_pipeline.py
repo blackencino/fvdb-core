@@ -4,7 +4,7 @@
 Tests for barrier-aware DSL pipeline planning and GPU-backed collective dispatch.
 """
 
-import numpy as np
+import torch
 
 from fvdb_tile.prototype.dsl_eval import run
 from fvdb_tile.prototype.dsl_pipeline import compile_source, plan_source
@@ -47,14 +47,14 @@ c = Unique(b)
 d = Map(c, v => Sub(v, Const(1)))
 d
 """
-    x_np = np.array([5, 3, 3, 2, 9, 2], dtype=np.int32)
-    x_val = Value(Type(Shape(Static(x_np.shape[0])), ScalarType.I32), x_np.copy())
+    x_t = torch.tensor([5, 3, 3, 2, 9, 2], dtype=torch.int32)
+    x_val = Value(Type(Shape(Static(x_t.shape[0])), ScalarType.I32), x_t.clone())
 
     direct_types, direct_out = run(source, {"x": x_val})
     exe = compile_source(source)
     result = exe.run({"x": x_val})
 
-    np.testing.assert_array_equal(result.output.data, direct_out.data)
+    torch.testing.assert_close(result.output.data, direct_out.data, atol=0, rtol=0)
     assert result.output.type == direct_out.type
     assert direct_types["d"] == direct_out.type
 
@@ -65,14 +65,14 @@ a = Sort(Input("x"))
 b = Unique(a)
 b
 """
-    x_np = np.array([4, 1, 4, 2, 1], dtype=np.int32)
-    before = x_np.copy()
-    x_val = Value(Type(Shape(Static(x_np.shape[0])), ScalarType.I32), x_np)
+    x_t = torch.tensor([4, 1, 4, 2, 1], dtype=torch.int32)
+    before = x_t.clone()
+    x_val = Value(Type(Shape(Static(x_t.shape[0])), ScalarType.I32), x_t)
 
     exe = compile_source(source)
     _ = exe.run({"x": x_val})
 
-    np.testing.assert_array_equal(x_np, before)
+    torch.testing.assert_close(x_t, before, atol=0, rtol=0)
 
 
 # ---------------------------------------------------------------------------
@@ -81,20 +81,20 @@ b
 
 
 def test_pipeline_collective_where_matches_evaluator():
-    """Where dispatched via torch.nonzero matches the pure numpy evaluator."""
+    """Where dispatched via torch.nonzero matches the pure torch evaluator."""
     source = """
 mask = Map(Input("x"), v => GE(v, Const(3)))
 active = Where(mask)
 active
 """
-    x_np = np.array([5, 1, 3, 0, 7, 2, 4], dtype=np.int32)
-    x_val = Value(Type(Shape(Static(x_np.shape[0])), ScalarType.I32), x_np.copy())
+    x_t = torch.tensor([5, 1, 3, 0, 7, 2, 4], dtype=torch.int32)
+    x_val = Value(Type(Shape(Static(x_t.shape[0])), ScalarType.I32), x_t.clone())
 
     _, direct_out = run(source, {"x": x_val})
     exe = compile_source(source)
     result_cpu = exe.run({"x": x_val}, device="cpu")
 
-    np.testing.assert_array_equal(result_cpu.output.data, direct_out.data)
+    torch.testing.assert_close(result_cpu.output.data, direct_out.data, atol=0, rtol=0)
     assert isinstance(result_cpu.output.type.iteration_shape.extents[0], Dynamic)
 
 
@@ -105,20 +105,20 @@ sorted = Sort(Input("coords"))
 unique = Unique(sorted)
 unique
 """
-    coords_np = np.array(
+    coords_t = torch.tensor(
         [[2, 1, 0], [0, 0, 1], [2, 1, 0], [1, 3, 2], [0, 0, 1]],
-        dtype=np.int32,
+        dtype=torch.int32,
     )
     coords_val = Value(
-        Type(Shape(Static(coords_np.shape[0])), Type(Shape(Static(3)), ScalarType.I32)),
-        coords_np.copy(),
+        Type(Shape(Static(coords_t.shape[0])), Type(Shape(Static(3)), ScalarType.I32)),
+        coords_t.clone(),
     )
 
     _, direct_out = run(source, {"coords": coords_val})
     exe = compile_source(source)
     result_cpu = exe.run({"coords": coords_val}, device="cpu")
 
-    np.testing.assert_array_equal(result_cpu.output.data, direct_out.data)
+    torch.testing.assert_close(result_cpu.output.data, direct_out.data, atol=0, rtol=0)
     assert isinstance(result_cpu.output.type.iteration_shape.extents[0], Dynamic)
 
 
@@ -131,19 +131,19 @@ c = Unique(b)
 d = Map(c, v => Sub(v, Const(1)))
 d
 """
-    x_np = np.array([5, 3, 3, 2, 9, 2], dtype=np.int32)
-    x_val = Value(Type(Shape(Static(x_np.shape[0])), ScalarType.I32), x_np.copy())
+    x_t = torch.tensor([5, 3, 3, 2, 9, 2], dtype=torch.int32)
+    x_val = Value(Type(Shape(Static(x_t.shape[0])), ScalarType.I32), x_t.clone())
 
     _, direct_out = run(source, {"x": x_val})
     exe = compile_source(source)
 
     # device=None uses evaluator for everything (correctness baseline)
     result_none = exe.run({"x": x_val}, device=None)
-    np.testing.assert_array_equal(result_none.output.data, direct_out.data)
+    torch.testing.assert_close(result_none.output.data, direct_out.data, atol=0, rtol=0)
 
     # device="cpu" uses torch for collectives
     result_cpu = exe.run({"x": x_val}, device="cpu")
-    np.testing.assert_array_equal(result_cpu.output.data, direct_out.data)
+    torch.testing.assert_close(result_cpu.output.data, direct_out.data, atol=0, rtol=0)
 
 
 def test_pipeline_nested_barrier_gather_where():
@@ -153,21 +153,19 @@ m = Map(Input("x"), v => GE(v, Const(0)))
 w = Gather(Input("x"), Where(m))
 w
 """
-    x_np = np.array([3, -1, 5, -2, 7], dtype=np.int32)
-    x_val = Value(Type(Shape(Static(x_np.shape[0])), ScalarType.I32), x_np.copy())
+    x_t = torch.tensor([3, -1, 5, -2, 7], dtype=torch.int32)
+    x_val = Value(Type(Shape(Static(x_t.shape[0])), ScalarType.I32), x_t.clone())
 
     _, direct_out = run(source, {"x": x_val})
     exe = compile_source(source)
     result_cpu = exe.run({"x": x_val}, device="cpu")
 
-    np.testing.assert_array_equal(result_cpu.output.data, direct_out.data)
+    torch.testing.assert_close(result_cpu.output.data, direct_out.data, atol=0, rtol=0)
 
 
 # ---------------------------------------------------------------------------
 # GPU cutile segment compilation (requires CUDA)
 # ---------------------------------------------------------------------------
-
-import torch
 
 HAS_CUDA = torch.cuda.is_available()
 
@@ -185,14 +183,14 @@ c = Unique(b)
 d = Map(c, v => Sub(v, Const(1)))
 d
 """
-    x_np = np.array([5, 3, 3, 2, 9, 2], dtype=np.int32)
-    x_val = Value(Type(Shape(Static(x_np.shape[0])), ScalarType.I32), x_np.copy())
+    x_t = torch.tensor([5, 3, 3, 2, 9, 2], dtype=torch.int32)
+    x_val = Value(Type(Shape(Static(x_t.shape[0])), ScalarType.I32), x_t.clone())
 
     _, direct_out = run(source, {"x": x_val})
     exe = compile_source(source)
     result_cuda = exe.run({"x": x_val}, device="cuda")
 
-    np.testing.assert_array_equal(result_cuda.output.data, direct_out.data)
+    torch.testing.assert_close(result_cuda.output.data, direct_out.data, atol=0, rtol=0)
 
 
 def test_pipeline_cutile_matches_evaluator():
@@ -207,11 +205,11 @@ b = Sort(a)
 c = Unique(b)
 c
 """
-    x_np = np.array([7, 2, 2, 5, 1, 7, 3], dtype=np.int32)
-    x_val = Value(Type(Shape(Static(x_np.shape[0])), ScalarType.I32), x_np.copy())
+    x_t = torch.tensor([7, 2, 2, 5, 1, 7, 3], dtype=torch.int32)
+    x_val = Value(Type(Shape(Static(x_t.shape[0])), ScalarType.I32), x_t.clone())
 
     exe = compile_source(source)
     result_none = exe.run({"x": x_val}, device=None)
     result_cuda = exe.run({"x": x_val}, device="cuda")
 
-    np.testing.assert_array_equal(result_cuda.output.data, result_none.output.data)
+    torch.testing.assert_close(result_cuda.output.data, result_none.output.data, atol=0, rtol=0)

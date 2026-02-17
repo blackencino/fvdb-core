@@ -12,7 +12,6 @@ Usage:
     python fvdb_tile/prototype/verify_memory.py
 """
 
-import numpy as np
 import torch
 
 from fvdb_tile.prototype.cig import build_compressed_cig3
@@ -28,15 +27,15 @@ except ImportError:
 
 def make_grid_coords(n_voxels: int, seed: int = 42) -> torch.Tensor:
     """Generate n_voxels unique random coordinates in [0, 4096)^3."""
-    rng = np.random.RandomState(seed)
-    coords_set = set()
+    gen = torch.Generator().manual_seed(seed)
+    coords_set: set[tuple[int, int, int]] = set()
     while len(coords_set) < n_voxels:
-        batch = rng.randint(0, 4096, (n_voxels * 2, 3))
+        batch = torch.randint(0, 4096, (n_voxels * 2, 3), generator=gen)
         for row in batch:
-            coords_set.add(tuple(row))
+            coords_set.add((int(row[0]), int(row[1]), int(row[2])))
             if len(coords_set) >= n_voxels:
                 break
-    return torch.from_numpy(np.array(sorted(coords_set)[:n_voxels], dtype=np.int32))
+    return torch.tensor(sorted(coords_set)[:n_voxels], dtype=torch.int32)
 
 
 def analyze_one(n_voxels: int):
@@ -75,10 +74,9 @@ def analyze_one(n_voxels: int):
     print(f"    {'':.<22} {'':>20} {'':>8} {'----------':>12}")
     print(f"    {'TOTAL':<22} {'':>20} {'':>8} {cig_total:>12,}  ({cig_total / 1024:.1f} KB)")
 
-    # Per-level summary
-    upper_bytes = sum(t.nelement() * t.element_size() for _, t in cig_components if "upper" in _)
-    lower_bytes = sum(t.nelement() * t.element_size() for _, t in cig_components if "lower" in _)
-    leaf_bytes = sum(t.nelement() * t.element_size() for _, t in cig_components if "leaf" in _)
+    upper_bytes = sum(t.nelement() * t.element_size() for n, t in cig_components if "upper" in n)
+    lower_bytes = sum(t.nelement() * t.element_size() for n, t in cig_components if "lower" in n)
+    leaf_bytes = sum(t.nelement() * t.element_size() for n, t in cig_components if "leaf" in n)
     root_bytes = cig.root_coords.nelement() * cig.root_coords.element_size()
     print(f"\n    Per-level: root={root_bytes:,}  upper={upper_bytes:,}  lower={lower_bytes:,}  leaf={leaf_bytes:,}")
     if cig.n_upper > 0:
@@ -102,47 +100,21 @@ def analyze_one(n_voxels: int):
     print(f"    num_voxels:      {grid.num_voxels:>12,}")
     print(f"    num_leaf_nodes:  {grid.num_leaf_nodes:>12,}")
 
-    # Compute theoretical NanoVDB component sizes for OnIndexGrid
     n_leaves_fvdb = grid.num_leaf_nodes
     n_voxels_fvdb = grid.num_voxels
 
-    # NanoVDB LeafData<ValueIndex>:
-    #   mValueMask: 512 bits = 64 bytes
-    #   mValueOff: 4 bytes (uint32)
-    #   mStatsOff: 4 bytes (uint32) -- statistics offset
-    #   mMinimum: 8 bytes (uint64 for index type)
-    #   mMaximum: 8 bytes
-    #   mAverage: 4 bytes (float)
-    #   mStdDevi: 4 bytes (float)
-    #   Padding to 32B alignment: varies
-    #   Total per leaf: ~96-128 bytes (depends on ValueIndex type)
     leaf_estimate = n_leaves_fvdb * 96
     print(f"\n    Theoretical NanoVDB breakdown (estimated):")
     print(f"      Leaf nodes:  {n_leaves_fvdb:>8} x ~96 bytes  = {leaf_estimate:>12,} bytes")
 
-    # Lower internal nodes (16^3):
-    #   Child mask: 4096 bits = 512 bytes
-    #   Value mask: 4096 bits = 512 bytes
-    #   Child/tile table: 4096 entries x 4 bytes = 16,384 bytes (DENSE!)
-    #   Min/max/avg/stddev metadata: ~32 bytes
-    #   Total per lower node: ~17,440 bytes
-    # Number of lower nodes: roughly n_leaves / avg_leaves_per_lower
-    # We don't know exact count, but can estimate
-    lower_per_node = 512 + 512 + 4096 * 4 + 32  # ~17,440
+    lower_per_node = 512 + 512 + 4096 * 4 + 32
     print(f"      Lower node cost: ~{lower_per_node:,} bytes each (512B mask + 16KB dense child table)")
 
-    # Upper internal nodes (32^3):
-    #   Child mask: 32768 bits = 4096 bytes
-    #   Value mask: 32768 bits = 4096 bytes
-    #   Child/tile table: 32768 entries x 4 bytes = 131,072 bytes (DENSE!)
-    #   Total per upper node: ~139,264 bytes
-    upper_per_node = 4096 + 4096 + 32768 * 4 + 32  # ~139,256
+    upper_per_node = 4096 + 4096 + 32768 * 4 + 32
     print(f"      Upper node cost: ~{upper_per_node:,} bytes each (4KB mask + 128KB dense child table)")
 
-    # Root: hash table of tiles
     print(f"      Root: variable (hash table of tile entries)")
 
-    # What CIG3 would be for the same structure
     print(f"\n    Key structural difference:")
     print(f"      NanoVDB lower: 4096 x 4-byte child offsets = 16,384 bytes per node (DENSE)")
     print(f"      CIG3 lower:    64 x 8-byte mask + 64 x 4-byte prefix = 768 bytes per node")

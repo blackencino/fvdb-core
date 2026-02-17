@@ -19,7 +19,7 @@ Segment kinds:
 Both segment kinds target GPU execution.  When ``device`` is set on
 ``PipelineExecutable.run()``, cutile segments compile to cuTile kernels
 and collective segments dispatch to torch ops.  When ``device`` is None,
-the pure numpy evaluator handles everything (correctness reference).
+the pure torch evaluator handles everything (correctness reference).
 """
 
 from __future__ import annotations
@@ -30,7 +30,6 @@ import math
 import os
 from dataclasses import dataclass
 
-import numpy as np
 import torch
 
 from .dsl_ast import (
@@ -86,12 +85,12 @@ class PipelineExecutable:
         """Execute the pipeline.
 
         Args:
-            inputs: named input Values (numpy arrays).
+            inputs: named input Values (torch tensors).
             device: torch device string.  ``"cpu"`` dispatches collectives to
                 torch CPU ops (cutile segments use evaluator).  ``"cuda"``
                 compiles cutile segments to cuTile GPU kernels AND dispatches
                 collectives to torch GPU ops.  ``None`` (default) uses the
-                pure numpy evaluator for everything.
+                pure torch evaluator for everything.
         """
         frozen_inputs = {name: _clone_value(val) for name, val in inputs.items()}
 
@@ -157,10 +156,7 @@ def _segment_external_refs(segment: PipelineSegment) -> set[str]:
 
 
 def _rewrite_refs_to_inputs(node: Node, external_names: set[str]) -> Node:
-    """Rewrite RefNode(name) -> InputNode(name) for external names.
-
-    Returns a new AST tree (nodes are frozen dataclasses).
-    """
+    """Rewrite RefNode(name) -> InputNode(name) for external names."""
     if isinstance(node, RefNode) and node.name in external_names:
         return InputNode(name=node.name)
 
@@ -191,12 +187,7 @@ def _rewrite_refs_to_inputs(node: Node, external_names: set[str]) -> Node:
 
 
 def _determine_tile_input(segment_input_types: dict[str, Type]) -> tuple[str, int]:
-    """Pick the tile input and its element rank for tile-parallel emission.
-
-    Prefers the first input with Dynamic leading extent.  Falls back to
-    the input with the largest Static leading extent.  Returns
-    (input_name, element_rank).
-    """
+    """Pick the tile input and its element rank for tile-parallel emission."""
     best_dynamic = None
     best_static = None
     best_static_n = -1
@@ -246,11 +237,7 @@ def _compile_kernel(code: str, kernel_name: str):
 
 
 def _node_to_source(node: Node) -> str:
-    """Serialize an AST node to a parseable DSL source string.
-
-    Unlike ``repr()``, this produces strings the DSL parser can consume.
-    The key difference: ``RefNode("v")`` emits ``v``, not ``Ref(v)``.
-    """
+    """Serialize an AST node to a parseable DSL source string."""
     if isinstance(node, InputNode):
         return f'Input("{node.name}")'
     if isinstance(node, RefNode):
@@ -258,7 +245,7 @@ def _node_to_source(node: Node) -> str:
     from .dsl_ast import ConstNode, AddNode, SubNode, GENode, AndNode, NotNode
     from .dsl_ast import InBoundsNode, GatherNode, DecomposeNode, FindNode
     from .dsl_ast import MaskedNode, CutNode, ReshapeNode, FuseNode, FlattenNode, PermuteNode
-    from .dsl_ast import DivNode, MulNode, CountNode, Morton3dNode, Morton3dSignedNode, MortonDecode3dNode
+    from .dsl_ast import DivNode, MulNode, CountNode, Morton3dNode, Morton3dSignedNode, MortonDecode3dNode, HierarchicalKeyNode, HierarchicalKeyDecodeNode
     from .dsl_ast import OverNode, ScanNode, EachRightNode, EachLeftNode, PriorNode
     from .dsl_ast import FieldNode, VerbRefNode, AdverbApplyNode, ApplyNode
 
@@ -310,6 +297,10 @@ def _node_to_source(node: Node) -> str:
         return f"Morton3dSigned({_node_to_source(node.input)})"
     if isinstance(node, MortonDecode3dNode):
         return f"MortonDecode3d({_node_to_source(node.input)})"
+    if isinstance(node, HierarchicalKeyNode):
+        return f"HierarchicalKey({_node_to_source(node.input)}, Const({node.bit_widths!r}))"
+    if isinstance(node, HierarchicalKeyDecodeNode):
+        return f"HierarchicalKeyDecode({_node_to_source(node.input)}, Const({node.bit_widths!r}))"
     if isinstance(node, FuseNode):
         return f"fuse({_node_to_source(node.input)})"
     if isinstance(node, FlattenNode):
@@ -342,7 +333,6 @@ def _run_cutile_segment(
 
     external_names = _segment_external_refs(segment)
 
-    # Build the segment's input types: original inputs + types of external refs
     segment_input_types: dict[str, Type] = {}
     for name in external_names:
         if name in original_input_types:
@@ -354,13 +344,11 @@ def _run_cutile_segment(
         else:
             raise TypeError(f"Cannot resolve type for external ref {name!r}")
 
-    # Also include original program inputs that are directly referenced via InputNode
     for binding in segment.bindings:
         for name in _collect_input_names(binding.node):
             if name not in segment_input_types and name in original_input_types:
                 segment_input_types[name] = original_input_types[name]
 
-    # Rewrite external RefNodes to InputNodes
     rewritten_bindings = []
     for binding in segment.bindings:
         new_node = _rewrite_refs_to_inputs(binding.node, external_names)
@@ -368,17 +356,14 @@ def _run_cutile_segment(
 
     last_name = segment.bindings[-1].name
 
-    # Serialize to parseable DSL source
     lines = []
     for name, node in rewritten_bindings:
         lines.append(f"{name} = {_node_to_source(node)}")
     lines.append(last_name)
     source = "\n".join(lines)
 
-    # Determine parallelism
     tile_input, tile_input_rank = _determine_tile_input(segment_input_types)
 
-    # Generate a unique kernel name from the segment content
     import hashlib
 
     seg_hash = hashlib.md5(source.encode()).hexdigest()[:8]
@@ -396,7 +381,6 @@ def _run_cutile_segment(
 
     kernel_fn = _compile_kernel(code, kernel_name)
 
-    # Prepare input tensors on device
     torch_device = torch.device(device)
     input_tensors = {}
     tile_N = 0
@@ -407,7 +391,10 @@ def _run_cutile_segment(
             data = env.bindings[name].data
         else:
             raise TypeError(f"No data for input {name!r}")
-        t = torch.from_numpy(np.asarray(data)).to(torch_device)
+        if isinstance(data, torch.Tensor):
+            t = data.to(torch_device)
+        else:
+            t = torch.as_tensor(data).to(torch_device)
         input_tensors[name] = t
         if name == tile_input:
             tile_N = t.shape[0]
@@ -415,7 +402,6 @@ def _run_cutile_segment(
     n_blocks = math.ceil(tile_N / TILE)
     result_t = torch.full((n_blocks * TILE,), -1, dtype=torch.int32, device=torch_device)
 
-    # Build launch args in the order emit_runnable_kernel expects
     import cuda.tile as ct
 
     launch_args = []
@@ -431,15 +417,12 @@ def _run_cutile_segment(
         tuple(launch_args),
     )
 
-    # Extract result and store in env
-    result_np = result_t[:tile_N].cpu().numpy().astype(np.int32)
+    result_trimmed = result_t[:tile_N].to(torch.int32)
     result_type = all_types.get(last_name)
     if result_type is None:
         result_type = Type(Shape(Dynamic()), ScalarType.I32)
-    env.bindings[last_name] = Value(result_type, result_np)
+    env.bindings[last_name] = Value(result_type, result_trimmed)
 
-    # For multi-binding segments, evaluate intermediate bindings via evaluator
-    # so they're available if referenced later (rare case).
     for binding in segment.bindings[:-1]:
         if binding.name not in env.bindings:
             env.bindings[binding.name] = eval_node(binding.node, env)
@@ -468,20 +451,22 @@ def _collect_input_names(node: Node) -> set[str]:
 def _torch_where(node: WhereNode, env: EvalEnv) -> Value:
     """Where via torch.nonzero -- returns (*, r) i32 coordinates."""
     input_val = eval_node(node.input, EvalEnv(env.inputs, env.bindings))
-    t = torch.from_numpy(np.asarray(input_val.data))
-    device = t.device
-    coords = torch.nonzero(t).to(dtype=torch.int32, device=device)
+    data = input_val.data
+    if isinstance(data, torch.Tensor):
+        coords = torch.nonzero(data).to(dtype=torch.int32)
+    else:
+        coords = torch.nonzero(torch.as_tensor(data)).to(dtype=torch.int32)
     result_type = Type(Shape(Dynamic()), coord_type(input_val.type.rank))
-    return Value(result_type, coords.numpy())
+    return Value(result_type, coords)
 
 
 def _torch_sort(node: SortNode, env: EvalEnv) -> Value:
     """Sort via torch -- stable ascending sort over leading axis."""
     input_val = eval_node(node.input, EvalEnv(env.inputs, env.bindings))
     data = input_val.data
-    if not isinstance(data, np.ndarray):
-        raise TypeError(f"Sort requires ndarray data, got {type(data)}")
-    t = torch.from_numpy(data.copy())
+    if not isinstance(data, torch.Tensor):
+        raise TypeError(f"Sort requires tensor data, got {type(data)}")
+    t = data.clone()
     if t.ndim == 1:
         sorted_t, _ = torch.sort(t, stable=True)
     else:
@@ -491,16 +476,16 @@ def _torch_sort(node: SortNode, env: EvalEnv) -> Value:
         for k in reversed(keys[:-1]):
             order = order[torch.argsort(k[order], stable=True)]
         sorted_t = t[order]
-    return Value(input_val.type, sorted_t.numpy())
+    return Value(input_val.type, sorted_t)
 
 
 def _torch_unique(node: UniqueNode, env: EvalEnv) -> Value:
     """Unique via torch.unique -- deduplicate along leading axis."""
     input_val = eval_node(node.input, EvalEnv(env.inputs, env.bindings))
     data = input_val.data
-    if not isinstance(data, np.ndarray):
-        raise TypeError(f"Unique requires ndarray data, got {type(data)}")
-    t = torch.from_numpy(data.copy())
+    if not isinstance(data, torch.Tensor):
+        raise TypeError(f"Unique requires tensor data, got {type(data)}")
+    t = data.clone()
     if t.ndim == 1:
         unique_t = torch.unique(t, sorted=True)
     else:
@@ -508,7 +493,7 @@ def _torch_unique(node: UniqueNode, env: EvalEnv) -> Value:
     in_ty = input_val.type
     tail = in_ty.iteration_shape.extents[1:]
     result_type = Type(Shape(Dynamic(), *tail), in_ty.element_type)
-    return Value(result_type, unique_t.numpy())
+    return Value(result_type, unique_t)
 
 
 def _make_collective_hooks(device: str) -> dict:
@@ -518,28 +503,28 @@ def _make_collective_hooks(device: str) -> dict:
     def where_hook(node, env):
         val = _torch_where(node, env)
         if torch_device.type != "cpu":
-            t = torch.from_numpy(val.data).to(torch_device)
-            return Value(val.type, t.cpu().numpy())
+            t = val.data.to(torch_device)
+            return Value(val.type, t.cpu())
         return val
 
     def sort_hook(node, env):
         val = _torch_sort(node, env)
         if torch_device.type != "cpu":
-            t = torch.from_numpy(val.data).to(torch_device)
+            t = val.data.to(torch_device)
             sorted_t, _ = torch.sort(t, stable=True, dim=0)
-            return Value(val.type, sorted_t.cpu().numpy())
+            return Value(val.type, sorted_t.cpu())
         return val
 
     def unique_hook(node, env):
         val = _torch_unique(node, env)
         if torch_device.type != "cpu":
-            t = torch.from_numpy(val.data).to(torch_device)
+            t = val.data.to(torch_device)
             if t.ndim == 1:
                 unique_t = torch.unique(t, sorted=True)
             else:
                 unique_t = torch.unique(t, dim=0, sorted=True)
             in_ty = val.type
-            return Value(in_ty, unique_t.cpu().numpy())
+            return Value(in_ty, unique_t.cpu())
         return val
 
     return {
@@ -637,8 +622,8 @@ def _clone_value(val: Value) -> Value:
 
 
 def _clone_data(data):
-    if isinstance(data, np.ndarray):
-        return data.copy()
+    if isinstance(data, torch.Tensor):
+        return data.clone()
     if isinstance(data, list):
         cloned = []
         for elem in data:

@@ -14,7 +14,6 @@ import os
 import sys
 import tempfile
 
-import numpy as np
 import torch
 
 import cuda.tile as ct
@@ -71,9 +70,9 @@ INPUT_TYPES = {
     "offsets": Type(Shape(Static(6)), Type(Shape(Static(3)), ScalarType.I32)),
 }
 
-FACE_OFFSETS = np.array(
+FACE_OFFSETS = torch.tensor(
     [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]],
-    dtype=np.int32,
+    dtype=torch.int32,
 )
 
 
@@ -129,15 +128,15 @@ def test_compile_and_launch():
     kernel_fn = _compile_kernel(code, "gen_neighbor_pred")
 
     # Prepare test data
-    np.random.seed(42)
-    leaf_data = np.random.randint(-1, 10, (8, 8, 8)).astype(np.int32)
+    gen = torch.Generator().manual_seed(42)
+    leaf_data = torch.randint(-1, 10, (8, 8, 8), generator=gen, dtype=torch.int32)
     mask_bool = leaf_data >= 0
-    active_coords = np.argwhere(mask_bool).astype(np.int32)
+    active_coords = torch.nonzero(mask_bool).to(torch.int32)
     N = active_coords.shape[0]
 
-    mask_t = torch.from_numpy(leaf_data.copy()).cuda()
-    coords_t = torch.from_numpy(active_coords.copy()).cuda()
-    offsets_t = torch.from_numpy(FACE_OFFSETS.copy()).cuda()
+    mask_t = leaf_data.clone().cuda()
+    coords_t = active_coords.clone().cuda()
+    offsets_t = FACE_OFFSETS.clone().cuda()
     result_t = torch.zeros(N, tile_size, dtype=torch.int32, device="cuda")
 
     # Launch the generated kernel
@@ -150,12 +149,12 @@ def test_compile_and_launch():
     )
 
     # Extract results (only first map_len columns are valid)
-    gpu_result = result_t.cpu().numpy()[:, :map_len].astype(bool)
+    gpu_result = result_t.cpu()[:, :map_len].to(torch.bool)
 
-    # Numpy reference
-    ref_result = _numpy_reference(leaf_data, active_coords, FACE_OFFSETS)
+    # Reference
+    ref_result = _reference(leaf_data, active_coords, FACE_OFFSETS)
 
-    np.testing.assert_array_equal(gpu_result, ref_result)
+    torch.testing.assert_close(gpu_result, ref_result, atol=0, rtol=0)
     total = int(ref_result.sum())
     print(f"  compile_and_launch: {N} voxels, {total} active neighbors -- PASSED")
 
@@ -179,23 +178,23 @@ def test_dsl_eval_vs_generated():
     kernel_fn = _compile_kernel(code, "gen_pred_e2e")
 
     # Test data
-    np.random.seed(99)
-    leaf_data = np.random.randint(-1, 5, (8, 8, 8)).astype(np.int32)
+    gen = torch.Generator().manual_seed(99)
+    leaf_data = torch.randint(-1, 5, (8, 8, 8), generator=gen, dtype=torch.int32)
     mask_bool = leaf_data >= 0
-    active_coords = np.argwhere(mask_bool).astype(np.int32)
+    active_coords = torch.nonzero(mask_bool).to(torch.int32)
     N = active_coords.shape[0]
 
     # --- GPU path: generated kernel ---
-    mask_t = torch.from_numpy(leaf_data.copy()).cuda()
-    coords_t = torch.from_numpy(active_coords.copy()).cuda()
-    offsets_t = torch.from_numpy(FACE_OFFSETS.copy()).cuda()
+    mask_t = leaf_data.clone().cuda()
+    coords_t = active_coords.clone().cuda()
+    offsets_t = FACE_OFFSETS.clone().cuda()
     result_t = torch.zeros(N, tile_size, dtype=torch.int32, device="cuda")
 
     ct.launch(torch.cuda.current_stream(), (N,), kernel_fn, (mask_t, coords_t, offsets_t, result_t, tile_size))
-    gpu_result = result_t.cpu().numpy()[:, :map_len].astype(bool)
+    gpu_result = result_t.cpu()[:, :map_len].to(torch.bool)
 
     # --- DSL evaluator path ---
-    dsl_result = np.zeros((N, 6), dtype=bool)
+    dsl_result = torch.zeros((N, 6), dtype=torch.bool)
     for i in range(N):
         coord_val = Value(Type(Shape(Static(3)), ScalarType.I32), active_coords[i])
         mask_val = Value(Type(Shape(Static(8), Static(8), Static(8)), ScalarType.I32), leaf_data)
@@ -207,7 +206,7 @@ def test_dsl_eval_vs_generated():
         dsl_result[i] = result.data
 
     # Compare
-    np.testing.assert_array_equal(gpu_result, dsl_result)
+    torch.testing.assert_close(gpu_result, dsl_result, atol=0, rtol=0)
     total = int(gpu_result.sum())
     print(f"  dsl_eval_vs_generated: {N} voxels, {total} active neighbors, DSL == GPU -- PASSED")
 
@@ -216,16 +215,16 @@ def test_dsl_eval_vs_generated():
 # Numpy reference helper
 # ---------------------------------------------------------------------------
 
-def _numpy_reference(mask_np, active_coords_np, offsets_np):
-    N = active_coords_np.shape[0]
-    N_OFF = offsets_np.shape[0]
-    result = np.zeros((N, N_OFF), dtype=bool)
+def _reference(mask_t, active_coords_t, offsets_t):
+    N = active_coords_t.shape[0]
+    N_OFF = offsets_t.shape[0]
+    result = torch.zeros((N, N_OFF), dtype=torch.bool)
     for i in range(N):
-        coord = active_coords_np[i]
+        coord = active_coords_t[i]
         for j in range(N_OFF):
-            nbr = coord + offsets_np[j]
-            in_bounds = np.all(nbr >= 0) and np.all(nbr < 8)
-            if in_bounds and mask_np[nbr[0], nbr[1], nbr[2]] >= 0:
+            nbr = coord + offsets_t[j]
+            in_bounds = (nbr >= 0).all() and (nbr < 8).all()
+            if in_bounds and mask_t[nbr[0], nbr[1], nbr[2]] >= 0:
                 result[i, j] = True
     return result
 

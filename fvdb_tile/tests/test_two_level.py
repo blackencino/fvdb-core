@@ -12,10 +12,10 @@ Proves:
   - Composition of hierarchical lookups with iteration patterns (Each, Where)
 """
 
-import numpy as np
+import torch
 
 from fvdb_tile.prototype.dsl_eval import run
-from fvdb_tile.prototype.ops import Value
+from fvdb_tile.prototype.ops import Value, morton3d
 from fvdb_tile.prototype.types import (
     Dynamic,
     Jagged,
@@ -25,7 +25,6 @@ from fvdb_tile.prototype.types import (
     Type,
     coord_type,
 )
-from fvdb_tile.prototype.ops import morton3d as np_morton3d
 
 
 # ---------------------------------------------------------------------------
@@ -62,38 +61,40 @@ active
 
 def _build_two_level_grid(n_lower=3, seed=42):
     """Build a small two-level grid for testing."""
-    np.random.seed(seed)
+    gen = torch.Generator().manual_seed(seed)
 
     L = n_lower
-    lower_data = np.full((L, 16, 16, 16), -1, dtype=np.int32)
+    lower_data = torch.full((L, 16, 16, 16), -1, dtype=torch.int32)
 
     leaf_blocks = []
     next_leaf_idx = 0
     next_voxel_idx = 0
 
     for li in range(L):
-        n_active = np.random.randint(100, 500)
-        positions = np.random.choice(16 * 16 * 16, n_active, replace=False)
+        n_active = torch.randint(100, 500, (1,), generator=gen).item()
+        positions = torch.randperm(16 * 16 * 16, generator=gen)[:n_active]
         for pos in positions:
-            lx = pos // (16 * 16)
-            ly = (pos // 16) % 16
-            lz = pos % 16
+            pos_val = pos.item()
+            lx = pos_val // (16 * 16)
+            ly = (pos_val // 16) % 16
+            lz = pos_val % 16
             lower_data[li, lx, ly, lz] = next_leaf_idx
 
-            leaf = np.full((8, 8, 8), -1, dtype=np.int32)
-            n_voxels = np.random.randint(50, 400)
-            voxel_positions = np.random.choice(512, n_voxels, replace=False)
+            leaf = torch.full((8, 8, 8), -1, dtype=torch.int32)
+            n_voxels = torch.randint(50, 400, (1,), generator=gen).item()
+            voxel_positions = torch.randperm(512, generator=gen)[:n_voxels]
             for vp in voxel_positions:
-                vx = vp // 64
-                vy = (vp // 8) % 8
-                vz = vp % 8
+                vp_val = vp.item()
+                vx = vp_val // 64
+                vy = (vp_val // 8) % 8
+                vz = vp_val % 8
                 leaf[vx, vy, vz] = next_voxel_idx
                 next_voxel_idx += 1
             leaf_blocks.append(leaf)
             next_leaf_idx += 1
 
     K = len(leaf_blocks)
-    leaf_data = np.stack(leaf_blocks)
+    leaf_data = torch.stack(leaf_blocks)
 
     return lower_data, leaf_data, next_voxel_idx
 
@@ -109,17 +110,17 @@ def test_3d_chain_single_coord():
     lower_data, leaf_data, _ = _build_two_level_grid(n_lower=2)
 
     # Pick a coord that resolves to an active voxel
-    active_lower_entries = np.argwhere(lower_data[0] >= 0)
+    active_lower_entries = torch.nonzero(lower_data[0] >= 0)
     ll = active_lower_entries[0]
-    leaf_idx_expected = lower_data[0, ll[0], ll[1], ll[2]]
-    active_leaf_entries = np.argwhere(leaf_data[leaf_idx_expected] >= 0)
+    leaf_idx_expected = lower_data[0, ll[0].item(), ll[1].item(), ll[2].item()]
+    active_leaf_entries = torch.nonzero(leaf_data[leaf_idx_expected] >= 0)
     vl = active_leaf_entries[0]
 
-    global_coord = np.array([
-        ll[0] * 8 + vl[0],
-        ll[1] * 8 + vl[1],
-        ll[2] * 8 + vl[2],
-    ], dtype=np.int32)
+    global_coord = torch.tensor([
+        ll[0].item() * 8 + vl[0].item(),
+        ll[1].item() * 8 + vl[1].item(),
+        ll[2].item() * 8 + vl[2].item(),
+    ], dtype=torch.int32)
 
     coord_val = Value(Type(Shape(Static(3)), ScalarType.I32), global_coord)
     lower_val = Value(
@@ -144,11 +145,12 @@ def test_3d_chain_single_coord():
 
     vl_ref = global_coord & 7
     ll_ref = (global_coord >> 3) & 15
-    expected_leaf = lower_data[0, ll_ref[0], ll_ref[1], ll_ref[2]]
-    expected_voxel = leaf_data[expected_leaf, vl_ref[0], vl_ref[1], vl_ref[2]] if expected_leaf >= 0 else -1
+    expected_leaf = lower_data[0, ll_ref[0].item(), ll_ref[1].item(), ll_ref[2].item()]
+    expected_voxel = leaf_data[expected_leaf, vl_ref[0].item(), vl_ref[1].item(), vl_ref[2].item()] if expected_leaf >= 0 else -1
 
     actual = int(result.data)
-    assert actual == expected_voxel, f"{actual} vs {expected_voxel}"
+    exp = expected_voxel.item() if isinstance(expected_voxel, torch.Tensor) else expected_voxel
+    assert actual == exp, f"{actual} vs {exp}"
     assert actual >= 0
     print(f"  global {global_coord} -> voxel_idx {actual}")
 
@@ -159,8 +161,8 @@ def test_3d_chain_batch():
     # ---- SETUP ----
     lower_data, leaf_data, _ = _build_two_level_grid(n_lower=1)
     N = 50
-    np.random.seed(99)
-    global_coords = np.random.randint(0, 128, (N, 3)).astype(np.int32)
+    gen = torch.Generator().manual_seed(99)
+    global_coords = torch.randint(0, 128, (N, 3), generator=gen, dtype=torch.int32)
 
     lower_val = Value(
         Type(Shape(Static(16), Static(16), Static(16)), ScalarType.I32),
@@ -183,10 +185,11 @@ def test_3d_chain_batch():
         gc = global_coords[i]
         ll = (gc >> 3) & 15
         vl = gc & 7
-        expected_leaf = lower_data[0, ll[0], ll[1], ll[2]]
-        expected_voxel = leaf_data[expected_leaf, vl[0], vl[1], vl[2]] if expected_leaf >= 0 else -1
+        expected_leaf = lower_data[0, ll[0].item(), ll[1].item(), ll[2].item()]
+        expected_voxel = leaf_data[expected_leaf, vl[0].item(), vl[1].item(), vl[2].item()] if expected_leaf >= 0 else -1
         actual = int(result.data)
-        assert actual == expected_voxel, f"Coord {gc}: {actual} vs {expected_voxel}"
+        exp = expected_voxel.item() if isinstance(expected_voxel, torch.Tensor) else expected_voxel
+        assert actual == exp, f"Coord {gc}: {actual} vs {exp}"
 
     print(f"3D chain batch: {N} lookups verified")
 
@@ -213,20 +216,20 @@ def test_morton_chain_batch():
     lower_data, leaf_data, _ = _build_two_level_grid(n_lower=1)
 
     # Morton-linearize
-    lower_morton = np.full((4096,), -1, dtype=np.int32)
+    lower_morton = torch.full((4096,), -1, dtype=torch.int32)
     for x in range(16):
         for y in range(16):
             for z in range(16):
-                m = int(np_morton3d(np.array([x, y, z], dtype=np.int32)))
+                m = int(morton3d(torch.tensor([x, y, z], dtype=torch.int32)))
                 lower_morton[m] = lower_data[0, x, y, z]
 
     K = leaf_data.shape[0]
-    leaf_morton = np.full((K, 512), -1, dtype=np.int32)
+    leaf_morton = torch.full((K, 512), -1, dtype=torch.int32)
     for k in range(K):
         for x in range(8):
             for y in range(8):
                 for z in range(8):
-                    m = int(np_morton3d(np.array([x, y, z], dtype=np.int32)))
+                    m = int(morton3d(torch.tensor([x, y, z], dtype=torch.int32)))
                     leaf_morton[k, m] = leaf_data[k, x, y, z]
 
     lower_m_val = Value(Type(Shape(Static(4096)), ScalarType.I32), lower_morton)
@@ -236,8 +239,8 @@ def test_morton_chain_batch():
     )
 
     N = 50
-    np.random.seed(99)
-    global_coords = np.random.randint(0, 128, (N, 3)).astype(np.int32)
+    gen = torch.Generator().manual_seed(99)
+    global_coords = torch.randint(0, 128, (N, 3), generator=gen, dtype=torch.int32)
 
     # ---- EXPRESSION ----
     for i in range(N):
@@ -250,10 +253,11 @@ def test_morton_chain_batch():
         gc = global_coords[i]
         ll = (gc >> 3) & 15
         vl = gc & 7
-        expected_leaf = lower_data[0, ll[0], ll[1], ll[2]]
-        expected_voxel = leaf_data[expected_leaf, vl[0], vl[1], vl[2]] if expected_leaf >= 0 else -1
+        expected_leaf = lower_data[0, ll[0].item(), ll[1].item(), ll[2].item()]
+        expected_voxel = leaf_data[expected_leaf, vl[0].item(), vl[1].item(), vl[2].item()] if expected_leaf >= 0 else -1
         actual = int(result.data)
-        assert actual == expected_voxel, f"Morton coord {gc}: {actual} vs {expected_voxel}"
+        exp = expected_voxel.item() if isinstance(expected_voxel, torch.Tensor) else expected_voxel
+        assert actual == exp, f"Morton coord {gc}: {actual} vs {exp}"
 
     print(f"Morton chain batch: {N} lookups match 3D reference exactly")
 
@@ -270,7 +274,7 @@ def test_batch_active_voxel_lookup():
     K = leaf_data.shape[0]
     n_test = min(5, K)
     leaf_subset = leaf_data[:n_test]
-    leaf_flat = Value.from_numpy(leaf_subset.reshape(n_test * 512), ScalarType.I32)
+    leaf_flat = Value.from_tensor(leaf_subset.reshape(n_test * 512), ScalarType.I32)
 
     # ---- EXPRESSION ----
     types, result = run(BATCH_ACTIVE_PROGRAM, {"leaf_flat": leaf_flat})
@@ -284,9 +288,9 @@ def test_batch_active_voxel_lookup():
 
     total_active = 0
     for li in range(n_test):
-        expected = np.argwhere(leaf_subset[li].reshape(8, 8, 8) >= 0).astype(np.int32)
+        expected = torch.nonzero(leaf_subset[li].reshape(8, 8, 8) >= 0).to(torch.int32)
         actual = result.data[li].data
-        np.testing.assert_array_equal(actual, expected)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
         total_active += len(expected)
 
     counts = [result.data[li].data.shape[0] for li in range(n_test)]

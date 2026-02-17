@@ -4,11 +4,11 @@
 First proof: Where on a single (8,8,8) leaf node.
 
 EXPRESSION phases use DSL strings executed via run().
-SETUP creates numpy data + Value inputs.
-EXTRACTION validates types and data against numpy references.
+SETUP creates torch data + Value inputs.
+EXTRACTION validates types and data against torch references.
 """
 
-import numpy as np
+import torch
 
 from fvdb_tile.prototype.dsl_eval import run
 from fvdb_tile.prototype.ops import Value
@@ -52,7 +52,7 @@ feat
 
 def test_map_preserves_shape():
     # ---- SETUP ----
-    leaf = Value.from_numpy(np.zeros((8, 8, 8), dtype=np.int32), ScalarType.I32)
+    leaf = Value.from_tensor(torch.zeros((8, 8, 8), dtype=torch.int32), ScalarType.I32)
 
     # ---- EXPRESSION ----
     types, result = run(MASK_PROGRAM, {"leaf": leaf})
@@ -63,7 +63,7 @@ def test_map_preserves_shape():
 
 def test_where_type():
     # ---- SETUP ----
-    leaf = Value.from_numpy(np.ones((8, 8, 8), dtype=np.int32), ScalarType.I32)
+    leaf = Value.from_tensor(torch.ones((8, 8, 8), dtype=torch.int32), ScalarType.I32)
 
     # ---- EXPRESSION ----
     types, result = run(WHERE_PROGRAM, {"leaf": leaf})
@@ -75,23 +75,23 @@ def test_where_type():
 
 def test_where_data():
     # ---- SETUP ----
-    np.random.seed(42)
-    leaf_data = np.random.randint(-1, 10, (8, 8, 8)).astype(np.int32)
-    leaf = Value.from_numpy(leaf_data, ScalarType.I32)
+    gen = torch.Generator().manual_seed(42)
+    leaf_data = torch.randint(-1, 10, (8, 8, 8), generator=gen, dtype=torch.int32)
+    leaf = Value.from_tensor(leaf_data, ScalarType.I32)
 
     # ---- EXPRESSION ----
     types, result = run(WHERE_PROGRAM, {"leaf": leaf})
 
     # ---- EXTRACTION ----
-    expected_coords = np.argwhere(leaf_data >= 0).astype(np.int32)
-    np.testing.assert_array_equal(result.data, expected_coords)
+    expected_coords = torch.nonzero(leaf_data >= 0).to(torch.int32)
+    torch.testing.assert_close(result.data, expected_coords, atol=0, rtol=0)
 
 
 def test_gather_active_indices():
     # ---- SETUP ----
-    np.random.seed(42)
-    leaf_data = np.random.randint(-1, 10, (8, 8, 8)).astype(np.int32)
-    leaf = Value.from_numpy(leaf_data, ScalarType.I32)
+    gen = torch.Generator().manual_seed(42)
+    leaf_data = torch.randint(-1, 10, (8, 8, 8), generator=gen, dtype=torch.int32)
+    leaf = Value.from_tensor(leaf_data, ScalarType.I32)
 
     # ---- EXPRESSION ----
     types, result = run(GATHER_IDX_PROGRAM, {"leaf": leaf})
@@ -99,20 +99,22 @@ def test_gather_active_indices():
     # ---- EXTRACTION ----
     assert result.type.iteration_shape == Shape(Dynamic())
     assert result.type.element_type == ScalarType.I32
-    assert np.all(result.data >= 0)
+    assert torch.all(result.data >= 0)
 
-    expected_coords = np.argwhere(leaf_data >= 0).astype(np.int32)
-    expected_vals = leaf_data[tuple(expected_coords[:, i] for i in range(3))]
-    np.testing.assert_array_equal(result.data, expected_vals)
+    expected_coords = torch.nonzero(leaf_data >= 0).to(torch.int32)
+    expected_vals = leaf_data[
+        expected_coords[:, 0], expected_coords[:, 1], expected_coords[:, 2]
+    ]
+    torch.testing.assert_close(result.data, expected_vals, atol=0, rtol=0)
 
 
 def test_gather_features():
     # ---- SETUP ----
-    np.random.seed(42)
-    leaf_data = np.random.randint(-1, 5, (8, 8, 8)).astype(np.int32)
-    leaf = Value.from_numpy(leaf_data, ScalarType.I32)
-    max_idx = int(leaf_data.max()) + 1
-    features_data = np.arange(max_idx * 4, dtype=np.float32).reshape(max_idx, 4)
+    gen = torch.Generator().manual_seed(42)
+    leaf_data = torch.randint(-1, 5, (8, 8, 8), generator=gen, dtype=torch.int32)
+    leaf = Value.from_tensor(leaf_data, ScalarType.I32)
+    max_idx = int(leaf_data.max().item()) + 1
+    features_data = torch.arange(max_idx * 4, dtype=torch.float32).reshape(max_idx, 4)
     features = Value(
         Type(Shape(Dynamic()), Type(Shape(Static(4)), ScalarType.F32)),
         features_data,
@@ -124,22 +126,24 @@ def test_gather_features():
     # ---- EXTRACTION ----
     assert result.type.iteration_shape == Shape(Dynamic())
     assert result.type.element_type == Type(Shape(Static(4)), ScalarType.F32)
-    expected_coords = np.argwhere(leaf_data >= 0).astype(np.int32)
-    expected_idx = leaf_data[tuple(expected_coords[:, i] for i in range(3))]
+    expected_coords = torch.nonzero(leaf_data >= 0).to(torch.int32)
+    expected_idx = leaf_data[
+        expected_coords[:, 0], expected_coords[:, 1], expected_coords[:, 2]
+    ]
     for i in range(len(expected_idx)):
-        np.testing.assert_array_equal(result.data[i], features_data[expected_idx[i]])
+        torch.testing.assert_close(result.data[i], features_data[expected_idx[i].item()], atol=0, rtol=0)
 
 
 def test_full_pipeline():
     """End-to-end: leaf -> mask -> where -> gather indices -> gather features."""
 
     # ---- SETUP ----
-    np.random.seed(123)
-    leaf_data = np.random.randint(-1, 8, (8, 8, 8)).astype(np.int32)
-    leaf = Value.from_numpy(leaf_data, ScalarType.I32)
-    max_idx = int(leaf_data.max()) + 1
+    gen = torch.Generator().manual_seed(123)
+    leaf_data = torch.randint(-1, 8, (8, 8, 8), generator=gen, dtype=torch.int32)
+    leaf = Value.from_tensor(leaf_data, ScalarType.I32)
+    max_idx = int(leaf_data.max().item()) + 1
     C = 3
-    feat_data = np.random.randn(max_idx, C).astype(np.float32)
+    feat_data = torch.randn(max_idx, C, generator=gen, dtype=torch.float32)
     features = Value(
         Type(Shape(Dynamic()), Type(Shape(Static(C)), ScalarType.F32)),
         feat_data,
@@ -153,9 +157,11 @@ def test_full_pipeline():
     assert types["active"] == Type(Shape(Dynamic()), coord_type(3))
 
     # Verify counts and values
-    expected_count = np.sum(leaf_data >= 0)
-    expected_coords = np.argwhere(leaf_data >= 0).astype(np.int32)
-    expected_idx = leaf_data[tuple(expected_coords[:, i] for i in range(3))]
+    expected_count = int(torch.sum(leaf_data >= 0).item())
+    expected_coords = torch.nonzero(leaf_data >= 0).to(torch.int32)
+    expected_idx = leaf_data[
+        expected_coords[:, 0], expected_coords[:, 1], expected_coords[:, 2]
+    ]
     assert result.data.shape[0] == expected_count
 
     print(f"Pipeline OK: {expected_count} active voxels, "

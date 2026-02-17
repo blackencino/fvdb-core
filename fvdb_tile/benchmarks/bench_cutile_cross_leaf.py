@@ -1,13 +1,13 @@
 # Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: Apache-2.0
 """
-Benchmark: cross-leaf neighbor predicate -- cuTile vs numpy vs PyTorch GPU.
+Benchmark: cross-leaf neighbor predicate -- cuTile vs ref vs PyTorch GPU.
 
 Measures wall-clock time for the hierarchical neighbor predicate (Decompose +
 chained Gather through a two-level grid) at parameterized scale.
 
 Three implementations:
-  - numpy (loop): per-coord, per-offset hierarchical lookup
+  - ref (loop): per-coord, per-offset hierarchical lookup
   - PyTorch GPU (vectorized): broadcast + advanced indexing through two levels
   - cuTile (generated): DSL-emitted @ct.kernel via emit_runnable_kernel
 """
@@ -16,7 +16,6 @@ import importlib
 import os
 import time
 
-import numpy as np
 import torch
 
 import cuda.tile as ct
@@ -28,9 +27,9 @@ ConstInt = ct.Constant[int]
 
 _GEN_DIR = os.path.join(os.path.dirname(__file__), "_generated")
 
-FACE_OFFSETS = np.array(
+FACE_OFFSETS = torch.tensor(
     [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]],
-    dtype=np.int32,
+    dtype=torch.int32,
 )
 
 
@@ -47,9 +46,9 @@ def build_grid(n_leaves, seed=42):
 
     Returns: (lower_data, leaf_data, all_global_coords)
     """
-    np.random.seed(seed)
+    torch.manual_seed(seed)
 
-    lower_data = np.full((16, 16, 16), -1, dtype=np.int32)
+    lower_data = torch.full((16, 16, 16), -1, dtype=torch.int32)
 
     # Place leaves in a contiguous 3D block for maximal boundary sharing
     leaf_blocks = []
@@ -70,55 +69,56 @@ def build_grid(n_leaves, seed=42):
 
     # Generate leaves with ~60% active voxels
     for _ in range(n_leaves):
-        leaf = np.full((8, 8, 8), -1, dtype=np.int32)
-        n_active = np.random.randint(280, 340)
-        positions = np.random.choice(512, n_active, replace=False)
+        leaf = torch.full((8, 8, 8), -1, dtype=torch.int32)
+        n_active = torch.randint(280, 340, (1,)).item()
+        positions = torch.randperm(512)[:n_active]
         for idx, pos in enumerate(positions):
-            vx = pos // 64
-            vy = (pos // 8) % 8
-            vz = pos % 8
+            vx = pos.item() // 64
+            vy = (pos.item() // 8) % 8
+            vz = pos.item() % 8
             leaf[vx, vy, vz] = len(leaf_blocks) * 1000 + idx
         leaf_blocks.append(leaf)
 
-    leaf_data = np.stack(leaf_blocks)
+    leaf_data = torch.stack(leaf_blocks)
 
     # Collect all active global coords
     all_coords = []
     for li, (lx, ly, lz) in enumerate(active_lower):
         leaf = leaf_data[li]
-        active_voxels = np.argwhere(leaf >= 0).astype(np.int32)
+        active_voxels = torch.nonzero(leaf >= 0).to(torch.int32)
         for vl in active_voxels:
-            gc = np.array(
-                [lx * 8 + vl[0], ly * 8 + vl[1], lz * 8 + vl[2]], dtype=np.int32
+            gc = torch.tensor(
+                [lx * 8 + vl[0].item(), ly * 8 + vl[1].item(), lz * 8 + vl[2].item()],
+                dtype=torch.int32,
             )
             all_coords.append(gc)
-    all_coords = np.array(all_coords, dtype=np.int32)
+    all_coords = torch.stack(all_coords)
 
     return lower_data, leaf_data, all_coords
 
 
 # ---------------------------------------------------------------------------
-# numpy reference
+# ref reference
 # ---------------------------------------------------------------------------
 
 
-def numpy_cross_leaf(lower_data, leaf_data, coords, offsets):
-    """Brute-force numpy: per-coord, per-offset hierarchical lookup."""
+def ref_cross_leaf(lower_data, leaf_data, coords, offsets):
+    """Brute-force ref: per-coord, per-offset hierarchical lookup."""
     N = coords.shape[0]
     N_OFF = offsets.shape[0]
-    result = np.zeros((N, N_OFF), dtype=bool)
+    result = torch.zeros((N, N_OFF), dtype=torch.bool)
     for i in range(N):
         c = coords[i]
         for j in range(N_OFF):
             nbr = c + offsets[j]
             ll = (nbr >> 3) & 15
             vl = nbr & 7
-            if np.any(ll < 0) or np.any(ll >= 16):
+            if torch.any(ll < 0) or torch.any(ll >= 16):
                 continue
-            leaf_idx = lower_data[ll[0], ll[1], ll[2]]
+            leaf_idx = lower_data[ll[0].item(), ll[1].item(), ll[2].item()]
             if leaf_idx < 0 or leaf_idx >= leaf_data.shape[0]:
                 continue
-            if leaf_data[leaf_idx, vl[0], vl[1], vl[2]] >= 0:
+            if leaf_data[leaf_idx, vl[0].item(), vl[1].item(), vl[2].item()] >= 0:
                 result[i, j] = True
     return result
 
@@ -270,35 +270,35 @@ def bench(n_leaves=64):
         cl = (coord >> 3) & 15
         for off in FACE_OFFSETS:
             nl = ((coord + off) >> 3) & 15
-            if not np.array_equal(cl, nl):
+            if not torch.equal(cl, nl):
                 n_cross += 1
 
     print(f"Grid: {K} leaves, {N} active voxels, {N * 6} lookups, {n_cross} cross-leaf")
 
     # Verify all implementations agree
-    ref = numpy_cross_leaf(lower_data, leaf_data, all_coords, FACE_OFFSETS)
-    total_active = int(ref.sum())
+    ref = ref_cross_leaf(lower_data, leaf_data, all_coords, FACE_OFFSETS)
+    total_active = int(ref.sum().item())
 
-    lower_t = torch.from_numpy(lower_data.copy()).cuda()
-    leaf_arr_t = torch.from_numpy(leaf_data.copy()).cuda()
-    coord_t = torch.from_numpy(all_coords.copy()).cuda()
-    offsets_t = torch.from_numpy(FACE_OFFSETS.copy()).cuda()
+    lower_t = lower_data.clone().cuda()
+    leaf_arr_t = leaf_data.clone().cuda()
+    coord_t = all_coords.clone().cuda()
+    offsets_t = FACE_OFFSETS.clone().cuda()
 
     pt_gpu = pytorch_gpu_cross_leaf(lower_t, leaf_arr_t, coord_t, offsets_t)
-    pt_result = pt_gpu.cpu().numpy()
-    np.testing.assert_array_equal(ref, pt_result)
+    pt_result = pt_gpu.cpu()
+    torch.testing.assert_close(ref, pt_result, atol=0, rtol=0)
 
     kernel_fn, tile_size, map_len = build_cutile_launcher(K)
     result_t = torch.zeros(N, tile_size, dtype=torch.int32, device="cuda")
     cutile_cross_leaf(kernel_fn, coord_t, offsets_t, lower_t, leaf_arr_t, result_t, tile_size)
-    ct_result = result_t.cpu().numpy()[:, :map_len].astype(bool)
-    np.testing.assert_array_equal(ref, ct_result)
+    ct_result = result_t.cpu()[:, :map_len].to(torch.bool)
+    torch.testing.assert_close(ref, ct_result, atol=0, rtol=0)
 
     print(f"All agree: {total_active} active neighbors.\n")
 
     # Benchmark
-    t_numpy = _time_fn(
-        lambda: numpy_cross_leaf(lower_data, leaf_data, all_coords, FACE_OFFSETS),
+    t_ref = _time_fn(
+        lambda: ref_cross_leaf(lower_data, leaf_data, all_coords, FACE_OFFSETS),
         warmup=1,
         repeats=3,
     )
@@ -312,11 +312,11 @@ def bench(n_leaves=64):
 
     t_cutile = _time_fn(_run_cutile)
 
-    print(f"{'Method':<25} {'Median (us)':>12} {'vs numpy':>10} {'vs GPU PyTorch':>15}")
+    print(f"{'Method':<25} {'Median (us)':>12} {'vs ref':>10} {'vs GPU PyTorch':>15}")
     print("-" * 65)
-    print(f"{'numpy (loop)':<25} {t_numpy:>12.0f} {'1.0x':>10} {'':<15}")
-    print(f"{'PyTorch GPU (vectorized)':<25} {t_pt_gpu:>12.1f} {t_numpy / t_pt_gpu:>9.1f}x {'1.0x':>15}")
-    print(f"{'cuTile (generated)':<25} {t_cutile:>12.1f} {t_numpy / t_cutile:>9.1f}x {t_pt_gpu / t_cutile:>14.1f}x")
+    print(f"{'ref (loop)':<25} {t_ref:>12.0f} {'1.0x':>10} {'':<15}")
+    print(f"{'PyTorch GPU (vectorized)':<25} {t_pt_gpu:>12.1f} {t_ref / t_pt_gpu:>9.1f}x {'1.0x':>15}")
+    print(f"{'cuTile (generated)':<25} {t_cutile:>12.1f} {t_ref / t_cutile:>9.1f}x {t_pt_gpu / t_cutile:>14.1f}x")
 
     return {
         "n_leaves": n_leaves,
@@ -324,7 +324,7 @@ def bench(n_leaves=64):
         "n_lookups": N * 6,
         "n_cross_leaf": n_cross,
         "active_neighbors": total_active,
-        "numpy_us": t_numpy,
+        "ref_us": t_ref,
         "pytorch_gpu_us": t_pt_gpu,
         "cutile_us": t_cutile,
     }
@@ -338,7 +338,7 @@ if __name__ == "__main__":
         results.append(bench(n_leaves))
 
     print("\n\n=== Summary ===")
-    print(f"{'Leaves':>7} {'Voxels':>8} {'Lookups':>10} {'numpy (us)':>12} {'PyTorch (us)':>13} {'cuTile (us)':>12} {'CT/PT':>7}")
+    print(f"{'Leaves':>7} {'Voxels':>8} {'Lookups':>10} {'ref (us)':>12} {'PyTorch (us)':>13} {'cuTile (us)':>12} {'CT/PT':>7}")
     print("-" * 75)
     for r in results:
         ct_vs_pt = r["pytorch_gpu_us"] / r["cutile_us"]
@@ -346,7 +346,7 @@ if __name__ == "__main__":
             f"{r['n_leaves']:>7} "
             f"{r['n_voxels']:>8} "
             f"{r['n_lookups']:>10} "
-            f"{r['numpy_us']:>12.0f} "
+            f"{r['ref_us']:>12.0f} "
             f"{r['pytorch_gpu_us']:>12.1f} "
             f"{r['cutile_us']:>12.1f} "
             f"{ct_vs_pt:>6.1f}x"

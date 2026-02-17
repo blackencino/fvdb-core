@@ -7,7 +7,6 @@ Validates the toolchain and confirms computed-index access works on
 the current Blackwell hardware. Pattern adapted from TileGym softmax.
 """
 
-import numpy as np
 import torch
 
 import cuda.tile as ct
@@ -47,39 +46,45 @@ def gather_2d_smoke(data, result, TILE: ConstInt, COLS: ConstInt):
 
 def test_vector_add():
     """1D vector add via gather/scatter with computed offsets."""
+    if not torch.cuda.is_available():
+        print("  SKIP: no CUDA device")
+        return
     N = 1024
     TILE = 128
-    a_np = np.random.randn(N).astype(np.float32)
-    b_np = np.random.randn(N).astype(np.float32)
-    expected = a_np + b_np
+    gen = torch.Generator().manual_seed(42)
+    a = torch.randn(N, generator=gen, dtype=torch.float32)
+    b = torch.randn(N, generator=gen, dtype=torch.float32)
+    expected = a + b
 
-    a = torch.from_numpy(a_np).cuda()
-    b = torch.from_numpy(b_np).cuda()
+    a_cuda = a.cuda()
+    b_cuda = b.cuda()
     result = torch.zeros(N, dtype=torch.float32, device="cuda")
 
     grid = (N // TILE,)
-    ct.launch(torch.cuda.current_stream(), grid, vector_add_gather, (a, b, result, N, TILE))
+    ct.launch(torch.cuda.current_stream(), grid, vector_add_gather, (a_cuda, b_cuda, result, N, TILE))
 
-    result_np = result.cpu().numpy()
-    np.testing.assert_allclose(result_np, expected, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(result.cpu(), expected, rtol=1e-5, atol=1e-5)
     print(f"  vector_add: {N} elements, TILE={TILE} -- PASSED")
 
 
 def test_gather_2d():
     """2D gather with computed (row, col) indices -- validates multi-dim indexing."""
+    if not torch.cuda.is_available():
+        print("  SKIP: no CUDA device")
+        return
     ROWS, COLS = 32, 64
     TILE = 64
-    data_np = np.random.randn(ROWS, COLS).astype(np.float32)
-    expected = data_np * 2.0
+    gen = torch.Generator().manual_seed(42)
+    data = torch.randn(ROWS, COLS, generator=gen, dtype=torch.float32)
+    expected = data * 2.0
 
-    data = torch.from_numpy(data_np).cuda()
+    data_cuda = data.cuda()
     result = torch.zeros(ROWS, COLS, dtype=torch.float32, device="cuda")
 
     grid = (ROWS,)
-    ct.launch(torch.cuda.current_stream(), grid, gather_2d_smoke, (data, result, TILE, COLS))
+    ct.launch(torch.cuda.current_stream(), grid, gather_2d_smoke, (data_cuda, result, TILE, COLS))
 
-    result_np = result.cpu().numpy()
-    np.testing.assert_allclose(result_np, expected, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(result.cpu(), expected, rtol=1e-5, atol=1e-5)
     print(f"  gather_2d: ({ROWS},{COLS}), TILE={TILE} -- PASSED")
 
 

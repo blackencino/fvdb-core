@@ -8,7 +8,7 @@ The jagged extent kind (~) emerges automatically from variable-length
 filtering within Each.
 """
 
-import numpy as np
+import torch
 
 from fvdb_tile.prototype.dsl_eval import run
 from fvdb_tile.prototype.ops import Value
@@ -41,12 +41,12 @@ filtered
 # ---------------------------------------------------------------------------
 
 def _in_bounds(coord, lo=0, hi=8):
-    return bool(np.all(coord >= lo) and np.all(coord < hi))
+    return bool(torch.all(coord >= lo).item() and torch.all(coord < hi).item())
 
 
-FACE_OFFSETS = np.array(
+FACE_OFFSETS = torch.tensor(
     [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]],
-    dtype=np.int32,
+    dtype=torch.int32,
 )
 
 
@@ -58,9 +58,9 @@ def test_neighbor_types():
     """Verify type propagation through the neighbor-finding expression."""
 
     # ---- SETUP ----
-    np.random.seed(42)
-    leaf_data = np.random.randint(-1, 10, (8, 8, 8)).astype(np.int32)
-    leaf = Value.from_numpy(leaf_data, ScalarType.I32)
+    gen = torch.Generator().manual_seed(42)
+    leaf_data = torch.randint(-1, 10, (8, 8, 8), generator=gen, dtype=torch.int32)
+    leaf = Value.from_tensor(leaf_data, ScalarType.I32)
     offsets = Value(
         Type(Shape(Static(6)), Type(Shape(Static(3)), ScalarType.I32)),
         FACE_OFFSETS,
@@ -88,9 +88,9 @@ def test_neighbor_data():
     """Verify numerical correctness against brute-force reference."""
 
     # ---- SETUP ----
-    np.random.seed(42)
-    leaf_data = np.random.randint(-1, 10, (8, 8, 8)).astype(np.int32)
-    leaf = Value.from_numpy(leaf_data, ScalarType.I32)
+    gen = torch.Generator().manual_seed(42)
+    leaf_data = torch.randint(-1, 10, (8, 8, 8), generator=gen, dtype=torch.int32)
+    leaf = Value.from_tensor(leaf_data, ScalarType.I32)
     offsets = Value(
         Type(Shape(Static(6)), Type(Shape(Static(3)), ScalarType.I32)),
         FACE_OFFSETS,
@@ -101,34 +101,36 @@ def test_neighbor_data():
 
     # ---- EXTRACTION ----
     mask_data = leaf_data >= 0
-    active_coords = np.argwhere(mask_data).astype(np.int32)
+    active_coords = torch.nonzero(mask_data).to(torch.int32)
 
     assert len(result.data) == len(active_coords)
 
     neighbor_counts = []
     for i, coord in enumerate(active_coords):
-        nbrs = coord[np.newaxis, :] + FACE_OFFSETS
-        valid = [nb for nb in nbrs if _in_bounds(nb) and mask_data[nb[0], nb[1], nb[2]]]
-        ref = np.array(valid, dtype=np.int32).reshape(-1, 3)
+        nbrs = coord.unsqueeze(0) + FACE_OFFSETS
+        valid = [nb for nb in nbrs if _in_bounds(nb) and mask_data[nb[0].item(), nb[1].item(), nb[2].item()].item()]
+        ref = torch.stack(valid).to(torch.int32) if valid else torch.empty((0, 3), dtype=torch.int32)
 
         actual = result.data[i].data
-        np.testing.assert_array_equal(actual, ref)
+        torch.testing.assert_close(actual, ref, atol=0, rtol=0)
         neighbor_counts.append(len(ref))
 
-    neighbor_counts = np.array(neighbor_counts)
-    print(f"Neighbor data OK: {len(active_coords)} active, "
-          f"min={neighbor_counts.min()} max={neighbor_counts.max()} "
-          f"mean={neighbor_counts.mean():.1f}")
-    assert neighbor_counts.min() != neighbor_counts.max(), "Expected jagged"
+    neighbor_counts = torch.tensor(neighbor_counts)
+    print(
+        f"Neighbor data OK: {len(active_coords)} active, "
+        f"min={neighbor_counts.min().item()} max={neighbor_counts.max().item()} "
+        f"mean={neighbor_counts.float().mean().item():.1f}"
+    )
+    assert neighbor_counts.min().item() != neighbor_counts.max().item(), "Expected jagged"
 
 
 def test_jagged_type_emerges():
     """The key test: does ~ appear in the type from the DSL?"""
 
     # ---- SETUP ----
-    np.random.seed(99)
-    leaf_data = np.random.randint(-1, 4, (8, 8, 8)).astype(np.int32)
-    leaf = Value.from_numpy(leaf_data, ScalarType.I32)
+    gen = torch.Generator().manual_seed(99)
+    leaf_data = torch.randint(-1, 4, (8, 8, 8), generator=gen, dtype=torch.int32)
+    leaf = Value.from_tensor(leaf_data, ScalarType.I32)
     offsets = Value(
         Type(Shape(Static(6)), Type(Shape(Static(3)), ScalarType.I32)),
         FACE_OFFSETS,

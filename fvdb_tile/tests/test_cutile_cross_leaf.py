@@ -18,7 +18,6 @@ This is the v6 milestone: DSL string -> GPU execution for cross-leaf traversal.
 import importlib
 import os
 
-import numpy as np
 import torch
 
 import cuda.tile as ct
@@ -90,9 +89,9 @@ INPUT_TYPES = {
     ),
 }
 
-FACE_OFFSETS = np.array(
+FACE_OFFSETS = torch.tensor(
     [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]],
-    dtype=np.int32,
+    dtype=torch.int32,
 )
 
 
@@ -103,56 +102,57 @@ FACE_OFFSETS = np.array(
 
 def _build_grid(seed=42):
     """Build a two-level grid with known active voxels near leaf boundaries."""
-    np.random.seed(seed)
+    gen = torch.Generator().manual_seed(seed)
 
-    lower_data = np.full((16, 16, 16), -1, dtype=np.int32)
+    lower_data = torch.full((16, 16, 16), -1, dtype=torch.int32)
 
     active_lower = [(3, 4, 5), (3, 4, 6), (3, 5, 5), (4, 4, 5)]
     leaf_blocks = []
     for i, (lx, ly, lz) in enumerate(active_lower):
         lower_data[lx, ly, lz] = i
-        leaf = np.full((8, 8, 8), -1, dtype=np.int32)
-        n_active = np.random.randint(100, 300)
-        positions = np.random.choice(512, n_active, replace=False)
+        leaf = torch.full((8, 8, 8), -1, dtype=torch.int32)
+        n_active = torch.randint(100, 300, (1,), generator=gen, dtype=torch.int32).item()
+        positions = torch.randperm(512, generator=gen)[:n_active]
         for idx, pos in enumerate(positions):
-            vx = pos // 64
-            vy = (pos // 8) % 8
-            vz = pos % 8
+            pos_val = int(pos)
+            vx = pos_val // 64
+            vy = (pos_val // 8) % 8
+            vz = pos_val % 8
             leaf[vx, vy, vz] = i * 1000 + idx
         leaf_blocks.append(leaf)
 
-    leaf_data = np.stack(leaf_blocks)
+    leaf_data = torch.stack(leaf_blocks)
     return lower_data, leaf_data, active_lower
 
 
 def _global_coord(lower_coord, leaf_coord):
-    return np.array(
+    return torch.tensor(
         [
-            lower_coord[0] * 8 + leaf_coord[0],
-            lower_coord[1] * 8 + leaf_coord[1],
-            lower_coord[2] * 8 + leaf_coord[2],
+            lower_coord[0] * 8 + int(leaf_coord[0]),
+            lower_coord[1] * 8 + int(leaf_coord[1]),
+            lower_coord[2] * 8 + int(leaf_coord[2]),
         ],
-        dtype=np.int32,
+        dtype=torch.int32,
     )
 
 
 def _numpy_cross_leaf_reference(lower_data, leaf_data, active_coords, offsets):
-    """Numpy reference: hierarchical cross-leaf neighbor predicate."""
+    """Reference: hierarchical cross-leaf neighbor predicate."""
     N = active_coords.shape[0]
     N_OFF = offsets.shape[0]
-    result = np.zeros((N, N_OFF), dtype=bool)
+    result = torch.zeros((N, N_OFF), dtype=torch.bool)
     for i in range(N):
         coord = active_coords[i]
         for j in range(N_OFF):
             nbr = coord + offsets[j]
             ll = (nbr >> 3) & 15
             vl = nbr & 7
-            if np.any(ll < 0) or np.any(ll >= 16):
+            if (ll < 0).any() or (ll >= 16).any():
                 continue
-            leaf_idx = lower_data[ll[0], ll[1], ll[2]]
+            leaf_idx = int(lower_data[ll[0], ll[1], ll[2]])
             if leaf_idx < 0 or leaf_idx >= leaf_data.shape[0]:
                 continue
-            if np.any(vl < 0) or np.any(vl >= 8):
+            if (vl < 0).any() or (vl >= 8).any():
                 continue
             if leaf_data[leaf_idx, vl[0], vl[1], vl[2]] >= 0:
                 result[i, j] = True
@@ -229,17 +229,17 @@ def test_compile_and_launch():
     all_coords = []
     for li, (lx, ly, lz) in enumerate(active_lower):
         leaf = leaf_data[li]
-        active_leaf = np.argwhere(leaf >= 0).astype(np.int32)
+        active_leaf = torch.nonzero(leaf >= 0).to(torch.int32)
         for vl in active_leaf:
             all_coords.append(_global_coord((lx, ly, lz), vl))
-    all_coords = np.array(all_coords, dtype=np.int32)
+    all_coords = torch.stack(all_coords).to(torch.int32)
     N = all_coords.shape[0]
 
     # GPU tensors
-    coord_t = torch.from_numpy(all_coords.copy()).cuda()
-    offsets_t = torch.from_numpy(FACE_OFFSETS.copy()).cuda()
-    lower_t = torch.from_numpy(lower_data.copy()).cuda()
-    leaf_arr_t = torch.from_numpy(leaf_data.copy()).cuda()
+    coord_t = all_coords.clone().cuda()
+    offsets_t = FACE_OFFSETS.clone().cuda()
+    lower_t = lower_data.clone().cuda()
+    leaf_arr_t = leaf_data.clone().cuda()
     result_t = torch.zeros(N, tile_size, dtype=torch.int32, device="cuda")
 
     # Launch
@@ -250,13 +250,13 @@ def test_compile_and_launch():
         (coord_t, offsets_t, lower_t, leaf_arr_t, result_t, tile_size),
     )
 
-    gpu_result = result_t.cpu().numpy()[:, :map_len].astype(bool)
+    gpu_result = result_t.cpu()[:, :map_len].to(torch.bool)
 
-    # Numpy reference
+    # Reference
     ref_result = _numpy_cross_leaf_reference(lower_data, leaf_data, all_coords, FACE_OFFSETS)
 
-    np.testing.assert_array_equal(gpu_result, ref_result)
-    total = int(ref_result.sum())
+    torch.testing.assert_close(gpu_result, ref_result, atol=0, rtol=0)
+    total = int(ref_result.sum().item())
     n_cross = _count_cross_leaf(all_coords, FACE_OFFSETS)
     print(
         f"  compile_and_launch: {N} voxels, {total} active neighbors, "
@@ -300,22 +300,23 @@ def test_dsl_eval_vs_generated():
     all_coords = []
     for li, (lx, ly, lz) in enumerate(active_lower):
         leaf = leaf_data[li]
-        active_leaf = np.argwhere(leaf >= 0).astype(np.int32)
+        active_leaf = torch.nonzero(leaf >= 0).to(torch.int32)
         for vl in active_leaf:
             all_coords.append(_global_coord((lx, ly, lz), vl))
-    all_coords = np.array(all_coords, dtype=np.int32)
+    all_coords = torch.stack(all_coords).to(torch.int32)
 
     # Use a subset for DSL evaluator (per-coord loop is slow)
-    rng = np.random.RandomState(42)
-    test_indices = rng.choice(len(all_coords), min(100, len(all_coords)), replace=False)
+    gen = torch.Generator().manual_seed(42)
+    n_test = min(100, len(all_coords))
+    test_indices = torch.randperm(len(all_coords), generator=gen)[:n_test]
     test_coords = all_coords[test_indices]
     N_test = len(test_coords)
 
     # --- GPU path ---
-    coord_t = torch.from_numpy(test_coords.copy()).cuda()
-    offsets_t = torch.from_numpy(FACE_OFFSETS.copy()).cuda()
-    lower_t = torch.from_numpy(lower_data.copy()).cuda()
-    leaf_arr_t = torch.from_numpy(leaf_data.copy()).cuda()
+    coord_t = test_coords.clone().cuda()
+    offsets_t = FACE_OFFSETS.clone().cuda()
+    lower_t = lower_data.clone().cuda()
+    leaf_arr_t = leaf_data.clone().cuda()
     result_t = torch.zeros(N_test, tile_size, dtype=torch.int32, device="cuda")
 
     ct.launch(
@@ -324,7 +325,7 @@ def test_dsl_eval_vs_generated():
         kernel_fn,
         (coord_t, offsets_t, lower_t, leaf_arr_t, result_t, tile_size),
     )
-    gpu_result = result_t.cpu().numpy()[:, :map_len].astype(bool)
+    gpu_result = result_t.cpu()[:, :map_len].to(torch.bool)
 
     # --- DSL evaluator path (per-coord, using the flat cross-leaf program) ---
     FLAT_PROGRAM = """
@@ -348,10 +349,11 @@ is_active
         leaf_data,
     )
 
-    dsl_result = np.zeros((N_test, 6), dtype=bool)
+    dsl_result = torch.zeros((N_test, 6), dtype=torch.bool)
     for i in range(N_test):
         coord_val = Value(Type(Shape(Static(3)), ScalarType.I32), test_coords[i])
-        for j, off in enumerate(FACE_OFFSETS):
+        for j in range(FACE_OFFSETS.shape[0]):
+            off = FACE_OFFSETS[j]
             offset_val = Value(Type(Shape(Static(3)), ScalarType.I32), off)
             _, result = dsl_run(
                 FLAT_PROGRAM,
@@ -365,7 +367,7 @@ is_active
             dsl_result[i, j] = bool(result.data)
 
     # Compare
-    np.testing.assert_array_equal(gpu_result, dsl_result)
+    torch.testing.assert_close(gpu_result, dsl_result, atol=0, rtol=0)
     total = int(gpu_result.sum())
     print(
         f"  dsl_eval_vs_generated: {N_test} voxels, {total} active neighbors, "
@@ -383,10 +385,11 @@ def _count_cross_leaf(coords, offsets):
     n_cross = 0
     for coord in coords:
         coord_lower = (coord >> 3) & 15
-        for off in offsets:
+        for idx in range(offsets.shape[0]):
+            off = offsets[idx]
             nbr = coord + off
             nbr_lower = (nbr >> 3) & 15
-            if not np.array_equal(coord_lower, nbr_lower):
+            if not torch.equal(coord_lower, nbr_lower):
                 n_cross += 1
     return n_cross
 

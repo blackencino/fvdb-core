@@ -12,7 +12,7 @@ Validates:
   6. Composition: outer product -> fuse
 """
 
-import numpy as np
+import torch
 import pytest
 
 from fvdb_tile.prototype.dsl_eval import run
@@ -33,19 +33,19 @@ from fvdb_tile.prototype.types import (
 
 def test_fuse_basic():
     """fuse((5,) / (3,) / i32) = (5, 3) / i32."""
-    data = np.arange(15, dtype=np.int32).reshape(5, 3)
+    data = torch.arange(15, dtype=torch.int32).reshape(5, 3)
     x = Value(Type(Shape(Static(5)), Type(Shape(Static(3)), ScalarType.I32)), data)
 
     types, result = run("y = fuse(Input(\"x\"))\ny", {"x": x})
 
     assert result.type == Type(Shape(Static(5), Static(3)), ScalarType.I32)
-    np.testing.assert_array_equal(result.data, data)
+    torch.testing.assert_close(result.data, data, atol=0, rtol=0)
     print(f"  fuse((5,) / (3,) / i32) = {result.type}")
 
 
 def test_fuse_multi_rank_inner():
     """fuse((2,) / (3, 4) / i32) = (2, 3, 4) / i32."""
-    data = np.arange(24, dtype=np.int32).reshape(2, 3, 4)
+    data = torch.arange(24, dtype=torch.int32).reshape(2, 3, 4)
     x = Value(
         Type(Shape(Static(2)), Type(Shape(Static(3), Static(4)), ScalarType.I32)),
         data,
@@ -54,7 +54,7 @@ def test_fuse_multi_rank_inner():
     types, result = run("y = fuse(Input(\"x\"))\ny", {"x": x})
 
     assert result.type == Type(Shape(Static(2), Static(3), Static(4)), ScalarType.I32)
-    np.testing.assert_array_equal(result.data, data)
+    torch.testing.assert_close(result.data, data, atol=0, rtol=0)
     print(f"  fuse((2,) / (3, 4) / i32) = {result.type}")
 
 
@@ -62,9 +62,9 @@ def test_fuse_rejects_jagged():
     """fuse must reject inner leading shape with Jagged extents."""
     jagged_type = Type(Shape(Static(3)), Type(Shape(Jagged()), ScalarType.I32))
     x = Value(jagged_type, [
-        Value(Type(Shape(Dynamic()), ScalarType.I32), np.array([1, 2], dtype=np.int32)),
-        Value(Type(Shape(Dynamic()), ScalarType.I32), np.array([3], dtype=np.int32)),
-        Value(Type(Shape(Dynamic()), ScalarType.I32), np.array([4, 5, 6], dtype=np.int32)),
+        Value(Type(Shape(Dynamic()), ScalarType.I32), torch.tensor([1, 2], dtype=torch.int32)),
+        Value(Type(Shape(Dynamic()), ScalarType.I32), torch.tensor([3], dtype=torch.int32)),
+        Value(Type(Shape(Dynamic()), ScalarType.I32), torch.tensor([4, 5, 6], dtype=torch.int32)),
     ])
 
     with pytest.raises(TypeError, match="Jagged"):
@@ -74,7 +74,7 @@ def test_fuse_rejects_jagged():
 
 def test_fuse_rejects_scalar_element():
     """fuse requires nested type, not scalar element."""
-    x = Value(Type(Shape(Static(5)), ScalarType.I32), np.arange(5, dtype=np.int32))
+    x = Value(Type(Shape(Static(5)), ScalarType.I32), torch.arange(5, dtype=torch.int32))
 
     with pytest.raises(TypeError, match="scalar element"):
         run("y = fuse(Input(\"x\"))\ny", {"x": x})
@@ -87,7 +87,7 @@ def test_fuse_rejects_scalar_element():
 
 def test_flatten_triple_nested():
     """flatten((5,) / (3,) / (2,) / i32) = (5, 3, 2) / i32."""
-    data = np.arange(30, dtype=np.int32).reshape(5, 3, 2)
+    data = torch.arange(30, dtype=torch.int32).reshape(5, 3, 2)
     x = Value(
         Type(
             Shape(Static(5)),
@@ -99,19 +99,19 @@ def test_flatten_triple_nested():
     types, result = run("y = flatten(Input(\"x\"))\ny", {"x": x})
 
     assert result.type == Type(Shape(Static(5), Static(3), Static(2)), ScalarType.I32)
-    np.testing.assert_array_equal(result.data, data)
+    torch.testing.assert_close(result.data, data, atol=0, rtol=0)
     print(f"  flatten((5,) / (3,) / (2,) / i32) = {result.type}")
 
 
 def test_flatten_already_flat():
     """flatten on already-flat type is a no-op."""
-    data = np.arange(12, dtype=np.int32).reshape(3, 4)
+    data = torch.arange(12, dtype=torch.int32).reshape(3, 4)
     x = Value(Type(Shape(Static(3), Static(4)), ScalarType.I32), data)
 
     types, result = run("y = flatten(Input(\"x\"))\ny", {"x": x})
 
     assert result.type == Type(Shape(Static(3), Static(4)), ScalarType.I32)
-    np.testing.assert_array_equal(result.data, data)
+    torch.testing.assert_close(result.data, data, atol=0, rtol=0)
     print("  flatten on flat type is no-op")
 
 
@@ -121,20 +121,20 @@ def test_flatten_already_flat():
 
 def test_permute_basic():
     """permute((3, 4, 5) / i32, [2, 0, 1]) = (5, 3, 4) / i32."""
-    data = np.arange(60, dtype=np.int32).reshape(3, 4, 5)
+    data = torch.arange(60, dtype=torch.int32).reshape(3, 4, 5)
     x = Value(Type(Shape(Static(3), Static(4), Static(5)), ScalarType.I32), data)
 
     types, result = run("y = permute(Input(\"x\"), [2, 0, 1])\ny", {"x": x})
 
     assert result.type == Type(Shape(Static(5), Static(3), Static(4)), ScalarType.I32)
-    expected = np.transpose(data, (2, 0, 1))
-    np.testing.assert_array_equal(result.data, expected)
+    expected = data.permute(2, 0, 1)
+    torch.testing.assert_close(result.data, expected, atol=0, rtol=0)
     print(f"  permute((3,4,5)/i32, [2,0,1]) = {result.type}")
 
 
 def test_permute_preserves_element():
     """permute only affects leading shape, element type unchanged."""
-    data = np.arange(24, dtype=np.int32).reshape(3, 4, 2)
+    data = torch.arange(24, dtype=torch.int32).reshape(3, 4, 2)
     x = Value(
         Type(Shape(Static(3), Static(4)), Type(Shape(Static(2)), ScalarType.I32)),
         data,
@@ -146,8 +146,8 @@ def test_permute_preserves_element():
     inner = result.type.element_type
     assert isinstance(inner, Type)
     assert inner == Type(Shape(Static(2)), ScalarType.I32)
-    expected = np.transpose(data, (1, 0, 2))
-    np.testing.assert_array_equal(result.data, expected)
+    expected = data.permute(1, 0, 2)
+    torch.testing.assert_close(result.data, expected, atol=0, rtol=0)
     print(f"  permute preserves element type: {result.type}")
 
 
@@ -157,8 +157,8 @@ def test_permute_preserves_element():
 
 def test_each_both_elementwise_add():
     """EachBoth(Add, x, y) with matching shapes: elementwise addition."""
-    x_data = np.array([1, 2, 3], dtype=np.int32)
-    y_data = np.array([10, 20, 30], dtype=np.int32)
+    x_data = torch.tensor([1, 2, 3], dtype=torch.int32)
+    y_data = torch.tensor([10, 20, 30], dtype=torch.int32)
     x = Value(Type(Shape(Static(3)), ScalarType.I32), x_data)
     y = Value(Type(Shape(Static(3)), ScalarType.I32), y_data)
 
@@ -168,14 +168,14 @@ def test_each_both_elementwise_add():
     )
 
     assert result.type == Type(Shape(Static(3)), ScalarType.I32)
-    np.testing.assert_array_equal(result.data, [11, 22, 33])
+    torch.testing.assert_close(result.data, torch.tensor([11, 22, 33], dtype=torch.int32), atol=0, rtol=0)
     print(f"  EachBoth(Add, [1,2,3], [10,20,30]) = {result.data.tolist()}")
 
 
 def test_each_both_nested_elements():
     """EachBoth with non-scalar elements: (3,) / (2,) i32."""
-    x_data = np.array([[1, 2], [3, 4], [5, 6]], dtype=np.int32)
-    y_data = np.array([[10, 20], [30, 40], [50, 60]], dtype=np.int32)
+    x_data = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int32)
+    y_data = torch.tensor([[10, 20], [30, 40], [50, 60]], dtype=torch.int32)
     inner_ty = Type(Shape(Static(2)), ScalarType.I32)
     x = Value(Type(Shape(Static(3)), inner_ty), x_data)
     y = Value(Type(Shape(Static(3)), inner_ty), y_data)
@@ -187,14 +187,14 @@ def test_each_both_nested_elements():
 
     assert result.type.iteration_shape == Shape(Static(3))
     expected = x_data + y_data
-    np.testing.assert_array_equal(result.data, expected)
+    torch.testing.assert_close(result.data, expected, atol=0, rtol=0)
     print(f"  EachBoth(Add) on (3,)/(2,) i32: correct")
 
 
 def test_each_both_type_mismatch():
     """EachBoth rejects mismatched leading shapes."""
-    x = Value(Type(Shape(Static(3)), ScalarType.I32), np.array([1, 2, 3], dtype=np.int32))
-    y = Value(Type(Shape(Static(5)), ScalarType.I32), np.arange(5, dtype=np.int32))
+    x = Value(Type(Shape(Static(3)), ScalarType.I32), torch.tensor([1, 2, 3], dtype=torch.int32))
+    y = Value(Type(Shape(Static(5)), ScalarType.I32), torch.arange(5, dtype=torch.int32))
 
     with pytest.raises(TypeError, match="mismatch"):
         run(
@@ -210,7 +210,7 @@ def test_each_both_type_mismatch():
 
 def test_cut_fuse_roundtrip():
     """cut(-3, x) then fuse recovers the original type and data."""
-    data = np.arange(15, dtype=np.int32)
+    data = torch.arange(15, dtype=torch.int32)
     x = Value(Type(Shape(Static(15)), ScalarType.I32), data)
 
     prog = """
@@ -221,7 +221,7 @@ fused
     types, result = run(prog, {"x": x})
 
     assert result.type == Type(Shape(Static(5), Static(3)), ScalarType.I32)
-    np.testing.assert_array_equal(result.data.ravel(), data)
+    torch.testing.assert_close(result.data.flatten(), data, atol=0, rtol=0)
     print(f"  cut(-3) then fuse: (15,)/i32 -> (5,)/(3,)/i32 -> (5,3)/i32")
 
 
@@ -231,8 +231,8 @@ fused
 
 def test_outer_product_then_fuse():
     """EachRight(EachLeft(Add)) then fuse merges the nesting."""
-    x_data = np.array([1, 2, 3], dtype=np.int32)
-    y_data = np.array([10, 20], dtype=np.int32)
+    x_data = torch.tensor([1, 2, 3], dtype=torch.int32)
+    y_data = torch.tensor([10, 20], dtype=torch.int32)
     x = Value(Type(Shape(Static(3)), ScalarType.I32), x_data)
     y = Value(Type(Shape(Static(2)), ScalarType.I32), y_data)
 
@@ -245,8 +245,8 @@ flat
 
     # outer: (2,) / (3,) / i32  ->  fuse: (2, 3) / i32
     assert result.type == Type(Shape(Static(2), Static(3)), ScalarType.I32)
-    expected = np.array([[11, 12, 13], [21, 22, 23]], dtype=np.int32)
-    np.testing.assert_array_equal(result.data, expected)
+    expected = torch.tensor([[11, 12, 13], [21, 22, 23]], dtype=torch.int32)
+    torch.testing.assert_close(result.data, expected, atol=0, rtol=0)
     print(f"  outer product then fuse: (2,)/(3,)/i32 -> (2,3)/i32")
 
 
@@ -255,8 +255,8 @@ def test_dot_product_via_each_both_over():
 
     This is the inner loop of matrix multiply: sum(x_i * y_i).
     """
-    x_data = np.array([1, 2, 3], dtype=np.int32)
-    y_data = np.array([4, 5, 6], dtype=np.int32)
+    x_data = torch.tensor([1, 2, 3], dtype=torch.int32)
+    y_data = torch.tensor([4, 5, 6], dtype=torch.int32)
     x = Value(Type(Shape(Static(3)), ScalarType.I32), x_data)
     y = Value(Type(Shape(Static(3)), ScalarType.I32), y_data)
 
@@ -268,7 +268,7 @@ dot
     types, result = run(prog, {"x": x, "y": y})
 
     assert result.type == Type(Shape(), ScalarType.I32)
-    expected = np.dot(x_data, y_data)
+    expected = (x_data * y_data).sum().item()
     assert int(result.data) == expected
     print(f"  dot product via EachBoth(Mul)+Over(Add): [1,2,3].[4,5,6] = {int(result.data)}")
 

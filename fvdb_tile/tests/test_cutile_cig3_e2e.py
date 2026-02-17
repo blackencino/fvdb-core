@@ -11,14 +11,12 @@ import importlib
 import math
 import os
 
-import numpy as np
 import torch
 
 import cuda.tile as ct
 
-from fvdb_tile.prototype.cig import build_compressed_cig3
+from fvdb_tile.prototype.cig import build_compressed_cig3, cig3_ijk_to_index_ref
 from fvdb_tile.prototype.dsl_to_cutile import emit_runnable_kernel
-from fvdb_tile.prototype.cig import cig3_ijk_to_index_numpy
 from fvdb_tile.prototype.types import Dynamic, ScalarType, Shape, Static, Type
 
 _GEN_DIR = os.path.join(os.path.dirname(__file__), "_generated")
@@ -69,24 +67,27 @@ def _compile_kernel(code: str, kernel_name: str):
 
 
 def _make_test_grid(n_voxels=500, seed=42):
-    rng = np.random.RandomState(seed)
+    gen = torch.Generator().manual_seed(seed)
     coords_set = set()
     while len(coords_set) < n_voxels:
-        batch = rng.randint(0, 4096, (n_voxels * 2, 3))
-        for row in batch:
-            coords_set.add(tuple(row))
+        batch = torch.randint(0, 4096, (n_voxels * 2, 3), generator=gen, dtype=torch.int32)
+        for idx in range(batch.shape[0]):
+            row = batch[idx]
+            coords_set.add((int(row[0]), int(row[1]), int(row[2])))
             if len(coords_set) >= n_voxels:
                 break
-    ijk = torch.from_numpy(np.array(sorted(coords_set)[:n_voxels], dtype=np.int32))
+    sorted_coords = sorted(coords_set)[:n_voxels]
+    ijk = torch.tensor(sorted_coords, dtype=torch.int32)
     return build_compressed_cig3(ijk), ijk
 
 
 def _make_mixed_queries(grid_coords, n_queries=2000, seed=99):
-    rng = np.random.RandomState(seed)
+    gen = torch.Generator().manual_seed(seed)
     N = grid_coords.shape[0]
     n_hits = n_queries // 2
-    hits = grid_coords[rng.choice(N, n_hits, replace=True)]
-    randoms = torch.from_numpy(rng.randint(0, 8192, (n_queries - n_hits, 3)).astype(np.int32))
+    hit_indices = torch.randint(0, N, (n_hits,), generator=gen, dtype=torch.int64)
+    hits = grid_coords[hit_indices]
+    randoms = torch.randint(0, 8192, (n_queries - n_hits, 3), generator=gen, dtype=torch.int32)
     return torch.cat([hits, randoms], dim=0)
 
 
@@ -161,10 +162,10 @@ def test_cig3_fused_single_upper():
     cig_cuda = cig.cuda()
     queries_cuda = queries.cuda().to(torch.int32)
 
-    gpu_result = _launch_kernel(kernel_fn, cig_cuda, queries_cuda).cpu().numpy()
-    ref_result = cig3_ijk_to_index_numpy(cig, queries.numpy())
+    gpu_result = _launch_kernel(kernel_fn, cig_cuda, queries_cuda).cpu()
+    ref_result = cig3_ijk_to_index_ref(cig, queries)
 
-    np.testing.assert_array_equal(gpu_result, ref_result)
+    torch.testing.assert_close(gpu_result, ref_result, atol=0, rtol=0)
     n_hits = int((gpu_result >= 0).sum())
     print(
         f"  cig3_fused_single_upper: {len(queries)} queries ({n_hits} hits), "
@@ -178,12 +179,16 @@ def test_cig3_fused_single_upper():
 
 
 def test_cig3_fused_multi_upper():
-    rng = np.random.RandomState(42)
+    gen = torch.Generator().manual_seed(42)
     coords = []
     for base_x in [0, 4096, 8192]:
         for _ in range(200):
-            coords.append([base_x + rng.randint(0, 4096), rng.randint(0, 4096), rng.randint(0, 4096)])
-    ijk = torch.from_numpy(np.array(coords, dtype=np.int32))
+            coords.append([
+                base_x + torch.randint(0, 4096, (1,), generator=gen, dtype=torch.int32).item(),
+                torch.randint(0, 4096, (1,), generator=gen, dtype=torch.int32).item(),
+                torch.randint(0, 4096, (1,), generator=gen, dtype=torch.int32).item(),
+            ])
+    ijk = torch.tensor(coords, dtype=torch.int32)
     cig = build_compressed_cig3(ijk)
 
     _, kernel_fn = _emit_and_compile(cig, "gen_cig3_fused3")
@@ -192,10 +197,10 @@ def test_cig3_fused_multi_upper():
     cig_cuda = cig.cuda()
     queries_cuda = queries.cuda().to(torch.int32)
 
-    gpu_result = _launch_kernel(kernel_fn, cig_cuda, queries_cuda).cpu().numpy()
-    ref_result = cig3_ijk_to_index_numpy(cig, queries.numpy())
+    gpu_result = _launch_kernel(kernel_fn, cig_cuda, queries_cuda).cpu()
+    ref_result = cig3_ijk_to_index_ref(cig, queries)
 
-    np.testing.assert_array_equal(gpu_result, ref_result)
+    torch.testing.assert_close(gpu_result, ref_result, atol=0, rtol=0)
     n_hits = int((gpu_result >= 0).sum())
     print(
         f"  cig3_fused_multi_upper: {len(queries)} queries ({n_hits} hits), "

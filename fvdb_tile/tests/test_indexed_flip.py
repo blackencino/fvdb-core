@@ -10,7 +10,7 @@ Tests are split into two groups:
     the algebra.
 """
 
-import numpy as np
+import torch
 
 from fvdb_tile.prototype.dsl_eval import run
 from fvdb_tile.prototype.layouts import (
@@ -63,10 +63,10 @@ def test_multi_leaf_cut():
     """Cut a flat array into K leaf nodes, reshape each to (8,8,8)."""
 
     # ---- SETUP ----
-    np.random.seed(42)
+    gen = torch.Generator().manual_seed(42)
     K = 5
-    flat_data = np.random.randint(-1, 10, (K * 512,)).astype(np.int32)
-    flat = Value.from_numpy(flat_data, ScalarType.I32)
+    flat_data = torch.randint(-1, 10, (K * 512,), generator=gen, dtype=torch.int32)
+    flat = Value.from_tensor(flat_data, ScalarType.I32)
 
     # ---- EXPRESSION ----
     types, result = run(MULTI_LEAF_CUT_PROGRAM, {"flat": flat})
@@ -84,10 +84,10 @@ def test_multi_leaf_where():
     """Where over multiple leaves produces double-nested jagged."""
 
     # ---- SETUP ----
-    np.random.seed(42)
+    gen = torch.Generator().manual_seed(42)
     K = 5
-    flat_data = np.random.randint(-1, 10, (K * 512,)).astype(np.int32)
-    flat = Value.from_numpy(flat_data, ScalarType.I32)
+    flat_data = torch.randint(-1, 10, (K * 512,), generator=gen, dtype=torch.int32)
+    flat = Value.from_tensor(flat_data, ScalarType.I32)
 
     # ---- EXPRESSION ----
     types, result = run(MULTI_LEAF_WHERE_PROGRAM, {"flat": flat})
@@ -102,9 +102,9 @@ def test_multi_leaf_where():
     # Verify data per leaf
     for i in range(K):
         leaf_data = flat_data[i * 512:(i + 1) * 512].reshape(8, 8, 8)
-        expected = np.argwhere(leaf_data >= 0).astype(np.int32)
+        expected = torch.nonzero(leaf_data >= 0).to(torch.int32)
         actual = result.data[i].data
-        np.testing.assert_array_equal(actual, expected)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
     counts = [result.data[i].data.shape[0] for i in range(K)]
     print(f"  active counts per leaf: {counts}")
@@ -119,12 +119,12 @@ def test_indexed_type_then_gather():
     """
 
     # ---- SETUP ----
-    np.random.seed(42)
-    leaf_data = np.random.randint(-1, 8, (8, 8, 8)).astype(np.int32)
-    leaf = Value.from_numpy(leaf_data, ScalarType.I32)
-    max_idx = int(leaf_data.max()) + 1
+    gen = torch.Generator().manual_seed(42)
+    leaf_data = torch.randint(-1, 8, (8, 8, 8), generator=gen, dtype=torch.int32)
+    leaf = Value.from_tensor(leaf_data, ScalarType.I32)
+    max_idx = int(leaf_data.max().item()) + 1
     C = 4
-    features_data = np.arange(max_idx * C, dtype=np.float32).reshape(max_idx, C)
+    features_data = torch.arange(max_idx * C, dtype=torch.float32).reshape(max_idx, C)
     features = Value(
         Type(Shape(Dynamic()), Type(Shape(Static(C)), ScalarType.F32)),
         features_data,
@@ -142,10 +142,12 @@ def test_indexed_type_then_gather():
     print(f"gather result type:  {result.type}")
 
     # Data check
-    expected_coords = np.argwhere(leaf_data >= 0).astype(np.int32)
-    expected_idx = leaf_data[tuple(expected_coords[:, i] for i in range(3))]
+    expected_coords = torch.nonzero(leaf_data >= 0).to(torch.int32)
+    expected_idx = leaf_data[
+        expected_coords[:, 0], expected_coords[:, 1], expected_coords[:, 2]
+    ]
     for i in range(len(expected_idx)):
-        np.testing.assert_array_equal(result.data[i], features_data[expected_idx[i]])
+        torch.testing.assert_close(result.data[i], features_data[expected_idx[i].item()], atol=0, rtol=0)
 
 
 # =========================================================================
@@ -183,13 +185,13 @@ def test_struct_flip_data():
     """
 
     # ---- SETUP ----
-    np.random.seed(42)
-    leaf_data = np.random.randint(-1, 5, (8, 8, 8)).astype(np.int32)
-    leaf = Value.from_numpy(leaf_data, ScalarType.I32)
-    max_idx = int(leaf_data.max()) + 1
-    pos_data = np.random.randn(max_idx, 3).astype(np.float32)
-    color_data = np.random.randn(max_idx, 3).astype(np.float32)
-    dens_data = np.random.randn(max_idx).astype(np.float32)
+    gen = torch.Generator().manual_seed(42)
+    leaf_data = torch.randint(-1, 5, (8, 8, 8), generator=gen, dtype=torch.int32)
+    leaf = Value.from_tensor(leaf_data, ScalarType.I32)
+    max_idx = int(leaf_data.max().item()) + 1
+    pos_data = torch.randn(max_idx, 3, generator=gen, dtype=torch.float32)
+    color_data = torch.randn(max_idx, 3, generator=gen, dtype=torch.float32)
+    dens_data = torch.randn(max_idx, generator=gen, dtype=torch.float32)
 
     positions = Value(Type(Shape(Dynamic()), Type(Shape(Static(3)), ScalarType.F32)), pos_data)
     colors = Value(Type(Shape(Dynamic()), Type(Shape(Static(3)), ScalarType.F32)), color_data)
@@ -219,9 +221,10 @@ idx
         s = voxels.data[i]
         assert isinstance(s, StructValue)
         idx = idx_result.data[i]
-        np.testing.assert_array_equal(s.pos, pos_data[idx])
-        np.testing.assert_array_equal(s.color, color_data[idx])
-        np.testing.assert_almost_equal(s.dens, dens_data[idx])
+        idx_val = idx.item() if isinstance(idx, torch.Tensor) else idx
+        torch.testing.assert_close(s.pos, pos_data[idx_val], atol=0, rtol=0)
+        torch.testing.assert_close(s.color, color_data[idx_val], atol=0, rtol=0)
+        torch.testing.assert_close(s.dens, dens_data[idx_val], atol=1e-5, rtol=1e-5)
 
     print(f"  {n_active} active voxels, each with pos/color/dens fields")
 

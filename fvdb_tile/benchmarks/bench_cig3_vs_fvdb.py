@@ -12,14 +12,12 @@ import math
 import os
 import time
 
-import numpy as np
 import torch
 
 import cuda.tile as ct
 
 from fvdb_tile.prototype.cig import build_compressed_cig3
 from fvdb_tile.prototype.dsl_to_cutile import emit_runnable_kernel
-from fvdb_tile.prototype.cig import cig3_ijk_to_index_numpy
 from fvdb_tile.prototype.types import Dynamic, ScalarType, Shape, Static, Type
 
 try:
@@ -117,23 +115,24 @@ def run_cig3_fused(cig_cuda, queries_cuda):
 
 
 def make_grid_coords(n_voxels: int, seed: int = 42) -> torch.Tensor:
-    rng = np.random.RandomState(seed)
+    gen = torch.Generator().manual_seed(seed)
     coords_set = set()
     while len(coords_set) < n_voxels:
-        batch = rng.randint(0, 4096, (n_voxels * 2, 3))
+        batch = torch.randint(0, 4096, (n_voxels * 2, 3), generator=gen)
         for row in batch:
-            coords_set.add(tuple(row))
+            coords_set.add(tuple(row.tolist()))
             if len(coords_set) >= n_voxels:
                 break
-    return torch.from_numpy(np.array(sorted(coords_set)[:n_voxels], dtype=np.int32))
+    return torch.tensor(sorted(coords_set)[:n_voxels], dtype=torch.int32)
 
 
 def make_query_coords(grid_coords: torch.Tensor, n_queries: int, seed: int = 99) -> torch.Tensor:
-    rng = np.random.RandomState(seed)
+    gen = torch.Generator().manual_seed(seed)
     N = grid_coords.shape[0]
     n_hits = n_queries // 2
-    hits = grid_coords[rng.choice(N, n_hits, replace=True)]
-    randoms = torch.from_numpy(rng.randint(0, 4096, (n_queries - n_hits, 3)).astype(np.int32))
+    hit_indices = torch.randint(0, N, (n_hits,), generator=gen)
+    hits = grid_coords[hit_indices]
+    randoms = torch.randint(0, 4096, (n_queries - n_hits, 3), dtype=torch.int32, generator=gen)
     return torch.cat([hits, randoms], dim=0)
 
 
@@ -169,7 +168,7 @@ def _time_cpu_fn(fn, warmup=1, repeats=5):
 def verify_agreement(fvdb_result, cig_result, label=""):
     fvdb_active = fvdb_result >= 0
     cig_active = cig_result >= 0
-    agree = (fvdb_active == cig_active).all()
+    agree = torch.all(fvdb_active == cig_active).item()
     n_fvdb_active = fvdb_active.sum().item()
     if not agree:
         n_disagree = (fvdb_active != cig_active).sum().item()

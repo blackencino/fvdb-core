@@ -5,14 +5,14 @@ Tree-walk evaluator for the micro DSL.
 
 Two passes:
   1. Type-check: infer types for all bindings (no data).
-  2. Execute: evaluate the AST against concrete numpy data.
+  2. Execute: evaluate the AST against concrete torch data.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-import numpy as np
+import torch
 
 from .dsl_ast import (
     AddNode,
@@ -40,6 +40,8 @@ from .dsl_ast import (
     Morton3dNode,
     Morton3dSignedNode,
     MortonDecode3dNode,
+    HierarchicalKeyNode,
+    HierarchicalKeyDecodeNode,
     MulNode,
     Node,
     NotNode,
@@ -59,7 +61,7 @@ from .dsl_ast import (
 from .dsl_parse import parse
 from .layouts import MaskedElement
 from .ops import FnValue, StructValue, Value, VERBS
-from .ops import morton3d as np_morton3d
+from .ops import morton3d
 from .types import Dynamic, FnType, Jagged, ScalarType, Shape, Static, Type, coord_type
 
 
@@ -80,22 +82,20 @@ class MaskedValue:
     """
 
     def __init__(self, mask_data, abs_prefix_data):
-        self.mask_data = mask_data  # numpy array (W,) i64 -- packed u64 mask
-        self.abs_prefix_data = abs_prefix_data  # numpy array (W,) i32 -- absolute prefix
+        self.mask_data = mask_data  # torch tensor (W,) i64 -- packed u64 mask
+        self.abs_prefix_data = abs_prefix_data  # torch tensor (W,) i32 -- absolute prefix
 
     def lookup(self, coord):
         """Check bitmask and compute dense index for a 3D coordinate.
 
         Args:
-            coord: (3,) i32 array -- node-local coordinate
+            coord: (3,) i32 tensor -- node-local coordinate
 
         Returns:
-            int: abs_prefix[word] + partial_popcount if active, else -1
+            0-d i64 tensor: abs_prefix[word] + partial_popcount if active, else -1
         """
-        # Guard: if abs_prefix[0] is negative, this masked value was
-        # constructed from sentinel data (the parent returned -1).
         if len(self.abs_prefix_data) > 0 and int(self.abs_prefix_data[0]) < 0:
-            return np.int64(-1)
+            return torch.tensor(-1, dtype=torch.int64)
 
         n_words = len(self.mask_data)
         bits_per_word = 64
@@ -106,18 +106,17 @@ class MaskedValue:
         bit_pos = flat_idx & 63
 
         if word_idx < 0 or word_idx >= n_words:
-            return np.int64(-1)
+            return torch.tensor(-1, dtype=torch.int64)
 
         word = int(self.mask_data[word_idx])
         if not ((word >> bit_pos) & 1):
-            return np.int64(-1)
+            return torch.tensor(-1, dtype=torch.int64)
 
-        # Absolute prefix already includes the base offset
         abs_cum = int(self.abs_prefix_data[word_idx])
         partial_mask = word & ((1 << bit_pos) - 1)
         partial = bin(partial_mask & 0xFFFFFFFFFFFFFFFF).count("1")
 
-        return np.int64(abs_cum + partial)
+        return torch.tensor(abs_cum + partial, dtype=torch.int64)
 
     def __repr__(self):
         n_active = sum(bin(int(w) & 0xFFFFFFFFFFFFFFFF).count("1") for w in self.mask_data)
@@ -187,12 +186,11 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
 
     if isinstance(node, ConstNode):
         if isinstance(node.value, int):
-            return Value(Type(Shape(), node.stype), np.int32(node.value))
+            return Value(Type(Shape(), node.stype), torch.tensor(node.value, dtype=torch.int32))
         elif isinstance(node.value, list):
-            arr = np.array(node.value, dtype=np.int32)
+            arr = torch.tensor(node.value, dtype=torch.int32)
             return Value(Type(Shape(Static(len(node.value))), node.stype), arr)
         elif isinstance(node.value, str):
-            # String constants are labels, not data
             return Value(Type(Shape(), node.stype), node.value)
         raise TypeError(f"Cannot evaluate const: {node.value!r}")
 
@@ -221,7 +219,6 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
 
     if isinstance(node, FieldNode):
         struct_val = eval_node(node.expr, env)
-        # Infer the field type
         input_types = {k: v.type for k, v in env.inputs.items()}
         type_env = {k: v.type for k, v in {**env.bindings, **env.locals}.items()}
         field_type = node.infer_type(type_env, input_types)
@@ -230,13 +227,13 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
             field_data = struct_val.data.fields[node.field_name]
             return Value(field_type, field_data)
         elif isinstance(struct_val.data, list):
-            # List of StructValues -- extract field from each
             field_data = [
                 sv.data.fields[node.field_name] if isinstance(sv.data, StructValue) else sv.fields[node.field_name]
                 for sv in struct_val.data
             ]
             return Value(
-                field_type, np.array(field_data, dtype=np.int32) if field_data else np.array([], dtype=np.int32)
+                field_type,
+                torch.stack(field_data).to(torch.int32) if field_data else torch.empty(0, dtype=torch.int32),
             )
         raise TypeError(f"Field access on non-struct: {type(struct_val.data)}")
 
@@ -245,17 +242,17 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
     if isinstance(node, AddNode):
         a = eval_node(node.a, env)
         b = eval_node(node.b, env)
-        return Value(a.type, (a.data + b.data).astype(a.data.dtype))
+        return Value(a.type, (a.data + b.data).to(a.data.dtype))
 
     if isinstance(node, SubNode):
         a = eval_node(node.a, env)
         b = eval_node(node.b, env)
-        return Value(a.type, (a.data - b.data).astype(a.data.dtype))
+        return Value(a.type, (a.data - b.data).to(a.data.dtype))
 
     if isinstance(node, GENode):
         a = eval_node(node.a, env)
         b = eval_node(node.b, env)
-        b_val = b.data if isinstance(b.data, np.ndarray) else b.data
+        b_val = b.data if isinstance(b.data, torch.Tensor) else b.data
         result = a.data >= b_val
         return Value(Type(a.type.iteration_shape, ScalarType.BOOL), result)
 
@@ -275,8 +272,8 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
         lo = int(lo_val.data)
         hi = int(hi_val.data)
         c = coord_val.data
-        result = bool(np.all(c >= lo) and np.all(c < hi))
-        return Value(Type(Shape(), ScalarType.BOOL), np.bool_(result))
+        result = bool(torch.all(c >= lo).item() and torch.all(c < hi).item())
+        return Value(Type(Shape(), ScalarType.BOOL), torch.tensor(result, dtype=torch.bool))
 
     # -- Structural operations --
 
@@ -284,7 +281,7 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
         input_val = eval_node(node.input, env)
         data = input_val.data
 
-        if isinstance(data, np.ndarray):
+        if isinstance(data, torch.Tensor):
             n = data.shape[0]
             elem_type = input_val.type.element_type
 
@@ -299,17 +296,13 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
                 child_env = env.with_local(node.var, elem_val)
                 results.append(eval_node(node.body, child_env))
 
-            # Determine result element type from body results, not numpy dtype.
             first_result_type = results[0].type
 
-            if all(isinstance(r.data, np.ndarray) for r in results):
-                stacked = np.stack([r.data for r in results])
-            elif all(isinstance(r.data, (np.bool_, np.integer, np.floating)) for r in results):
-                stacked = np.array([r.data for r in results])
+            if all(isinstance(r.data, torch.Tensor) for r in results):
+                stacked = torch.stack([r.data for r in results])
             else:
-                stacked = np.array([r.data for r in results])
+                stacked = torch.tensor([r.data for r in results])
 
-            # Use body's result type as element type (preserves nesting info)
             if first_result_type.rank == 0:
                 result_type = Type(input_val.type.iteration_shape, first_result_type.element_type)
             else:
@@ -329,7 +322,7 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
         input_val = eval_node(node.input, env)
         data = input_val.data
 
-        if isinstance(data, np.ndarray):
+        if isinstance(data, torch.Tensor):
             n = data.shape[0]
             elem_type = input_val.type.element_type
             results = []
@@ -353,26 +346,25 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
 
     if isinstance(node, WhereNode):
         input_val = eval_node(node.input, env)
-        coords = np.argwhere(input_val.data).astype(np.int32)
+        coords = torch.nonzero(input_val.data).to(torch.int32)
         result_type = Type(Shape(Dynamic()), coord_type(input_val.type.rank))
         return Value(result_type, coords)
 
     if isinstance(node, SortNode):
         input_val = eval_node(node.input, env)
         data = input_val.data
-        if not isinstance(data, np.ndarray):
-            raise TypeError(f"Sort requires ndarray data, got {type(data)}")
+        if not isinstance(data, torch.Tensor):
+            raise TypeError(f"Sort requires tensor data, got {type(data)}")
         sorted_data = _sort_leading_axis(data)
         return Value(input_val.type, sorted_data)
 
     if isinstance(node, UniqueNode):
         input_val = eval_node(node.input, env)
         data = input_val.data
-        if not isinstance(data, np.ndarray):
-            raise TypeError(f"Unique requires ndarray data, got {type(data)}")
+        if not isinstance(data, torch.Tensor):
+            raise TypeError(f"Unique requires tensor data, got {type(data)}")
         unique_data = _unique_leading_axis(data)
 
-        # Preserve element type, but output length is data-dependent.
         in_ty = input_val.type
         tail = in_ty.iteration_shape.extents[1:]
         result_type = Type(Shape(Dynamic(), *tail), in_ty.element_type)
@@ -392,11 +384,10 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
         shift = 0
         for i, bw in enumerate(node.bit_widths):
             mask = (1 << bw) - 1
-            fields[f"level_{i}"] = ((data >> shift) & mask).astype(np.int32)
+            fields[f"level_{i}"] = ((data >> shift) & mask).to(torch.int32)
             shift += bw
-        fields["which_top"] = (data >> shift).astype(np.int32)
+        fields["which_top"] = (data >> shift).to(torch.int32)
 
-        # Infer type
         input_types = {k: v.type for k, v in env.inputs.items()}
         type_env = {k: v.type for k, v in {**env.bindings, **env.locals}.items()}
         result_type = node.infer_type(type_env, input_types)
@@ -405,7 +396,7 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
 
     if isinstance(node, Morton3dNode):
         coord_val = eval_node(node.input, env)
-        result = np_morton3d(coord_val.data)
+        result = morton3d(coord_val.data)
         return Value(Type(Shape(), ScalarType.I32), result)
 
     if isinstance(node, Morton3dSignedNode):
@@ -426,16 +417,34 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
         result_type = node.infer_type(type_env, input_types)
         return Value(result_type, result)
 
+    if isinstance(node, HierarchicalKeyNode):
+        coord_val = eval_node(node.input, env)
+        from .ops import hierarchical_key
+        result = hierarchical_key(coord_val.data, node.bit_widths)
+        input_types = {k: v.type for k, v in env.inputs.items()}
+        type_env = {k: v.type for k, v in {**env.bindings, **env.locals}.items()}
+        result_type = node.infer_type(type_env, input_types)
+        return Value(result_type, result)
+
+    if isinstance(node, HierarchicalKeyDecodeNode):
+        key_val = eval_node(node.input, env)
+        from .ops import hierarchical_key_decode
+        result = hierarchical_key_decode(key_val.data, node.bit_widths)
+        input_types = {k: v.type for k, v in env.inputs.items()}
+        type_env = {k: v.type for k, v in {**env.bindings, **env.locals}.items()}
+        result_type = node.infer_type(type_env, input_types)
+        return Value(result_type, result)
+
     if isinstance(node, FindNode):
         table_val = eval_node(node.table, env)
         key_val = eval_node(node.key, env)
-        table_data = table_val.data  # (R, K) numpy array
-        key_data = key_val.data  # (K,) numpy array
+        table_data = table_val.data
+        key_data = key_val.data
         R = table_data.shape[0]
         for r in range(R):
-            if np.array_equal(table_data[r], key_data):
-                return Value(Type(Shape(), ScalarType.I32), np.int32(r))
-        return Value(Type(Shape(), ScalarType.I32), np.int32(-1))
+            if torch.equal(table_data[r], key_data):
+                return Value(Type(Shape(), ScalarType.I32), torch.tensor(r, dtype=torch.int32))
+        return Value(Type(Shape(), ScalarType.I32), torch.tensor(-1, dtype=torch.int32))
 
     if isinstance(node, MaskedNode):
         mask_val = eval_node(node.mask, env)
@@ -452,11 +461,10 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
         from .layouts import cut_by_size
 
         new_type = cut_by_size(node.size, input_val.type)
-        # Reshape the data to match
         data = input_val.data
-        if isinstance(data, np.ndarray):
+        if isinstance(data, torch.Tensor):
             n = data.shape[0] // node.size
-            new_shape = (n, node.size) + data.shape[1:]
+            new_shape = (n, node.size) + tuple(data.shape[1:])
             data = data.reshape(new_shape)
         return Value(new_type, data)
 
@@ -466,9 +474,9 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
 
         new_type = reshape_layout(input_val.type, node.new_shape)
         data = input_val.data
-        if isinstance(data, np.ndarray):
+        if isinstance(data, torch.Tensor):
             old_rank = input_val.type.rank
-            elem_dims = data.shape[old_rank:]
+            elem_dims = tuple(data.shape[old_rank:])
             new_iter = tuple(
                 -1 if (isinstance(s, int) and s < 0) or s == "*" else int(s)
                 for s in node.new_shape
@@ -483,10 +491,9 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
 
         new_type = fuse_layout(input_val.type)
         data = input_val.data
-        if isinstance(data, np.ndarray):
+        if isinstance(data, torch.Tensor):
             fused_shape = tuple(e.n if hasattr(e, "n") else -1 for e in new_type.iteration_shape.extents)
-            remaining = data.shape[new_type.rank :]
-            # For static shapes, reshape to the fused shape + any trailing element dims
+            remaining = tuple(data.shape[new_type.rank:])
             target = fused_shape
             if remaining:
                 target = fused_shape + remaining
@@ -499,7 +506,7 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
 
         new_type = flatten_layout(input_val.type)
         data = input_val.data
-        if isinstance(data, np.ndarray):
+        if isinstance(data, torch.Tensor):
             flat_shape = tuple(e.n if hasattr(e, "n") else -1 for e in new_type.iteration_shape.extents)
             data = data.reshape(flat_shape)
         return Value(new_type, data)
@@ -510,13 +517,11 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
 
         new_type = permute_layout(input_val.type, node.order)
         data = input_val.data
-        if isinstance(data, np.ndarray):
-            # Build full axis permutation: permute the leading shape axes,
-            # keep element axes in original order
+        if isinstance(data, torch.Tensor):
             n_leading = len(node.order)
             n_total = data.ndim
             full_order = list(node.order) + list(range(n_leading, n_total))
-            data = np.transpose(data, full_order)
+            data = data.permute(*full_order)
         return Value(new_type, data)
 
     # -- Adverbs --
@@ -525,25 +530,20 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
         input_val = eval_node(node.input, env)
         verb_fn = _resolve_verb(node.verb)
         data = input_val.data
-        if isinstance(data, np.ndarray):
-            # Reduce over all elements of the iteration space
-            # For multi-rank, this reduces the full array to the element shape
+        if isinstance(data, torch.Tensor):
             et = input_val.type.element_type
             if isinstance(et, Type):
-                # Element is itself an array -- reduce leading axis
-                result_data = data[0].copy()
+                result_data = data[0].clone()
                 for i in range(1, data.shape[0]):
                     result_data = verb_fn(result_data, data[i])
                 result_type = et
             else:
-                # Scalar element -- reduce everything
-                result_data = data.flat[0]
-                for i in range(1, data.size):
-                    result_data = verb_fn(result_data, data.flat[i])
+                result_data = data.flatten()[0]
+                for i in range(1, data.numel()):
+                    result_data = verb_fn(result_data, data.flatten()[i])
                 result_type = Type(Shape(), et)
             return Value(result_type, result_data)
         elif isinstance(data, list):
-            # List of Values -- fold
             acc = data[0]
             for v in data[1:]:
                 acc_data = verb_fn(acc.data, v.data)
@@ -555,8 +555,8 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
         input_val = eval_node(node.input, env)
         verb_fn = _resolve_verb(node.verb)
         data = input_val.data
-        if isinstance(data, np.ndarray):
-            result = np.empty_like(data)
+        if isinstance(data, torch.Tensor):
+            result = torch.empty_like(data)
             result[0] = data[0]
             for i in range(1, data.shape[0]):
                 result[i] = verb_fn(result[i - 1], data[i])
@@ -568,15 +568,15 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
         right_val = eval_node(node.right, env)
         verb_fn = _resolve_verb(node.verb)
         data = right_val.data
-        if isinstance(data, np.ndarray):
+        if isinstance(data, torch.Tensor):
             results = []
             for i in range(data.shape[0]):
                 r = verb_fn(left_val.data, data[i])
                 results.append(r)
-            stacked = np.stack(results) if isinstance(results[0], np.ndarray) else np.array(results)
-            from .ops import _numpy_dtype_to_stype
+            stacked = torch.stack(results) if isinstance(results[0], torch.Tensor) else torch.tensor(results)
+            from .ops import _torch_dtype_to_stype
 
-            result_stype = _numpy_dtype_to_stype(stacked.dtype)
+            result_stype = _torch_dtype_to_stype(stacked.dtype)
             return Value(Type(right_val.type.iteration_shape, result_stype), stacked)
         raise TypeError(f"Cannot EachRight over {type(data)}")
 
@@ -585,15 +585,15 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
         right_val = eval_node(node.right, env)
         verb_fn = _resolve_verb(node.verb)
         data = left_val.data
-        if isinstance(data, np.ndarray):
+        if isinstance(data, torch.Tensor):
             results = []
             for i in range(data.shape[0]):
                 r = verb_fn(data[i], right_val.data)
                 results.append(r)
-            stacked = np.stack(results) if isinstance(results[0], np.ndarray) else np.array(results)
-            from .ops import _numpy_dtype_to_stype
+            stacked = torch.stack(results) if isinstance(results[0], torch.Tensor) else torch.tensor(results)
+            from .ops import _torch_dtype_to_stype
 
-            result_stype = _numpy_dtype_to_stype(stacked.dtype)
+            result_stype = _torch_dtype_to_stype(stacked.dtype)
             return Value(Type(left_val.type.iteration_shape, result_stype), stacked)
         raise TypeError(f"Cannot EachLeft over {type(data)}")
 
@@ -601,16 +601,16 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
         input_val = eval_node(node.input, env)
         verb_fn = _resolve_verb(node.verb)
         data = input_val.data
-        if isinstance(data, np.ndarray):
+        if isinstance(data, torch.Tensor):
             results = []
             for i in range(1, data.shape[0]):
                 results.append(verb_fn(data[i], data[i - 1]))
-            stacked = np.stack(results) if isinstance(results[0], np.ndarray) else np.array(results)
+            stacked = torch.stack(results) if isinstance(results[0], torch.Tensor) else torch.tensor(results)
             lead = input_val.type.iteration_shape.extents[0]
             new_lead = Static(lead.n - 1) if isinstance(lead, Static) else lead
-            from .ops import _numpy_dtype_to_stype
+            from .ops import _torch_dtype_to_stype
 
-            result_stype = _numpy_dtype_to_stype(stacked.dtype)
+            result_stype = _torch_dtype_to_stype(stacked.dtype)
             return Value(Type(Shape(new_lead), result_stype), stacked)
         raise TypeError(f"Cannot Prior over {type(data)}")
 
@@ -619,8 +619,8 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
     if isinstance(node, DivNode):
         a = eval_node(node.a, env)
         b = eval_node(node.b, env)
-        b_data = b.data if isinstance(b.data, np.ndarray) else float(b.data)
-        result = (a.data / b_data).astype(np.float32)
+        b_data = b.data if isinstance(b.data, torch.Tensor) else float(b.data)
+        result = (a.data / b_data).to(torch.float32)
         a_ty = a.type
         if a_ty.rank == 0:
             return Value(Type(Shape(), ScalarType.F32), result)
@@ -629,18 +629,18 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
     if isinstance(node, MulNode):
         a = eval_node(node.a, env)
         b = eval_node(node.b, env)
-        b_data = b.data if isinstance(b.data, np.ndarray) else b.data
-        return Value(a.type, (a.data * b_data).astype(a.data.dtype))
+        b_data = b.data if isinstance(b.data, torch.Tensor) else b.data
+        return Value(a.type, (a.data * b_data).to(a.data.dtype))
 
     if isinstance(node, CountNode):
         input_val = eval_node(node.input, env)
-        if isinstance(input_val.data, np.ndarray):
+        if isinstance(input_val.data, torch.Tensor):
             count = input_val.data.shape[0]
         elif isinstance(input_val.data, list):
             count = len(input_val.data)
         else:
             count = 1
-        return Value(Type(Shape(), ScalarType.I32), np.int32(count))
+        return Value(Type(Shape(), ScalarType.I32), torch.tensor(count, dtype=torch.int32))
 
     raise TypeError(f"Cannot evaluate node type: {type(node).__name__}")
 
@@ -656,10 +656,10 @@ def _gather(target: Value, indexer: Value) -> Value:
 
     def _sentinel(et):
         if et == ScalarType.BOOL:
-            return np.bool_(False)
+            return torch.tensor(False, dtype=torch.bool)
         elif et in (ScalarType.I32, ScalarType.I64):
-            return np.int32(-1)
-        return np.float32(0.0)
+            return torch.tensor(-1, dtype=torch.int32)
+        return torch.tensor(0.0, dtype=torch.float32)
 
     # Masked target: bitmask check + popcount.
     if isinstance(target.data, MaskedValue):
@@ -668,9 +668,8 @@ def _gather(target: Value, indexer: Value) -> Value:
         return Value(Type(Shape(), ScalarType.I64), result)
 
     # Special case 1: single-point lookup with vector coordinate.
-    # (r,) integer indexer into rank-r target -> single element.
     if (
-        isinstance(indexer.data, np.ndarray)
+        isinstance(indexer.data, torch.Tensor)
         and indexer.type.is_scalar_element
         and indexer.type.element_type in (ScalarType.I32, ScalarType.I64)
         and indexer.data.ndim == 1
@@ -683,13 +682,12 @@ def _gather(target: Value, indexer: Value) -> Value:
 
         in_bounds = all(0 <= coord[i] < target.data.shape[i] for i in range(len(coord)))
         if not in_bounds:
-            return Value(result_type, _sentinel(et) if isinstance(et, ScalarType) else np.int32(-1))
+            return Value(result_type, _sentinel(et) if isinstance(et, ScalarType) else torch.tensor(-1, dtype=torch.int32))
 
-        result_data = target.data[tuple(coord)]
+        result_data = target.data[tuple(coord.long())]
         return Value(result_type, result_data)
 
     # Special case 2: scalar integer indexing into rank-1 target.
-    # Returns the element directly (unwrapped).
     if (
         indexer.type.rank == 0
         and isinstance(indexer.type.element_type, ScalarType)
@@ -704,7 +702,7 @@ def _gather(target: Value, indexer: Value) -> Value:
             if isinstance(et, ScalarType):
                 return Value(result_type, _sentinel(et))
             else:
-                return Value(result_type, np.full(target.data.shape[1:], -1, dtype=np.int32))
+                return Value(result_type, torch.full(target.data.shape[1:], -1, dtype=torch.int32))
 
         result_data = target.data[idx]
         return Value(result_type, result_data)
@@ -713,18 +711,18 @@ def _gather(target: Value, indexer: Value) -> Value:
 
     result_type = indexed_layout(indexer.type, target.type)
 
-    if isinstance(indexer.data, np.ndarray):
+    if isinstance(indexer.data, torch.Tensor):
         if isinstance(idx_elem, ScalarType):
-            result_data = target.data[indexer.data]
+            result_data = target.data[indexer.data.long()]
         elif isinstance(idx_elem, Type):
             coords = indexer.data
             if coords.ndim == 2:
-                idx_tuple = tuple(coords[:, i] for i in range(coords.shape[1]))
+                idx_tuple = tuple(coords[:, i].long() for i in range(coords.shape[1]))
                 result_data = target.data[idx_tuple]
             elif coords.ndim == 1:
-                result_data = target.data[tuple(coords)]
+                result_data = target.data[tuple(coords.long())]
             else:
-                result_data = target.data[tuple(coords)]
+                result_data = target.data[tuple(coords.long())]
         else:
             raise TypeError(f"Unexpected indexer element: {idx_elem!r}")
         return Value(result_type, result_data)
@@ -737,17 +735,14 @@ def _gather(target: Value, indexer: Value) -> Value:
 
 
 def _resolve_verb(name: str):
-    """Map a verb name to a binary numpy function.
-
-    Legacy helper -- new code should use VERBS registry instead.
-    """
+    """Map a verb name to a binary function."""
     verbs = {
         "Add": lambda a, b: a + b,
         "Sub": lambda a, b: a - b,
         "Mul": lambda a, b: a * b,
         "Div": lambda a, b: a / b,
-        "Min": lambda a, b: np.minimum(a, b),
-        "Max": lambda a, b: np.maximum(a, b),
+        "Min": lambda a, b: torch.minimum(a, b),
+        "Max": lambda a, b: torch.maximum(a, b),
         "And": lambda a, b: a & b,
         "Or": lambda a, b: a | b,
     }
@@ -764,14 +759,14 @@ def _resolve_verb(name: str):
 def _extract_elements(val: Value) -> list[Value]:
     """Extract elements from a value by iterating its leading shape.
 
-    For ndarray data, slices along the first axis (each slice has shape
+    For tensor data, slices along the first axis (each slice has shape
     corresponding to remaining axes). For list data, returns elements directly.
     """
     data = val.data
     elem_type = val.type.element_type
     elem_as_type = elem_type if isinstance(elem_type, Type) else Type(Shape(), elem_type)
 
-    if isinstance(data, np.ndarray):
+    if isinstance(data, torch.Tensor):
         if val.type.rank == 0:
             return [val]
         n = data.shape[0]
@@ -792,12 +787,7 @@ def _extract_elements(val: Value) -> list[Value]:
 
 
 def _unwrap_and_promote(result_et):
-    """Unwrap rank-0 scalar wrappers and promote Dynamic->Jagged for nesting.
-
-    When a verb returns () / scalar, unwrap to just the ScalarType so that
-    nesting produces (S,) / scalar instead of (S,) / (() / scalar).
-    Then apply the standard jaggedness promotion for non-scalar results.
-    """
+    """Unwrap rank-0 scalar wrappers and promote Dynamic->Jagged for nesting."""
     if isinstance(result_et, Type) and result_et.rank == 0 and isinstance(result_et.element_type, ScalarType):
         return result_et.element_type
     if isinstance(result_et, Type):
@@ -806,11 +796,7 @@ def _unwrap_and_promote(result_et):
 
 
 def _wrap_adverb(adverb: str, inner_fn: FnValue) -> FnValue:
-    """Wrap a FnValue with adverb iteration logic, producing a new FnValue.
-
-    The returned FnValue's apply_fn implements the leading-shape iteration
-    rule for the given adverb, delegating to inner_fn for each element.
-    """
+    """Wrap a FnValue with adverb iteration logic, producing a new FnValue."""
     if adverb == "Over":
         def over_apply(xs: Value) -> Value:
             elements = _extract_elements(xs)
@@ -945,20 +931,13 @@ def _collect_adverb_results_with_shape(outer_shape: Shape, results: list[Value])
         raise TypeError("Empty result list in adverb")
 
     first_type = results[0].type
-    # Unwrap rank-0 scalar wrapper so nesting is clean
     inner_type = _unwrap_and_promote(first_type)
 
-    all_ndarray = all(isinstance(r.data, np.ndarray) for r in results)
-    all_same_shape = all_ndarray and all(r.data.shape == results[0].data.shape for r in results[1:])
+    all_tensor = all(isinstance(r.data, torch.Tensor) for r in results)
+    all_same_shape = all_tensor and all(r.data.shape == results[0].data.shape for r in results[1:])
 
-    if all_same_shape and all_ndarray:
-        stacked = np.stack([r.data for r in results])
-        result_type = Type(outer_shape, inner_type)
-        return Value(result_type, stacked)
-
-    all_scalar = all(isinstance(r.data, (np.bool_, np.integer, np.floating)) for r in results)
-    if all_scalar:
-        stacked = np.array([r.data for r in results])
+    if all_same_shape and all_tensor:
+        stacked = torch.stack([r.data for r in results])
         result_type = Type(outer_shape, inner_type)
         return Value(result_type, stacked)
 
@@ -966,25 +945,33 @@ def _collect_adverb_results_with_shape(outer_shape: Shape, results: list[Value])
     return Value(result_type, results)
 
 
-def _sort_leading_axis(data: np.ndarray) -> np.ndarray:
+def _sort_leading_axis(data: torch.Tensor) -> torch.Tensor:
     """Stable sort along the leading axis with immutable value semantics."""
     if data.ndim == 1:
-        return np.sort(data, kind="stable")
+        return torch.sort(data, stable=True).values
     rows = data.reshape(data.shape[0], -1)
-    # np.lexsort uses last key as primary; reverse to sort by column order.
-    order = np.lexsort(tuple(rows[:, i] for i in range(rows.shape[1] - 1, -1, -1)))
-    return data[order].copy()
+    # Lexsort equivalent: stable sort by each column in reverse order.
+    order = torch.arange(rows.shape[0], device=data.device)
+    for i in range(rows.shape[1] - 1, -1, -1):
+        sub_order = torch.argsort(rows[order, i], stable=True)
+        order = order[sub_order]
+    return data[order].clone()
 
 
-def _unique_leading_axis(data: np.ndarray) -> np.ndarray:
+def _unique_leading_axis(data: torch.Tensor) -> torch.Tensor:
     """Deduplicate along leading axis with immutable value semantics."""
     if data.ndim == 1:
-        return np.unique(data)
+        return torch.unique(data, sorted=True)
     rows = data.reshape(data.shape[0], -1)
-    _, first_idx = np.unique(rows, axis=0, return_index=True)
-    # Keep first occurrence order to preserve value-semantic predictability.
-    first_idx_sorted = np.sort(first_idx)
-    return data[first_idx_sorted].copy()
+    _, inverse = torch.unique(rows, dim=0, return_inverse=True)
+    # Find first occurrence of each unique row
+    first_occ: dict[int, int] = {}
+    for i in range(rows.shape[0]):
+        u = inverse[i].item()
+        if u not in first_occ:
+            first_occ[u] = i
+    first_idx_sorted = sorted(first_occ.values())
+    return data[first_idx_sorted].clone()
 
 
 def _promote_dynamic_to_jagged(ty: Type) -> Type:
@@ -1004,19 +991,16 @@ def _collect_results(input_type: Type, results: list[Value]) -> Value:
 
     first_type = results[0].type
     outer_extent = input_type.iteration_shape.extents[0] if input_type.rank > 0 else Static(len(results))
-
-    # Promote Dynamic -> Jagged: Each applies body independently per element.
     inner_type = _promote_dynamic_to_jagged(first_type) if isinstance(first_type, Type) else first_type
 
-    # Check if all results have identical data shapes (for stacking).
     all_same_data = (
-        all(isinstance(r.data, np.ndarray) and r.data.shape == results[0].data.shape for r in results[1:])
-        if isinstance(results[0].data, np.ndarray)
+        all(isinstance(r.data, torch.Tensor) and r.data.shape == results[0].data.shape for r in results[1:])
+        if isinstance(results[0].data, torch.Tensor)
         else False
     )
 
-    if all_same_data and isinstance(results[0].data, np.ndarray):
-        stacked = np.stack([r.data for r in results])
+    if all_same_data and isinstance(results[0].data, torch.Tensor):
+        stacked = torch.stack([r.data for r in results])
         result_type = Type(Shape(outer_extent), inner_type)
         return Value(result_type, stacked)
     else:
@@ -1037,11 +1021,9 @@ def run(source: str, inputs: dict[str, Value]) -> tuple[dict[str, Type], Value]:
     """
     prog = parse(source)
 
-    # Pass 1: type-check
     input_types = {name: val.type for name, val in inputs.items()}
     inferred = prog.infer_types(input_types)
 
-    # Pass 2: execute
     env = EvalEnv(inputs)
     for name, node in prog.bindings:
         val = eval_node(node, env)

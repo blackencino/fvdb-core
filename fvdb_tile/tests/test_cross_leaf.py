@@ -16,7 +16,7 @@ This is the hardest composability test: cross-boundary traversal through a
 hierarchical sparse structure, expressed purely as a DSL string.
 """
 
-import numpy as np
+import torch
 
 from fvdb_tile.prototype.dsl_eval import run
 from fvdb_tile.prototype.ops import Value
@@ -77,49 +77,50 @@ is_active
 # Test data builder
 # ---------------------------------------------------------------------------
 
-FACE_OFFSETS = np.array(
+FACE_OFFSETS = torch.tensor(
     [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]],
-    dtype=np.int32,
+    dtype=torch.int32,
 )
 
 
 def _build_grid(seed=42):
     """Build a two-level grid with known active voxels near leaf boundaries."""
-    np.random.seed(seed)
+    gen = torch.Generator().manual_seed(seed)
 
     # Lower level: (16, 16, 16) mapping to leaf indices
-    lower_data = np.full((16, 16, 16), -1, dtype=np.int32)
+    lower_data = torch.full((16, 16, 16), -1, dtype=torch.int32)
 
     # Place a few adjacent lower nodes so cross-leaf neighbors exist
     active_lower = [(3, 4, 5), (3, 4, 6), (3, 5, 5), (4, 4, 5)]
     leaf_blocks = []
     for i, (lx, ly, lz) in enumerate(active_lower):
         lower_data[lx, ly, lz] = i
-        leaf = np.full((8, 8, 8), -1, dtype=np.int32)
-        n_active = np.random.randint(100, 300)
-        positions = np.random.choice(512, n_active, replace=False)
+        leaf = torch.full((8, 8, 8), -1, dtype=torch.int32)
+        n_active = torch.randint(100, 300, (1,), generator=gen).item()
+        positions = torch.randperm(512, generator=gen)[:n_active]
         for idx, pos in enumerate(positions):
-            vx = pos // 64
-            vy = (pos // 8) % 8
-            vz = pos % 8
+            pos_val = pos.item()
+            vx = pos_val // 64
+            vy = (pos_val // 8) % 8
+            vz = pos_val % 8
             leaf[vx, vy, vz] = i * 1000 + idx
         leaf_blocks.append(leaf)
 
-    leaf_data = np.stack(leaf_blocks)
+    leaf_data = torch.stack(leaf_blocks)
     return lower_data, leaf_data, active_lower
 
 
 def _global_coord(lower_coord, leaf_coord):
     """Convert (lower_coord, leaf_coord) to global coordinate."""
-    return np.array([
+    return torch.tensor([
         lower_coord[0] * 8 + leaf_coord[0],
         lower_coord[1] * 8 + leaf_coord[1],
         lower_coord[2] * 8 + leaf_coord[2],
-    ], dtype=np.int32)
+    ], dtype=torch.int32)
 
 
 def _reference_lookup(lower_data, leaf_data, global_coord):
-    """Numpy reference: hierarchical lookup for one global coordinate.
+    """Reference: hierarchical lookup for one global coordinate.
 
     Returns the voxel value, or -1 if any level is inactive or OOB.
     """
@@ -127,18 +128,18 @@ def _reference_lookup(lower_data, leaf_data, global_coord):
     vl = global_coord & 7
 
     # Check lower bounds
-    if np.any(ll < 0) or np.any(ll >= 16):
+    if torch.any(ll < 0).item() or torch.any(ll >= 16).item():
         return -1
 
-    leaf_idx = lower_data[ll[0], ll[1], ll[2]]
+    leaf_idx = lower_data[ll[0].item(), ll[1].item(), ll[2].item()]
     if leaf_idx < 0 or leaf_idx >= leaf_data.shape[0]:
         return -1
 
     # Check leaf bounds
-    if np.any(vl < 0) or np.any(vl >= 8):
+    if torch.any(vl < 0).item() or torch.any(vl >= 8).item():
         return -1
 
-    return leaf_data[leaf_idx, vl[0], vl[1], vl[2]]
+    return leaf_data[leaf_idx.item(), vl[0].item(), vl[1].item(), vl[2].item()]
 
 
 # ---------------------------------------------------------------------------
@@ -152,15 +153,15 @@ def test_single_coord_cross_leaf():
     # Pick a coord in the first leaf, near the boundary
     lx, ly, lz = active_lower[0]
     leaf = leaf_data[0]
-    active_leaf = np.argwhere(leaf >= 0).astype(np.int32)
+    active_leaf = torch.nonzero(leaf >= 0).to(torch.int32)
     # Pick a boundary voxel (leaf_coord component == 7) if available
-    boundary = [c for c in active_leaf if c[2] == 7]
+    boundary = [c for c in active_leaf if c[2].item() == 7]
     if boundary:
-        vl = np.array(boundary[0], dtype=np.int32)
+        vl = boundary[0].to(torch.int32)
     else:
         vl = active_leaf[0]
 
-    global_coord = _global_coord((lx, ly, lz), vl)
+    global_coord = _global_coord((lx, ly, lz), (vl[0].item(), vl[1].item(), vl[2].item()))
 
     # Run for each of 6 offsets individually
     lower_val = Value(
@@ -193,12 +194,13 @@ def test_single_coord_cross_leaf():
         dsl_results.append(dsl_active)
 
         ref_val = _reference_lookup(lower_data, leaf_data, nbr_coord)
-        ref_results.append(ref_val >= 0)
+        ref_results.append((ref_val >= 0).item() if isinstance(ref_val, torch.Tensor) else ref_val >= 0)
 
     assert dsl_results == ref_results, f"DSL: {dsl_results}, ref: {ref_results}"
 
     n_active = sum(ref_results)
-    is_boundary = any(c == 7 or c == 0 for c in vl)
+    vl_list = [vl[0].item(), vl[1].item(), vl[2].item()]
+    is_boundary = any(c == 7 or c == 0 for c in vl_list)
     print(
         f"  single_coord: global={global_coord}, leaf_local={vl}, "
         f"boundary={is_boundary}, {n_active}/6 active neighbors -- PASSED"
@@ -215,22 +217,23 @@ def test_cross_boundary_neighbor():
     leaf = leaf_data[0]
 
     # Find a voxel with z=7 in the first leaf
-    z7_voxels = np.argwhere((leaf >= 0) & (np.arange(8).reshape(1, 1, 8) == 7))
+    z7_mask = (leaf >= 0) & (torch.arange(8, device=leaf.device).reshape(1, 1, 8) == 7)
+    z7_voxels = torch.nonzero(z7_mask)
     if len(z7_voxels) == 0:
         print("  cross_boundary: no z=7 voxels in first leaf -- SKIPPED")
         return
 
-    vl = z7_voxels[0].astype(np.int32)
-    global_coord = _global_coord((lx, ly, lz), vl)
+    vl = z7_voxels[0].to(torch.int32)
+    global_coord = _global_coord((lx, ly, lz), (vl[0].item(), vl[1].item(), vl[2].item()))
 
     # The +z neighbor is at global_coord + (0,0,1)
     # This crosses into lower node (3,4,6), leaf_local (vl[0], vl[1], 0)
-    nbr_global = global_coord + np.array([0, 0, 1], dtype=np.int32)
+    nbr_global = global_coord + torch.tensor([0, 0, 1], dtype=torch.int32)
     nbr_ll = (nbr_global >> 3) & 15
     nbr_vl = nbr_global & 7
 
     # Verify the neighbor IS in a different lower node
-    assert nbr_ll[2] != lz, f"Neighbor should cross leaf boundary: {nbr_ll}"
+    assert nbr_ll[2].item() != lz, f"Neighbor should cross leaf boundary: {nbr_ll}"
 
     # Run DSL
     lower_val = Value(
@@ -245,7 +248,7 @@ def test_cross_boundary_neighbor():
         leaf_data,
     )
     coord_val = Value(Type(Shape(Static(3)), ScalarType.I32), global_coord)
-    offset_val = Value(Type(Shape(Static(3)), ScalarType.I32), np.array([0, 0, 1], dtype=np.int32))
+    offset_val = Value(Type(Shape(Static(3)), ScalarType.I32), torch.tensor([0, 0, 1], dtype=torch.int32))
 
     _, result = run(CROSS_LEAF_PREDICATE, {
         "coord": coord_val,
@@ -256,12 +259,12 @@ def test_cross_boundary_neighbor():
 
     dsl_active = bool(result.data)
     ref_val = _reference_lookup(lower_data, leaf_data, nbr_global)
-    ref_active = ref_val >= 0
+    ref_active = (ref_val >= 0).item() if isinstance(ref_val, torch.Tensor) else ref_val >= 0
 
     assert dsl_active == ref_active, f"DSL: {dsl_active}, ref: {ref_active}"
     print(
         f"  cross_boundary: voxel {global_coord} -> +z neighbor {nbr_global}, "
-        f"crosses from lower ({lx},{ly},{lz}) to ({nbr_ll[0]},{nbr_ll[1]},{nbr_ll[2]}), "
+        f"crosses from lower ({lx},{ly},{lz}) to ({nbr_ll[0].item()},{nbr_ll[1].item()},{nbr_ll[2].item()}), "
         f"active={dsl_active} -- PASSED"
     )
 
@@ -286,16 +289,17 @@ def test_batch_cross_leaf():
     all_global_coords = []
     for li, (lx, ly, lz) in enumerate(active_lower):
         leaf = leaf_data[li]
-        active_leaf = np.argwhere(leaf >= 0).astype(np.int32)
+        active_leaf = torch.nonzero(leaf >= 0).to(torch.int32)
         for vl in active_leaf:
-            gc = _global_coord((lx, ly, lz), vl)
+            gc = _global_coord((lx, ly, lz), (vl[0].item(), vl[1].item(), vl[2].item()))
             all_global_coords.append(gc)
 
-    all_global_coords = np.array(all_global_coords, dtype=np.int32)
+    all_global_coords = torch.stack(all_global_coords)
     N = len(all_global_coords)
 
     # Test a subset (full batch would be slow through per-coord DSL evaluation)
-    test_indices = np.random.RandomState(42).choice(N, min(50, N), replace=False)
+    gen = torch.Generator().manual_seed(42)
+    test_indices = torch.randperm(N, generator=gen)[: min(50, N)]
 
     n_cross = 0
     n_total = 0
@@ -315,7 +319,7 @@ def test_batch_cross_leaf():
 
             dsl_active = bool(result.data)
             ref_val = _reference_lookup(lower_data, leaf_data, nbr)
-            ref_active = ref_val >= 0
+            ref_active = (ref_val >= 0).item() if isinstance(ref_val, torch.Tensor) else ref_val >= 0
 
             assert dsl_active == ref_active, (
                 f"Mismatch at {gc} + {off} = {nbr}: DSL={dsl_active}, ref={ref_active}"
@@ -324,7 +328,7 @@ def test_batch_cross_leaf():
             # Check if this neighbor crosses a leaf boundary
             gc_lower = (gc >> 3) & 15
             nbr_lower = (nbr >> 3) & 15
-            if not np.array_equal(gc_lower, nbr_lower):
+            if not torch.equal(gc_lower, nbr_lower):
                 n_cross += 1
             n_total += 1
 

@@ -13,7 +13,7 @@ Demonstrates:
     same result, different materialisation point)
 """
 
-import numpy as np
+import torch
 
 from fvdb_tile.prototype.dsl_eval import run
 from fvdb_tile.prototype.layouts import cut_by_size, indexed
@@ -32,19 +32,19 @@ from fvdb_tile.prototype.types import (
 # Test mesh: a tetrahedron (4 vertices, 4 triangular faces)
 # ---------------------------------------------------------------------------
 
-TETRA_POSITIONS = np.array([
+TETRA_POSITIONS = torch.tensor([
     [0.0, 0.0, 0.0],
     [1.0, 0.0, 0.0],
     [0.5, 1.0, 0.0],
     [0.5, 0.5, 1.0],
-], dtype=np.float32)
+], dtype=torch.float32)
 
-TETRA_FACES = np.array([
+TETRA_FACES = torch.tensor([
     [0, 1, 2],
     [0, 1, 3],
     [0, 2, 3],
     [1, 2, 3],
-], dtype=np.int32)
+], dtype=torch.int32)
 
 
 # ---------------------------------------------------------------------------
@@ -115,12 +115,12 @@ def test_mesh_centroids():
 
     # ---- SETUP ----
     positions = Value(
-        Type(Shape(Static(TETRA_POSITIONS.size)), ScalarType.F32),
-        TETRA_POSITIONS.ravel().astype(np.float32),
+        Type(Shape(Static(TETRA_POSITIONS.numel())), ScalarType.F32),
+        TETRA_POSITIONS.flatten().to(torch.float32),
     )
     faces = Value(
-        Type(Shape(Static(TETRA_FACES.size)), ScalarType.I32),
-        TETRA_FACES.ravel().astype(np.int32),
+        Type(Shape(Static(TETRA_FACES.numel())), ScalarType.I32),
+        TETRA_FACES.flatten().to(torch.int32),
     )
 
     # ---- EXPRESSION ----
@@ -136,11 +136,11 @@ def test_mesh_centroids():
 
     F = TETRA_FACES.shape[0]
     for fi in range(F):
-        actual = result.data[fi] if isinstance(result.data[fi], np.ndarray) else result.data[fi].data
-        expected = TETRA_POSITIONS[TETRA_FACES[fi]].mean(axis=0)
-        np.testing.assert_array_almost_equal(actual, expected)
+        actual = result.data[fi] if isinstance(result.data[fi], torch.Tensor) else result.data[fi].data
+        expected = TETRA_POSITIONS[TETRA_FACES[fi]].mean(dim=0)
+        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
-    centroid0 = result.data[0] if isinstance(result.data[0], np.ndarray) else result.data[0].data
+    centroid0 = result.data[0] if isinstance(result.data[0], torch.Tensor) else result.data[0].data
     print(f"  4 face centroids verified via DSL")
     print(f"  centroids[0] = {centroid0}")
     print(f"  -> Mean = Div(Over(Add, ...), Const(3)) -- no special primitive needed.")
@@ -155,12 +155,12 @@ def test_mesh_dsl():
 
     # ---- SETUP ----
     positions = Value(
-        Type(Shape(Static(TETRA_POSITIONS.size)), ScalarType.F32),
-        TETRA_POSITIONS.ravel().astype(np.float32),
+        Type(Shape(Static(TETRA_POSITIONS.numel())), ScalarType.F32),
+        TETRA_POSITIONS.flatten().to(torch.float32),
     )
     faces = Value(
-        Type(Shape(Static(TETRA_FACES.size)), ScalarType.I32),
-        TETRA_FACES.ravel().astype(np.int32),
+        Type(Shape(Static(TETRA_FACES.numel())), ScalarType.I32),
+        TETRA_FACES.flatten().to(torch.int32),
     )
 
     # ---- EXPRESSION ----
@@ -176,9 +176,9 @@ def test_mesh_dsl():
 
     for fi in range(4):
         tri_data = result.data[fi]
-        actual = tri_data if isinstance(tri_data, np.ndarray) else tri_data.data
+        actual = tri_data if isinstance(tri_data, torch.Tensor) else tri_data.data
         expected = TETRA_POSITIONS[TETRA_FACES[fi]]
-        np.testing.assert_array_almost_equal(actual, expected)
+        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
     print(f"  DSL produced correct triangle vertex data for 4 faces")
     print(f"  -> Mesh expressed as layouts over tensors, no custom mesh class.")

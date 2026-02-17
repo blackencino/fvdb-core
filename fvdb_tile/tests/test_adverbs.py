@@ -12,7 +12,7 @@ Validates:
   5. Backward compatibility with existing DSL programs
 """
 
-import numpy as np
+import torch
 
 from fvdb_tile.prototype.dsl_eval import run
 from fvdb_tile.prototype.ops import Value
@@ -33,7 +33,7 @@ from fvdb_tile.prototype.types import (
 
 def test_over_add():
     """Over(Add, xs) reduces a vector by summation."""
-    xs_data = np.array([1, 2, 3, 4, 5], dtype=np.int32)
+    xs_data = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int32)
     xs = Value(Type(Shape(Static(5)), ScalarType.I32), xs_data)
 
     types, result = run("reduced = Over(Add, Input(\"xs\"))\nreduced", {"xs": xs})
@@ -49,29 +49,29 @@ def test_over_add():
 
 def test_each_right_basic():
     """EachRight(Add, scalar, vector) adds scalar to each element."""
-    x = Value(Type(Shape(), ScalarType.I32), np.int32(10))
-    y_data = np.array([1, 2, 3], dtype=np.int32)
+    x = Value(Type(Shape(), ScalarType.I32), torch.tensor(10, dtype=torch.int32))
+    y_data = torch.tensor([1, 2, 3], dtype=torch.int32)
     y = Value(Type(Shape(Static(3)), ScalarType.I32), y_data)
 
     prog = "result = EachRight(Add, Input(\"x\"), Input(\"y\"))\nresult"
     types, result = run(prog, {"x": x, "y": y})
 
     assert result.type.iteration_shape == Shape(Static(3))
-    np.testing.assert_array_equal(result.data, [11, 12, 13])
+    torch.testing.assert_close(result.data, torch.tensor([11, 12, 13], dtype=torch.int32), atol=0, rtol=0)
     print("  EachRight(Add, 10, [1,2,3]) = [11,12,13]")
 
 
 def test_each_left_basic():
     """EachLeft(Add, vector, scalar) adds scalar to each element."""
-    x_data = np.array([1, 2, 3], dtype=np.int32)
+    x_data = torch.tensor([1, 2, 3], dtype=torch.int32)
     x = Value(Type(Shape(Static(3)), ScalarType.I32), x_data)
-    y = Value(Type(Shape(), ScalarType.I32), np.int32(10))
+    y = Value(Type(Shape(), ScalarType.I32), torch.tensor(10, dtype=torch.int32))
 
     prog = "result = EachLeft(Add, Input(\"x\"), Input(\"y\"))\nresult"
     types, result = run(prog, {"x": x, "y": y})
 
     assert result.type.iteration_shape == Shape(Static(3))
-    np.testing.assert_array_equal(result.data, [11, 12, 13])
+    torch.testing.assert_close(result.data, torch.tensor([11, 12, 13], dtype=torch.int32), atol=0, rtol=0)
     print("  EachLeft(Add, [1,2,3], 10) = [11,12,13]")
 
 
@@ -98,9 +98,9 @@ def test_outer_product_each_right_each_left():
 
     Result: (2,) / (3,) / i32 = [[11,12,13], [21,22,23]]
     """
-    x_data = np.array([1, 2, 3], dtype=np.int32)
+    x_data = torch.tensor([1, 2, 3], dtype=torch.int32)
     x = Value(Type(Shape(Static(3)), ScalarType.I32), x_data)
-    y_data = np.array([10, 20], dtype=np.int32)
+    y_data = torch.tensor([10, 20], dtype=torch.int32)
     y = Value(Type(Shape(Static(2)), ScalarType.I32), y_data)
 
     prog = "result = EachRight(EachLeft(Add), Input(\"x\"), Input(\"y\"))\nresult"
@@ -113,8 +113,8 @@ def test_outer_product_each_right_each_left():
     assert inner.iteration_shape == Shape(Static(3)), f"inner shape {inner.iteration_shape}"
 
     # Data check
-    expected = np.array([[11, 12, 13], [21, 22, 23]], dtype=np.int32)
-    np.testing.assert_array_equal(result.data, expected)
+    expected = torch.tensor([[11, 12, 13], [21, 22, 23]], dtype=torch.int32)
+    torch.testing.assert_close(result.data, expected, atol=0, rtol=0)
     print(f"  EachRight(EachLeft(Add))([1,2,3], [10,20]) = {result.data.tolist()}")
     print(f"  Type: {result.type}")
 
@@ -136,9 +136,9 @@ def test_outer_product_reversed():
 
     Result: (3,) / (2,) / i32 = [[11,21], [12,22], [13,23]]
     """
-    x_data = np.array([1, 2, 3], dtype=np.int32)
+    x_data = torch.tensor([1, 2, 3], dtype=torch.int32)
     x = Value(Type(Shape(Static(3)), ScalarType.I32), x_data)
-    y_data = np.array([10, 20], dtype=np.int32)
+    y_data = torch.tensor([10, 20], dtype=torch.int32)
     y = Value(Type(Shape(Static(2)), ScalarType.I32), y_data)
 
     prog = "result = EachLeft(EachRight(Add), Input(\"x\"), Input(\"y\"))\nresult"
@@ -151,8 +151,8 @@ def test_outer_product_reversed():
     assert inner.iteration_shape == Shape(Static(2)), f"inner shape {inner.iteration_shape}"
 
     # Data check
-    expected = np.array([[11, 21], [12, 22], [13, 23]], dtype=np.int32)
-    np.testing.assert_array_equal(result.data, expected)
+    expected = torch.tensor([[11, 21], [12, 22], [13, 23]], dtype=torch.int32)
+    torch.testing.assert_close(result.data, expected, atol=0, rtol=0)
     print(f"  EachLeft(EachRight(Add))([1,2,3], [10,20]) = {result.data.tolist()}")
     print(f"  Type: {result.type}")
 
@@ -193,9 +193,9 @@ def test_nested_adverb_type_inference():
 
 def test_let_bound_adverb():
     """A composed adverb can be let-bound and applied later."""
-    x_data = np.array([1, 2], dtype=np.int32)
+    x_data = torch.tensor([1, 2], dtype=torch.int32)
     x = Value(Type(Shape(Static(2)), ScalarType.I32), x_data)
-    y_data = np.array([10, 20, 30], dtype=np.int32)
+    y_data = torch.tensor([10, 20, 30], dtype=torch.int32)
     y = Value(Type(Shape(Static(3)), ScalarType.I32), y_data)
 
     prog = """
@@ -205,8 +205,8 @@ result
 """
     types, result = run(prog, {"x": x, "y": y})
 
-    expected = np.array([[11, 12], [21, 22], [31, 32]], dtype=np.int32)
-    np.testing.assert_array_equal(result.data, expected)
+    expected = torch.tensor([[11, 12], [21, 22], [31, 32]], dtype=torch.int32)
+    torch.testing.assert_close(result.data, expected, atol=0, rtol=0)
     print(f"  f = EachRight(EachLeft(Add)); Apply(f, [1,2], [10,20,30]) = {result.data.tolist()}")
 
 
@@ -221,30 +221,30 @@ centroids = Each(face_idx, f => Div(Over(Add, Map(f, i => Gather(vertices, i))),
 centroids
 """
 
-TETRA_POSITIONS = np.array([
+TETRA_POSITIONS = torch.tensor([
     [0.0, 0.0, 0.0],
     [1.0, 0.0, 0.0],
     [0.5, 1.0, 0.0],
     [0.5, 0.5, 1.0],
-], dtype=np.float32)
+], dtype=torch.float32)
 
-TETRA_FACES = np.array([
+TETRA_FACES = torch.tensor([
     [0, 1, 2],
     [0, 1, 3],
     [0, 2, 3],
     [1, 2, 3],
-], dtype=np.int32)
+], dtype=torch.int32)
 
 
 def test_backward_compat_centroids():
     """Mesh centroid program uses Over(Add, ...) -- must still work."""
     positions = Value(
-        Type(Shape(Static(TETRA_POSITIONS.size)), ScalarType.F32),
-        TETRA_POSITIONS.ravel().astype(np.float32),
+        Type(Shape(Static(TETRA_POSITIONS.numel())), ScalarType.F32),
+        TETRA_POSITIONS.flatten().to(torch.float32),
     )
     faces = Value(
-        Type(Shape(Static(TETRA_FACES.size)), ScalarType.I32),
-        TETRA_FACES.ravel().astype(np.int32),
+        Type(Shape(Static(TETRA_FACES.numel())), ScalarType.I32),
+        TETRA_FACES.flatten().to(torch.int32),
     )
 
     types, result = run(CENTROID_PROGRAM, {"positions": positions, "faces": faces})
@@ -252,9 +252,9 @@ def test_backward_compat_centroids():
     assert result.type.iteration_shape == Shape(Static(4))
 
     for fi in range(4):
-        actual = result.data[fi] if isinstance(result.data[fi], np.ndarray) else result.data[fi].data
-        expected = TETRA_POSITIONS[TETRA_FACES[fi]].mean(axis=0)
-        np.testing.assert_array_almost_equal(actual, expected)
+        actual = result.data[fi] if isinstance(result.data[fi], torch.Tensor) else result.data[fi].data
+        expected = TETRA_POSITIONS[TETRA_FACES[fi]].mean(dim=0)
+        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
     print(f"  Centroid backward compat: 4 faces verified")
 
