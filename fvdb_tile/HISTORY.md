@@ -189,10 +189,43 @@ masked + CIG3 (`test_masked`, `test_cig3`), GPU codegen
 
 ### Next steps
 
-1. **Multi-step pipeline on GPU** -- implement `Where` as a two-pass
-   GPU pipeline (count kernel -> `torch.cumsum` -> scatter kernel).
-   The pipeline planner already identifies barriers.
-2. **conv_grid** -- topology expansion using Sort + Unique collectives.
-3. **Close the query performance gap** -- investigate hardware popcount
+1. **conv_grid** -- topology expansion using Sort + Unique collectives
+   via the pipeline executor (now that collectives dispatch to torch).
+2. **Close the query performance gap** -- investigate hardware popcount
    via cuTile TileIR.
-4. **Batch dimension** -- extend CIG3 to handle GridBatch.
+3. **Batch dimension** -- extend CIG3 to handle GridBatch.
+4. **Cutile segment compilation** -- wire cutile segments to
+   `emit_runnable_kernel` for full GPU execution end-to-end.
+
+---
+
+## GPU-Backed Pipeline Collectives: Feb 17 2026
+
+The pipeline executor now dispatches collective segments (Where, Sort,
+Unique) to torch ops via the `device` parameter on
+`PipelineExecutable.run()`.
+
+### What was added
+
+- `EvalEnv.hooks` in `dsl_eval.py`: optional dict mapping node types to
+  callable overrides.  The evaluator checks hooks before its normal
+  dispatch, and hooks propagate through child environments automatically.
+- `_torch_where`, `_torch_sort`, `_torch_unique` in `dsl_pipeline.py`:
+  torch-backed implementations of collective operations.
+- `_make_collective_hooks(device)`: builds a hooks dict for a given
+  torch device.  Used by `PipelineExecutable.run(device=...)`.
+- `PipelineExecutable.run(device=...)`: when `device` is `"cpu"` or
+  `"cuda"`, collective operations dispatch to torch.  When `None`
+  (default), the pure numpy evaluator handles everything (backwards
+  compatible).
+- Four new tests in `test_pipeline.py` verifying collective dispatch
+  matches the pure evaluator for Where, Sort+Unique, mixed segments,
+  and nested barriers.
+
+### Design notes
+
+Data stays as numpy `Value` objects at segment boundaries.  Collective
+hooks convert numpy to torch, run the op, and convert back.  This keeps
+the existing test infrastructure working.  The hooks mechanism is general:
+any node type can be overridden, enabling future backends (cuTile segment
+compilation) via the same interface.

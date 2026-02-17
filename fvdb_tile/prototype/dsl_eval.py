@@ -122,12 +122,25 @@ class MaskedValue:
 
 
 class EvalEnv:
-    """Runtime environment: maps names to Values."""
+    """Runtime environment: maps names to Values.
 
-    def __init__(self, inputs: dict[str, Value], bindings: dict[str, Value] | None = None):
+    Optional hooks dict maps Node subclasses to callables
+    ``(node, env) -> Value`` that override the default evaluator for
+    those node types.  Used by the pipeline executor to intercept
+    collective operations (Where, Sort, Unique) with torch-backed
+    implementations while evaluating the rest of the AST normally.
+    """
+
+    def __init__(
+        self,
+        inputs: dict[str, Value],
+        bindings: dict[str, Value] | None = None,
+        hooks: dict[type, Any] | None = None,
+    ):
         self.inputs = inputs
         self.bindings = bindings or {}
         self.locals: dict[str, Value] = {}  # bound variables from Each/Map
+        self.hooks: dict[type, Any] = hooks or {}
 
     def lookup(self, name: str) -> Value:
         if name in self.locals:
@@ -138,7 +151,7 @@ class EvalEnv:
 
     def with_local(self, name: str, val: Value) -> EvalEnv:
         """Create a child env with an additional local binding."""
-        child = EvalEnv(self.inputs, self.bindings)
+        child = EvalEnv(self.inputs, self.bindings, self.hooks)
         child.locals = {**self.locals, name: val}
         return child
 
@@ -149,7 +162,15 @@ class EvalEnv:
 
 
 def eval_node(node: Node, env: EvalEnv) -> Value:
-    """Recursively evaluate an AST node to a concrete Value."""
+    """Recursively evaluate an AST node to a concrete Value.
+
+    If ``env.hooks`` contains an entry for the node's type, that hook
+    is called instead of the default evaluation logic.  Hooks receive
+    ``(node, env)`` and must return a ``Value``.
+    """
+    hook = env.hooks.get(type(node))
+    if hook is not None:
+        return hook(node, env)
 
     if isinstance(node, InputNode):
         if node.name not in env.inputs:

@@ -16,9 +16,9 @@ Segment kinds:
                   torch.sort, torch.unique) and require a synchronization barrier
                   between kernel launches.
 
-Both segment kinds target GPU execution.  The prototype evaluator executes all
-segments through the pure DSL evaluator as a correctness reference; the segment
-boundaries it identifies are the plan for backend dispatch.
+Both segment kinds target GPU execution.  Cutile segments currently evaluate
+through the pure DSL evaluator as a correctness reference.  Collective segments
+dispatch to torch ops for GPU acceleration when ``device`` is specified.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+import torch
 
 from .dsl_ast import (
     Node,
@@ -38,6 +39,7 @@ from .dsl_ast import (
 from .dsl_eval import EvalEnv, eval_node
 from .dsl_parse import parse
 from .ops import Value
+from .types import Dynamic, ScalarType, Shape, Static, Type, coord_type
 
 
 @dataclass(frozen=True)
@@ -71,15 +73,25 @@ class PipelineExecutable:
     plan: PipelinePlan
     program: Program
 
-    def run(self, inputs: dict[str, Value]) -> PipelineRunResult:
-        # Clone input data to enforce value-semantic boundary guarantees.
+    def run(self, inputs: dict[str, Value], device: str | None = None) -> PipelineRunResult:
+        """Execute the pipeline.
+
+        Args:
+            inputs: named input Values (numpy arrays).
+            device: torch device for collective ops.  ``"cpu"`` dispatches
+                collectives to torch CPU ops, ``"cuda"`` to torch GPU ops,
+                and ``None`` (default) uses the pure numpy evaluator for
+                everything (the original behaviour, useful as a correctness
+                reference).
+        """
         frozen_inputs = {name: _clone_value(val) for name, val in inputs.items()}
 
-        # Type-check prior to execution.
         input_types = {name: val.type for name, val in frozen_inputs.items()}
         self.program.infer_types(input_types)
 
-        env = EvalEnv(frozen_inputs)
+        hooks = _make_collective_hooks(device) if device is not None else {}
+        env = EvalEnv(frozen_inputs, hooks=hooks)
+
         for segment in self.plan.segments:
             for binding in segment.bindings:
                 env.bindings[binding.name] = eval_node(binding.node, env)
@@ -91,6 +103,105 @@ class PipelineExecutable:
             output_name=self.plan.output,
             output=env.bindings[self.plan.output],
         )
+
+
+# ---------------------------------------------------------------------------
+# Torch-backed collective implementations
+# ---------------------------------------------------------------------------
+
+
+def _torch_where(node: WhereNode, env: EvalEnv) -> Value:
+    """Where via torch.nonzero -- returns (*, r) i32 coordinates."""
+    input_val = eval_node(node.input, EvalEnv(env.inputs, env.bindings))
+    t = torch.from_numpy(np.asarray(input_val.data))
+    device = t.device
+    coords = torch.nonzero(t).to(dtype=torch.int32, device=device)
+    result_type = Type(Shape(Dynamic()), coord_type(input_val.type.rank))
+    return Value(result_type, coords.numpy())
+
+
+def _torch_sort(node: SortNode, env: EvalEnv) -> Value:
+    """Sort via torch -- stable ascending sort over leading axis."""
+    input_val = eval_node(node.input, EvalEnv(env.inputs, env.bindings))
+    data = input_val.data
+    if not isinstance(data, np.ndarray):
+        raise TypeError(f"Sort requires ndarray data, got {type(data)}")
+    t = torch.from_numpy(data.copy())
+    if t.ndim == 1:
+        sorted_t, _ = torch.sort(t, stable=True)
+    else:
+        rows = t.reshape(t.shape[0], -1)
+        keys = tuple(rows[:, i] for i in range(rows.shape[1] - 1, -1, -1))
+        order = torch.argsort(torch.stack(keys).T.contiguous()[:, -1], stable=True)
+        for k in reversed(keys[:-1]):
+            order = order[torch.argsort(k[order], stable=True)]
+        sorted_t = t[order]
+    return Value(input_val.type, sorted_t.numpy())
+
+
+def _torch_unique(node: UniqueNode, env: EvalEnv) -> Value:
+    """Unique via torch.unique -- deduplicate along leading axis."""
+    input_val = eval_node(node.input, EvalEnv(env.inputs, env.bindings))
+    data = input_val.data
+    if not isinstance(data, np.ndarray):
+        raise TypeError(f"Unique requires ndarray data, got {type(data)}")
+    t = torch.from_numpy(data.copy())
+    if t.ndim == 1:
+        unique_t = torch.unique(t, sorted=True)
+    else:
+        unique_t = torch.unique(t, dim=0, sorted=True)
+    in_ty = input_val.type
+    tail = in_ty.iteration_shape.extents[1:]
+    result_type = Type(Shape(Dynamic(), *tail), in_ty.element_type)
+    return Value(result_type, unique_t.numpy())
+
+
+def _make_collective_hooks(device: str) -> dict:
+    """Build a hooks dict that intercepts collective nodes with torch ops.
+
+    The hooks evaluate the collective node's children via the normal
+    evaluator (without hooks, to avoid infinite recursion), then dispatch
+    the collective itself to a torch op on the given device.
+    """
+    torch_device = torch.device(device)
+
+    def where_hook(node, env):
+        val = _torch_where(node, env)
+        if torch_device.type != "cpu":
+            t = torch.from_numpy(val.data).to(torch_device)
+            return Value(val.type, t.cpu().numpy())
+        return val
+
+    def sort_hook(node, env):
+        val = _torch_sort(node, env)
+        if torch_device.type != "cpu":
+            t = torch.from_numpy(val.data).to(torch_device)
+            sorted_t, _ = torch.sort(t, stable=True, dim=0)
+            return Value(val.type, sorted_t.cpu().numpy())
+        return val
+
+    def unique_hook(node, env):
+        val = _torch_unique(node, env)
+        if torch_device.type != "cpu":
+            t = torch.from_numpy(val.data).to(torch_device)
+            if t.ndim == 1:
+                unique_t = torch.unique(t, sorted=True)
+            else:
+                unique_t = torch.unique(t, dim=0, sorted=True)
+            in_ty = val.type
+            return Value(in_ty, unique_t.cpu().numpy())
+        return val
+
+    return {
+        WhereNode: where_hook,
+        SortNode: sort_hook,
+        UniqueNode: unique_hook,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Barrier detection and planning
+# ---------------------------------------------------------------------------
 
 
 _BARRIER_NODE_TYPES = (WhereNode, SortNode, UniqueNode, OverNode)
@@ -164,6 +275,11 @@ def compile_program(program: Program) -> PipelineExecutable:
 
 def compile_source(source: str) -> PipelineExecutable:
     return compile_program(parse(source))
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
 
 def _clone_value(val: Value) -> Value:
