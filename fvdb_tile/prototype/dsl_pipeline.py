@@ -417,7 +417,7 @@ def _run_cutile_segment(
         tuple(launch_args),
     )
 
-    result_trimmed = result_t[:tile_N].to(torch.int32)
+    result_trimmed = result_t[:tile_N].to(torch.int32).cpu()
     result_type = all_types.get(last_name)
     if result_type is None:
         result_type = Type(Shape(Dynamic()), ScalarType.I32)

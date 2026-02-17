@@ -209,28 +209,29 @@ voxel_idx
 """
 
 
+def _morton_lut(dim: int) -> torch.Tensor:
+    """Pre-compute a (dim, dim, dim) -> morton index lookup table."""
+    coords = torch.stack(torch.meshgrid(
+        torch.arange(dim), torch.arange(dim), torch.arange(dim), indexing="ij"
+    ), dim=-1).reshape(-1, 3).to(torch.int32)
+    return morton3d(coords)
+
+
 def test_morton_chain_batch():
     """Same grid morton-linearized, verify identical results via DSL."""
 
     # ---- SETUP ----
     lower_data, leaf_data, _ = _build_two_level_grid(n_lower=1)
 
-    # Morton-linearize
+    # Morton-linearize (vectorized)
+    lut_16 = _morton_lut(16)
     lower_morton = torch.full((4096,), -1, dtype=torch.int32)
-    for x in range(16):
-        for y in range(16):
-            for z in range(16):
-                m = int(morton3d(torch.tensor([x, y, z], dtype=torch.int32)))
-                lower_morton[m] = lower_data[0, x, y, z]
+    lower_morton[lut_16.long()] = lower_data[0].reshape(-1)
 
     K = leaf_data.shape[0]
+    lut_8 = _morton_lut(8)
     leaf_morton = torch.full((K, 512), -1, dtype=torch.int32)
-    for k in range(K):
-        for x in range(8):
-            for y in range(8):
-                for z in range(8):
-                    m = int(morton3d(torch.tensor([x, y, z], dtype=torch.int32)))
-                    leaf_morton[k, m] = leaf_data[k, x, y, z]
+    leaf_morton[:, lut_8.long()] = leaf_data.reshape(K, -1)
 
     lower_m_val = Value(Type(Shape(Static(4096)), ScalarType.I32), lower_morton)
     leaf_m_val = Value(

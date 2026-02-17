@@ -1,14 +1,14 @@
 # Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: Apache-2.0
 """
-Benchmark: cross-leaf neighbor predicate -- cuTile vs ref vs PyTorch GPU.
+Benchmark: cross-leaf neighbor predicate -- cuTile vs PyTorch (CPU & GPU).
 
 Measures wall-clock time for the hierarchical neighbor predicate (Decompose +
 chained Gather through a two-level grid) at parameterized scale.
 
 Three implementations:
-  - ref (loop): per-coord, per-offset hierarchical lookup
-  - PyTorch GPU (vectorized): broadcast + advanced indexing through two levels
+  - PyTorch CPU (vectorized): broadcast + advanced indexing on CPU
+  - PyTorch GPU (vectorized): same, on CUDA
   - cuTile (generated): DSL-emitted @ct.kernel via emit_runnable_kernel
 """
 
@@ -81,55 +81,27 @@ def build_grid(n_leaves, seed=42):
 
     leaf_data = torch.stack(leaf_blocks)
 
-    # Collect all active global coords
-    all_coords = []
+    # Collect all active global coords (vectorized per-leaf)
+    all_coords_list = []
     for li, (lx, ly, lz) in enumerate(active_lower):
-        leaf = leaf_data[li]
-        active_voxels = torch.nonzero(leaf >= 0).to(torch.int32)
-        for vl in active_voxels:
-            gc = torch.tensor(
-                [lx * 8 + vl[0].item(), ly * 8 + vl[1].item(), lz * 8 + vl[2].item()],
-                dtype=torch.int32,
-            )
-            all_coords.append(gc)
-    all_coords = torch.stack(all_coords)
+        active_voxels = torch.nonzero(leaf_data[li] >= 0).to(torch.int32)  # (M, 3)
+        origin = torch.tensor([lx * 8, ly * 8, lz * 8], dtype=torch.int32)
+        all_coords_list.append(active_voxels + origin)
+    all_coords = torch.cat(all_coords_list)
 
     return lower_data, leaf_data, all_coords
 
 
 # ---------------------------------------------------------------------------
-# ref reference
+# PyTorch (vectorized) -- used for both CPU and GPU
 # ---------------------------------------------------------------------------
 
 
-def ref_cross_leaf(lower_data, leaf_data, coords, offsets):
-    """Brute-force ref: per-coord, per-offset hierarchical lookup."""
-    N = coords.shape[0]
-    N_OFF = offsets.shape[0]
-    result = torch.zeros((N, N_OFF), dtype=torch.bool)
-    for i in range(N):
-        c = coords[i]
-        for j in range(N_OFF):
-            nbr = c + offsets[j]
-            ll = (nbr >> 3) & 15
-            vl = nbr & 7
-            if torch.any(ll < 0) or torch.any(ll >= 16):
-                continue
-            leaf_idx = lower_data[ll[0].item(), ll[1].item(), ll[2].item()]
-            if leaf_idx < 0 or leaf_idx >= leaf_data.shape[0]:
-                continue
-            if leaf_data[leaf_idx, vl[0].item(), vl[1].item(), vl[2].item()] >= 0:
-                result[i, j] = True
-    return result
+def pytorch_cross_leaf(lower_t, leaf_arr_t, coords_t, offsets_t):
+    """Vectorized PyTorch: broadcast + hierarchical advanced indexing.
 
-
-# ---------------------------------------------------------------------------
-# PyTorch GPU (vectorized)
-# ---------------------------------------------------------------------------
-
-
-def pytorch_gpu_cross_leaf(lower_t, leaf_arr_t, coords_t, offsets_t):
-    """Vectorized PyTorch on GPU: broadcast + hierarchical advanced indexing."""
+    Works on both CPU and CUDA tensors (all args must be on the same device).
+    """
     K = leaf_arr_t.shape[0]
 
     # (N, 1, 3) + (1, 6, 3) -> (N, 6, 3)
@@ -264,19 +236,16 @@ def bench(n_leaves=64):
     N = all_coords.shape[0]
     K = leaf_data.shape[0]
 
-    # Count cross-leaf lookups
-    n_cross = 0
-    for coord in all_coords:
-        cl = (coord >> 3) & 15
-        for off in FACE_OFFSETS:
-            nl = ((coord + off) >> 3) & 15
-            if not torch.equal(cl, nl):
-                n_cross += 1
+    # Count cross-leaf lookups (vectorized)
+    all_nbrs = all_coords.unsqueeze(1) + FACE_OFFSETS.unsqueeze(0)  # (N, 6, 3)
+    own_leaf = (all_coords >> 3) & 15  # (N, 3)
+    nbr_leaf = (all_nbrs >> 3) & 15  # (N, 6, 3)
+    n_cross = int((~(own_leaf.unsqueeze(1) == nbr_leaf).all(dim=2)).sum().item())
 
     print(f"Grid: {K} leaves, {N} active voxels, {N * 6} lookups, {n_cross} cross-leaf")
 
-    # Verify all implementations agree
-    ref = ref_cross_leaf(lower_data, leaf_data, all_coords, FACE_OFFSETS)
+    # Reference: PyTorch CPU (vectorized)
+    ref = pytorch_cross_leaf(lower_data, leaf_data, all_coords, FACE_OFFSETS)
     total_active = int(ref.sum().item())
 
     lower_t = lower_data.clone().cuda()
@@ -284,10 +253,11 @@ def bench(n_leaves=64):
     coord_t = all_coords.clone().cuda()
     offsets_t = FACE_OFFSETS.clone().cuda()
 
-    pt_gpu = pytorch_gpu_cross_leaf(lower_t, leaf_arr_t, coord_t, offsets_t)
-    pt_result = pt_gpu.cpu()
-    torch.testing.assert_close(ref, pt_result, atol=0, rtol=0)
+    # Verify PyTorch GPU matches CPU
+    pt_gpu = pytorch_cross_leaf(lower_t, leaf_arr_t, coord_t, offsets_t)
+    torch.testing.assert_close(ref, pt_gpu.cpu(), atol=0, rtol=0)
 
+    # Verify cuTile matches CPU
     kernel_fn, tile_size, map_len = build_cutile_launcher(K)
     result_t = torch.zeros(N, tile_size, dtype=torch.int32, device="cuda")
     cutile_cross_leaf(kernel_fn, coord_t, offsets_t, lower_t, leaf_arr_t, result_t, tile_size)
@@ -297,13 +267,13 @@ def bench(n_leaves=64):
     print(f"All agree: {total_active} active neighbors.\n")
 
     # Benchmark
-    t_ref = _time_fn(
-        lambda: ref_cross_leaf(lower_data, leaf_data, all_coords, FACE_OFFSETS),
-        warmup=1,
-        repeats=3,
+    t_pt_cpu = _time_fn(
+        lambda: pytorch_cross_leaf(lower_data, leaf_data, all_coords, FACE_OFFSETS),
+        warmup=3,
+        repeats=20,
     )
     t_pt_gpu = _time_fn(
-        lambda: pytorch_gpu_cross_leaf(lower_t, leaf_arr_t, coord_t, offsets_t)
+        lambda: pytorch_cross_leaf(lower_t, leaf_arr_t, coord_t, offsets_t)
     )
 
     def _run_cutile():
@@ -312,11 +282,11 @@ def bench(n_leaves=64):
 
     t_cutile = _time_fn(_run_cutile)
 
-    print(f"{'Method':<25} {'Median (us)':>12} {'vs ref':>10} {'vs GPU PyTorch':>15}")
-    print("-" * 65)
-    print(f"{'ref (loop)':<25} {t_ref:>12.0f} {'1.0x':>10} {'':<15}")
-    print(f"{'PyTorch GPU (vectorized)':<25} {t_pt_gpu:>12.1f} {t_ref / t_pt_gpu:>9.1f}x {'1.0x':>15}")
-    print(f"{'cuTile (generated)':<25} {t_cutile:>12.1f} {t_ref / t_cutile:>9.1f}x {t_pt_gpu / t_cutile:>14.1f}x")
+    print(f"{'Method':<25} {'Median (us)':>12} {'vs PyTorch GPU':>15}")
+    print("-" * 55)
+    print(f"{'PyTorch CPU (vectorized)':<25} {t_pt_cpu:>12.0f} {t_pt_cpu / t_pt_gpu:>14.1f}x")
+    print(f"{'PyTorch GPU (vectorized)':<25} {t_pt_gpu:>12.1f} {'1.0x':>15}")
+    print(f"{'cuTile (generated)':<25} {t_cutile:>12.1f} {t_pt_gpu / t_cutile:>14.1f}x")
 
     return {
         "n_leaves": n_leaves,
@@ -324,7 +294,7 @@ def bench(n_leaves=64):
         "n_lookups": N * 6,
         "n_cross_leaf": n_cross,
         "active_neighbors": total_active,
-        "ref_us": t_ref,
+        "pytorch_cpu_us": t_pt_cpu,
         "pytorch_gpu_us": t_pt_gpu,
         "cutile_us": t_cutile,
     }
@@ -338,16 +308,19 @@ if __name__ == "__main__":
         results.append(bench(n_leaves))
 
     print("\n\n=== Summary ===")
-    print(f"{'Leaves':>7} {'Voxels':>8} {'Lookups':>10} {'ref (us)':>12} {'PyTorch (us)':>13} {'cuTile (us)':>12} {'CT/PT':>7}")
-    print("-" * 75)
+    print(
+        f"{'Leaves':>7} {'Voxels':>8} {'Lookups':>10} "
+        f"{'PT CPU (us)':>12} {'PT GPU (us)':>12} {'cuTile (us)':>12} {'CT/PT GPU':>10}"
+    )
+    print("-" * 80)
     for r in results:
         ct_vs_pt = r["pytorch_gpu_us"] / r["cutile_us"]
         print(
             f"{r['n_leaves']:>7} "
             f"{r['n_voxels']:>8} "
             f"{r['n_lookups']:>10} "
-            f"{r['ref_us']:>12.0f} "
+            f"{r['pytorch_cpu_us']:>12.0f} "
             f"{r['pytorch_gpu_us']:>12.1f} "
             f"{r['cutile_us']:>12.1f} "
-            f"{ct_vs_pt:>6.1f}x"
+            f"{ct_vs_pt:>9.1f}x"
         )

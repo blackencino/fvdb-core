@@ -22,16 +22,25 @@ from .dsl_ast import (
     AddNode,
     AndNode,
     ConstNode,
+    CountNode,
     DecomposeNode,
+    DivNode,
     FieldNode,
     FindNode,
     GatherNode,
     GENode,
+    HierarchicalKeyDecodeNode,
+    HierarchicalKeyNode,
     InBoundsNode,
     InputNode,
     MapNode,
     MaskedNode,
+    Morton3dNode,
+    Morton3dSignedNode,
+    MortonDecode3dNode,
+    MulNode,
     Node,
+    NotNode,
     Program,
     RefNode,
     SubNode,
@@ -56,6 +65,51 @@ EmitVal = Union[str, list[str], dict]
 
 def _next_pow2(n: int) -> int:
     return 1 << (n - 1).bit_length() if n > 0 else 1
+
+
+_MORTON_OFFSET = 1 << 20
+
+
+def _emit_part1by2(ctx: EmitCtx, x_var: str, dtype: str = "ct.int64") -> str:
+    """Emit inline _part1by2 bit-spread: space x so 2 zero bits separate each.
+
+    Produces a single output variable holding the spread result in i64.
+    """
+    ctx.emit(f"# _part1by2 bit-spread")
+    v = ctx.fresh("pb")
+    ctx.emit(f"{v} = ct.astype({x_var}, {dtype}) & {dtype}(0x1FFFFF)")
+    for shift, mask in [
+        (32, 0x1F00000000FFFF),
+        (16, 0x1F0000FF0000FF),
+        (8, 0x100F00F00F00F00F),
+        (4, 0x10C30C30C30C30C3),
+        (2, 0x1249249249249249),
+    ]:
+        prev = v
+        v = ctx.fresh("pb")
+        ctx.emit(f"{v} = ({prev} | ({prev} << {dtype}({shift}))) & {dtype}({hex(mask)})")
+    return v
+
+
+def _emit_compact1by2(ctx: EmitCtx, x_var: str, dtype: str = "ct.int64") -> str:
+    """Emit inline _compact1by2 bit-extract: inverse of _part1by2.
+
+    Extracts every third bit from x_var. Produces i64 result.
+    """
+    ctx.emit(f"# _compact1by2 bit-extract")
+    v = ctx.fresh("cb")
+    ctx.emit(f"{v} = ct.astype({x_var}, {dtype}) & {dtype}({hex(0x1249249249249249)})")
+    for shift, mask in [
+        (2, 0x10C30C30C30C30C3),
+        (4, 0x100F00F00F00F00F),
+        (8, 0x1F0000FF0000FF),
+        (16, 0x1F00000000FFFF),
+        (32, 0x1FFFFF),
+    ]:
+        prev = v
+        v = ctx.fresh("cb")
+        ctx.emit(f"{v} = ({prev} | ({prev} >> {dtype}({shift}))) & {dtype}({hex(mask)})")
+    return v
 
 
 # ---------------------------------------------------------------------------
@@ -491,6 +545,313 @@ def _emit_decomposed(node: Node, ctx: EmitCtx, input_types: dict[str, Type]) -> 
         result = _emit_decomposed(node.body, ctx, input_types)
         ctx.locals = old_locals
         return result
+
+    # -----------------------------------------------------------------
+    # MulNode: axis-decomposed multiplication
+    # -----------------------------------------------------------------
+    if isinstance(node, MulNode):
+        a = _emit_decomposed(node.a, ctx, input_types)
+        b = _emit_decomposed(node.b, ctx, input_types)
+        if isinstance(a, list) and isinstance(b, list):
+            assert len(a) == len(b), f"Axis count mismatch: {len(a)} vs {len(b)}"
+            result = []
+            for ai, bi in zip(a, b):
+                v = ctx.fresh("mul")
+                ctx.emit(f"{v} = {ai} * {bi}")
+                result.append(v)
+            return result
+        if isinstance(a, list):
+            result = []
+            for ai in a:
+                v = ctx.fresh("mul")
+                ctx.emit(f"{v} = {ai} * {b}")
+                result.append(v)
+            return result
+        if isinstance(b, list):
+            result = []
+            for bi in b:
+                v = ctx.fresh("mul")
+                ctx.emit(f"{v} = {a} * {bi}")
+                result.append(v)
+            return result
+        v = ctx.fresh("mul")
+        ctx.emit(f"{v} = {a} * {b}")
+        return v
+
+    # -----------------------------------------------------------------
+    # DivNode: axis-decomposed division (result is f32)
+    # -----------------------------------------------------------------
+    if isinstance(node, DivNode):
+        a = _emit_decomposed(node.a, ctx, input_types)
+        b = _emit_decomposed(node.b, ctx, input_types)
+        if isinstance(a, list) and isinstance(b, list):
+            assert len(a) == len(b), f"Axis count mismatch: {len(a)} vs {len(b)}"
+            result = []
+            for ai, bi in zip(a, b):
+                v = ctx.fresh("div")
+                ctx.emit(f"{v} = ct.astype({ai}, ct.float32) / ct.astype({bi}, ct.float32)")
+                result.append(v)
+            return result
+        if isinstance(a, list):
+            result = []
+            for ai in a:
+                v = ctx.fresh("div")
+                ctx.emit(f"{v} = ct.astype({ai}, ct.float32) / ct.astype({b}, ct.float32)")
+                result.append(v)
+            return result
+        if isinstance(b, list):
+            result = []
+            for bi in b:
+                v = ctx.fresh("div")
+                ctx.emit(f"{v} = ct.astype({a}, ct.float32) / ct.astype({bi}, ct.float32)")
+                result.append(v)
+            return result
+        v = ctx.fresh("div")
+        ctx.emit(f"{v} = ct.astype({a}, ct.float32) / ct.astype({b}, ct.float32)")
+        return v
+
+    # -----------------------------------------------------------------
+    # NotNode: bitwise NOT
+    # -----------------------------------------------------------------
+    if isinstance(node, NotNode):
+        a = _emit_decomposed(node.a, ctx, input_types)
+        if isinstance(a, list):
+            result = []
+            for ai in a:
+                v = ctx.fresh("not")
+                ctx.emit(f"{v} = ~{ai}")
+                result.append(v)
+            return result
+        v = ctx.fresh("not")
+        ctx.emit(f"{v} = ~{a}")
+        return v
+
+    # -----------------------------------------------------------------
+    # InBoundsNode: per-axis bounds check  (lo <= x_i < hi), AND'd
+    # -----------------------------------------------------------------
+    if isinstance(node, InBoundsNode):
+        coord = _emit_decomposed(node.coord, ctx, input_types)
+        lo = _emit_decomposed(node.lo, ctx, input_types)
+        hi = _emit_decomposed(node.hi, ctx, input_types)
+        lo_str = lo if isinstance(lo, str) else lo[0]
+        hi_str = hi if isinstance(hi, str) else hi[0]
+        ctx.emit("# InBounds: per-axis range check")
+        if isinstance(coord, list):
+            checks = []
+            for ax_var in coord:
+                c = ctx.fresh("ib")
+                ctx.emit(f"{c} = ct.astype(({ax_var} >= {lo_str}) & ({ax_var} < {hi_str}), ct.int32)")
+                checks.append(c)
+            result_var = checks[0]
+            for c in checks[1:]:
+                r = ctx.fresh("ib")
+                ctx.emit(f"{r} = {result_var} & {c}")
+                result_var = r
+            return result_var
+        v = ctx.fresh("ib")
+        ctx.emit(f"{v} = ct.astype(({coord} >= {lo_str}) & ({coord} < {hi_str}), ct.int32)")
+        return v
+
+    # -----------------------------------------------------------------
+    # CountNode: static count from the type's leading extent
+    # -----------------------------------------------------------------
+    if isinstance(node, CountNode):
+        input_node = node.input
+        if isinstance(input_node, InputNode) and input_node.name in input_types:
+            ty = input_types[input_node.name]
+            if ty.rank > 0 and isinstance(ty.iteration_shape.extents[0], Static):
+                return repr(ty.iteration_shape.extents[0].n)
+        if isinstance(input_node, RefNode):
+            name = input_node.name
+            if name in input_types:
+                ty = input_types[name]
+                if ty.rank > 0 and isinstance(ty.iteration_shape.extents[0], Static):
+                    return repr(ty.iteration_shape.extents[0].n)
+        raise TypeError("CountNode requires input with Static leading extent at emit time")
+
+    # -----------------------------------------------------------------
+    # Morton3dNode: unsigned 3D morton encoding via _part1by2
+    # -----------------------------------------------------------------
+    if isinstance(node, Morton3dNode):
+        coord = _emit_decomposed(node.input, ctx, input_types)
+        if not isinstance(coord, list) or len(coord) != 3:
+            raise TypeError(f"Morton3d requires 3D decomposed coord, got {type(coord)}")
+        ctx.emit("# Morton3d: bit-interleave 3D coord")
+        px = _emit_part1by2(ctx, coord[0])
+        py = _emit_part1by2(ctx, coord[1])
+        pz = _emit_part1by2(ctx, coord[2])
+        v = ctx.fresh("morton")
+        ctx.emit(f"{v} = ct.astype({px} | ({py} << ct.int64(1)) | ({pz} << ct.int64(2)), ct.int32)")
+        return v
+
+    # -----------------------------------------------------------------
+    # Morton3dSignedNode: signed 3D morton encoding (offset + _part1by2)
+    # -----------------------------------------------------------------
+    if isinstance(node, Morton3dSignedNode):
+        coord = _emit_decomposed(node.input, ctx, input_types)
+        if not isinstance(coord, list) or len(coord) != 3:
+            raise TypeError(f"Morton3dSigned requires 3D decomposed coord, got {type(coord)}")
+        ctx.emit(f"# Morton3dSigned: offset by {_MORTON_OFFSET} then bit-interleave")
+        offset_axes = []
+        for ax_var in coord:
+            v = ctx.fresh("moff")
+            ctx.emit(f"{v} = ct.astype({ax_var}, ct.int64) + ct.int64({_MORTON_OFFSET})")
+            offset_axes.append(v)
+        px = _emit_part1by2(ctx, offset_axes[0])
+        py = _emit_part1by2(ctx, offset_axes[1])
+        pz = _emit_part1by2(ctx, offset_axes[2])
+        v = ctx.fresh("morton_s")
+        ctx.emit(f"{v} = {px} | ({py} << ct.int64(1)) | ({pz} << ct.int64(2))")
+        return v
+
+    # -----------------------------------------------------------------
+    # MortonDecode3dNode: decode morton codes to signed 3D coords
+    # -----------------------------------------------------------------
+    if isinstance(node, MortonDecode3dNode):
+        code_val = _emit_decomposed(node.input, ctx, input_types)
+        code_str = code_val if isinstance(code_val, str) else code_val[0]
+        ctx.emit("# MortonDecode3d: extract per-axis bits and restore sign")
+        code_i64 = ctx.fresh("mc")
+        ctx.emit(f"{code_i64} = ct.astype({code_str}, ct.int64)")
+        shifted_y = ctx.fresh("mc")
+        ctx.emit(f"{shifted_y} = {code_i64} >> ct.int64(1)")
+        shifted_z = ctx.fresh("mc")
+        ctx.emit(f"{shifted_z} = {code_i64} >> ct.int64(2)")
+        rx = _emit_compact1by2(ctx, code_i64)
+        ry = _emit_compact1by2(ctx, shifted_y)
+        rz = _emit_compact1by2(ctx, shifted_z)
+        axes = []
+        for raw in [rx, ry, rz]:
+            v = ctx.fresh("md")
+            ctx.emit(f"{v} = ct.astype({raw} - ct.int64({_MORTON_OFFSET}), ct.int32)")
+            axes.append(v)
+        return axes
+
+    # -----------------------------------------------------------------
+    # HierarchicalKeyNode: CIG-compatible hierarchical sort key
+    # -----------------------------------------------------------------
+    if isinstance(node, HierarchicalKeyNode):
+        coord = _emit_decomposed(node.input, ctx, input_types)
+        if not isinstance(coord, list) or len(coord) != 3:
+            raise TypeError(f"HierarchicalKey requires 3D decomposed coord, got {type(coord)}")
+        bit_widths = node.bit_widths
+        ctx.emit(f"# HierarchicalKey: bit_widths={bit_widths}")
+        cx = ctx.fresh("hc")
+        cy = ctx.fresh("hc")
+        cz = ctx.fresh("hc")
+        ctx.emit(f"{cx} = ct.astype({coord[0]}, ct.int64)")
+        ctx.emit(f"{cy} = ct.astype({coord[1]}, ct.int64)")
+        ctx.emit(f"{cz} = ct.astype({coord[2]}, ct.int64)")
+        key_var = ctx.fresh("hk")
+        ctx.emit(f"{key_var} = ct.int64(0)")
+        coord_shift = 0
+        key_shift = 0
+        for bw in bit_widths:
+            dim = 1 << bw
+            mask = dim - 1
+            lx = ctx.fresh("lx")
+            ly = ctx.fresh("ly")
+            lz = ctx.fresh("lz")
+            if coord_shift == 0:
+                ctx.emit(f"{lx} = {cx} & ct.int64({mask})")
+                ctx.emit(f"{ly} = {cy} & ct.int64({mask})")
+                ctx.emit(f"{lz} = {cz} & ct.int64({mask})")
+            else:
+                ctx.emit(f"{lx} = ({cx} >> ct.int64({coord_shift})) & ct.int64({mask})")
+                ctx.emit(f"{ly} = ({cy} >> ct.int64({coord_shift})) & ct.int64({mask})")
+                ctx.emit(f"{lz} = ({cz} >> ct.int64({coord_shift})) & ct.int64({mask})")
+            lin = ctx.fresh("lin")
+            ctx.emit(f"{lin} = {lx} * ct.int64({dim * dim}) + {ly} * ct.int64({dim}) + {lz}")
+            new_key = ctx.fresh("hk")
+            if key_shift == 0:
+                ctx.emit(f"{new_key} = {key_var} | {lin}")
+            else:
+                ctx.emit(f"{new_key} = {key_var} | ({lin} << ct.int64({key_shift}))")
+            key_var = new_key
+            coord_shift += bw
+            key_shift += 3 * bw
+        rx = ctx.fresh("rx")
+        ry = ctx.fresh("ry")
+        rz = ctx.fresh("rz")
+        ctx.emit(f"{rx} = {cx} >> ct.int64({coord_shift})")
+        ctx.emit(f"{ry} = {cy} >> ct.int64({coord_shift})")
+        ctx.emit(f"{rz} = {cz} >> ct.int64({coord_shift})")
+        root_lin = ctx.fresh("rlin")
+        ctx.emit(f"{root_lin} = {rx} * ct.int64({1 << 20}) + {ry} * ct.int64({1 << 10}) + {rz}")
+        final_key = ctx.fresh("hk")
+        if key_shift == 0:
+            ctx.emit(f"{final_key} = {key_var} | {root_lin}")
+        else:
+            ctx.emit(f"{final_key} = {key_var} | ({root_lin} << ct.int64({key_shift}))")
+        return final_key
+
+    # -----------------------------------------------------------------
+    # HierarchicalKeyDecodeNode: decode hierarchical key to 3D coords
+    # -----------------------------------------------------------------
+    if isinstance(node, HierarchicalKeyDecodeNode):
+        key_val = _emit_decomposed(node.input, ctx, input_types)
+        key_str = key_val if isinstance(key_val, str) else key_val[0]
+        bit_widths = node.bit_widths
+        ctx.emit(f"# HierarchicalKeyDecode: bit_widths={bit_widths}")
+        k = ctx.fresh("dk")
+        ctx.emit(f"{k} = ct.astype({key_str}, ct.int64)")
+        ax = ctx.fresh("dx")
+        ay = ctx.fresh("dy")
+        az = ctx.fresh("dz")
+        ctx.emit(f"{ax} = ct.int64(0)")
+        ctx.emit(f"{ay} = ct.int64(0)")
+        ctx.emit(f"{az} = ct.int64(0)")
+        key_shift = 0
+        coord_shift = 0
+        for bw in bit_widths:
+            dim = 1 << bw
+            n_bits = 3 * bw
+            level_mask = (1 << n_bits) - 1
+            lin = ctx.fresh("dlin")
+            if key_shift == 0:
+                ctx.emit(f"{lin} = {k} & ct.int64({level_mask})")
+            else:
+                ctx.emit(f"{lin} = ({k} >> ct.int64({key_shift})) & ct.int64({level_mask})")
+            lz = ctx.fresh("dlz")
+            ly = ctx.fresh("dly")
+            lx = ctx.fresh("dlx")
+            ctx.emit(f"{lz} = {lin} % ct.int64({dim})")
+            ctx.emit(f"{ly} = ({lin} / ct.int64({dim})) % ct.int64({dim})")
+            ctx.emit(f"{lx} = {lin} / ct.int64({dim * dim})")
+            new_ax = ctx.fresh("dx")
+            new_ay = ctx.fresh("dy")
+            new_az = ctx.fresh("dz")
+            if coord_shift == 0:
+                ctx.emit(f"{new_ax} = {ax} | {lx}")
+                ctx.emit(f"{new_ay} = {ay} | {ly}")
+                ctx.emit(f"{new_az} = {az} | {lz}")
+            else:
+                ctx.emit(f"{new_ax} = {ax} | ({lx} << ct.int64({coord_shift}))")
+                ctx.emit(f"{new_ay} = {ay} | ({ly} << ct.int64({coord_shift}))")
+                ctx.emit(f"{new_az} = {az} | ({lz} << ct.int64({coord_shift}))")
+            ax, ay, az = new_ax, new_ay, new_az
+            key_shift += n_bits
+            coord_shift += bw
+        root_lin = ctx.fresh("drlin")
+        ctx.emit(f"{root_lin} = {k} >> ct.int64({key_shift})")
+        drz = ctx.fresh("drz")
+        dry = ctx.fresh("dry")
+        drx = ctx.fresh("drx")
+        ctx.emit(f"{drz} = {root_lin} & ct.int64({(1 << 10) - 1})")
+        ctx.emit(f"{dry} = ({root_lin} >> ct.int64(10)) & ct.int64({(1 << 10) - 1})")
+        ctx.emit(f"{drx} = {root_lin} >> ct.int64(20)")
+        final_x = ctx.fresh("fx")
+        final_y = ctx.fresh("fy")
+        final_z = ctx.fresh("fz")
+        if coord_shift == 0:
+            ctx.emit(f"{final_x} = ct.astype({ax} | {drx}, ct.int32)")
+            ctx.emit(f"{final_y} = ct.astype({ay} | {dry}, ct.int32)")
+            ctx.emit(f"{final_z} = ct.astype({az} | {drz}, ct.int32)")
+        else:
+            ctx.emit(f"{final_x} = ct.astype({ax} | ({drx} << ct.int64({coord_shift})), ct.int32)")
+            ctx.emit(f"{final_y} = ct.astype({ay} | ({dry} << ct.int64({coord_shift})), ct.int32)")
+            ctx.emit(f"{final_z} = ct.astype({az} | ({drz} << ct.int64({coord_shift})), ct.int32)")
+        return [final_x, final_y, final_z]
 
     raise TypeError(f"Unsupported node for decomposed emission: {type(node).__name__}")
 
