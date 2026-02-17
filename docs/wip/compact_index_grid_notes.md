@@ -1074,11 +1074,13 @@ File inventory:
 | `cig_cutile.py` | v7: cuTile kernel for CIG ijk_to_index |
 | `test_cig.py` | v7: CIG builder and ijk_to_index correctness tests |
 | `bench_cig_vs_fvdb.py` | v7/v8: head-to-head CIG vs fVDB comparison |
-| `cig_masked_cutile.py` | v8: cuTile kernels with bitmask + popcount (i32 reference + u64 primary) |
-| `test_masked.py` | v8: masked layout DSL tests |
-| `test_cutile_masked_e2e.py` | v9: end-to-end DSL -> cuTile codegen for masked CIG ijk_to_index |
+| `cig_masked_cutile.py` | v8: hand-written cuTile kernels with bitmask + popcount (i32 ref + u64) |
+| `test_masked.py` | v8: masked layout DSL tests (updated for abs-prefix in v11) |
+| `test_cutile_masked_e2e.py` | v9/v11: end-to-end DSL -> cuTile codegen for masked CIG ijk_to_index |
 | `test_cig3.py` | v10: 3-level CIG builder, root lookup, numpy reference tests |
-| `test_cutile_cig3_e2e.py` | v10: end-to-end 3-level CIG DSL -> cuTile codegen + GPU verify |
+| `test_cutile_cig3_e2e.py` | v10/v11: end-to-end 3-level CIG DSL -> cuTile codegen (fused Find) |
+| `bench_cig3_vs_fvdb.py` | v11: 3-level CIG vs fVDB head-to-head benchmark |
+| `verify_memory.py` | v11: detailed byte-level memory comparison CIG3 vs fVDB |
 | `run_all_tests.py` | Single entry point for non-GPU tests |
 
 ### Current state
@@ -1146,22 +1148,22 @@ Key semantic rules:
 23. u64 popcount variant: `ct.uint64` tiles work correctly. 8 gathers +
     8 popcounts vs 16 + 16. Eliminates i32 mask conversion step. ~10%
     faster at 50K voxels, negligible difference at other scales.
-24. Masked Gather codegen: the 4-line masked CIG DSL expression compiles
-    to a ~105-line cuTile `@ct.kernel` via the extended emitter. The
-    generated kernel is structurally identical to the hand-written u64
-    kernel (same gathers, same popcount chain, same conditional result).
-    Third idiom recognised by the emitter (after chained Gather fusion
-    and Decompose + field). See `test_cutile_masked_e2e.py`.
+24. Masked Gather codegen: the masked CIG DSL expression compiles to a
+    cuTile `@ct.kernel` via the emitter.  The abs-prefix version produces
+    a 56-line kernel (2-level) or 101-line kernel (3-level).  Third idiom
+    recognised by the emitter (after chained Gather fusion and Decompose
+    + field). See `test_cutile_masked_e2e.py`.
 25. Tile-parallel emission: `emit_runnable_kernel` generalised to handle
     flat query parallelism (`query_idx = bid * TILE + arange`) alongside
     the existing batch+Map pattern. The masked CIG uses tile-parallel.
-26. Prefix-sum masked layout: `masked` extended to 3 args (mask, prefix,
-    offset). Query cost O(1) per level via 2 gathers + 1 popcount,
-    regardless of mask width. Replaces the O(W) unrolled chain.
+26. Absolute prefix-sum masked layout: `masked(mask, abs_prefix)` with
+    base offset folded into the prefix at build time.  Query cost O(1)
+    per level via 2 gathers + 1 popcount, regardless of mask width.
+    Replaces the O(W) unrolled chain and the separate offset gather.
 27. 3-level CIG: upper (32^3) + lower (16^3) + leaf (8^3) with
-    bit-widths [3, 4, 5]. Root linear scan via torch, 3-level masked
-    chain fused in a single 104-line cuTile kernel. Verified against
-    numpy reference for single-upper and multi-upper grids.
+    bit-widths [3, 4, 5]. Fully fused 101-line cuTile kernel with Find
+    root lookup + 3 masked levels. Verified against numpy reference for
+    single-upper and multi-upper grids.
 28. Configurable level stacking: the `[3, 4, 5]` bit-widths are
     parameters, not hard-coded. Any stacking (e.g. `[3, 3, 3, 3]`)
     works with the same masked Gather pattern.
@@ -1213,30 +1215,69 @@ Key semantic rules:
 
 ### Recommended next steps
 
-**1. Head-to-head benchmark: 3-level CIG vs fVDB.** The 3-level CIG is
-structurally complete; it needs benchmarking at scale against fVDB's
-`ijk_to_index` with the same coordinates. The benchmark harness from v7/v8
-already exists. Key questions: does the prefix-sum approach maintain the
-1.3x query speed advantage? What is the memory ratio at 3 levels?
+**1. Close the query performance gap (6-20% vs NanoVDB).**  The 3-level
+CIG is within 6-20% of NanoVDB.  Sources of the remaining gap:
 
-**2. Multi-step compilation (barrier-based pipeline).** Implement the
-architecture described in the Multi-Step Compilation section above. Start
-with the simplest case: `Where` on GPU as a two-pass pipeline (count
-cuTile kernel -> `torch.cumsum` -> scatter cuTile kernel). This unlocks
-variable-length output and is the prerequisite for conv_grid and grid
-construction.
+- Software Hamming weight (4 bit-manipulation steps per popcount) vs
+  NanoVDB's `__popcll()` (single PTX instruction).  Investigate whether
+  cuTile's compiler lowers the Hamming weight pattern to `__popcll()` via
+  the TileIR dump (`CUDA_TILE_LOGS=CUTILEIR`).  If not, add a `Popc`
+  DSL primitive that maps to a hardware intrinsic.
+- The `Find` scan for R=1 emits a comparison + conditional select that
+  could be strength-reduced to a constant `upper_idx = 0` when R is
+  known to be 1 at emit time.
+- Three data-dependent masked-Gather blocks in sequence.  Each block is
+  already O(1) (2 gathers + 1 popcount), but the chain is serial.
+  Investigate whether cuTile/TileIR interleaves the arithmetic across
+  blocks (memory latency hiding).
 
-**3. `conv_grid` as the next fVDB operator comparison.** Takes an input
-grid + kernel size, produces the output grid topology (active voxels of
-the convolution). Requires: iterate active voxels, expand by kernel
-offsets, deduplicate -> a multi-step pipeline. Same benchmark harness as
-ijk_to_index (same grid, compare fVDB `conv_grid` vs CIG pipeline).
+**2. Next fVDB operations.**  Broaden from `ijk_to_index` to other
+`GridBatch` operations to test composability:
 
-**4. Per-node bounds (half-open intervals).** Store `[min, max)` per leaf
-(and per upper node once the third level exists). Derivable from node
-position and bit-widths, but explicit storage enables ray-box intersection
-without recomputing decomposition. Half-open intervals: `min == max` means
-empty, adjacent nodes share exact boundaries, size = `max - min`. ~24
+- `neighbor_indexes(ijk, extent)`: given query coords + extent, return
+  neighbor voxel indices.  The cross-leaf neighbor pattern from v5/v6 is
+  already demonstrated in the DSL; this is a formalisation for the
+  3-level CIG.
+- `conv_grid(kernel_size, stride)`: topology expansion.  Requires
+  multi-step compilation: expand active voxels by kernel offsets -> sort
+  -> unique -> build output CIG.  This is the first use of the
+  barrier-based pipeline architecture (see Multi-Step Compilation above).
+- `dilated_grid(dilation)`: structurally similar to conv_grid but simpler
+  (fixed extent).
+- `sample_trilinear(points, voxel_data)`: interpolation at continuous
+  coordinates.  Requires world-to-voxel transform, 8-corner Gather for
+  trilinear weights, weighted sum.  The Gather + arithmetic pattern
+  exists; the new elements are the coordinate transform and the
+  reduction over corners.
+- `inject_from` / `inject_to`: map data between grids with different
+  topologies.  Uses `ijk_to_index` on both grids -- largely a
+  composition of existing primitives.
+
+**3. Batch dimension.**  fVDB's `GridBatch` wraps multiple grids.
+`ijk_to_index` takes `JaggedTensor` (per-grid jagged coordinates) and
+returns per-grid jagged indices.  The CIG currently has no batch
+dimension.  Options:
+
+- **Simplest first**: one kernel launch per grid.  The caller iterates
+  over grids and calls the CIG3 query for each.  No framework changes.
+- **Jagged outer dimension**: `cut` the query array by batch offsets,
+  then `Each` over grids.  The DSL already has `Each` and `cut`.  The
+  emitter would handle the outer `Each` as a grid-level loop or multiple
+  kernel launches.
+- **Packed batch**: store all grids' CIG3 arrays contiguously with
+  per-grid offsets (like NanoVDB's buffer).  The root `Find` table
+  includes a batch index column.  More complex but avoids per-grid
+  launch overhead.
+
+**4. Multi-step compilation (barrier-based pipeline).**  Implement the
+architecture described in the Multi-Step Compilation section.  Start with
+`Where` on GPU as a two-pass pipeline (count cuTile kernel ->
+`torch.cumsum` -> scatter cuTile kernel).  This unlocks variable-length
+output and is the prerequisite for conv_grid and grid construction.
+
+**5. Per-node bounds (half-open intervals).**  Store `[min, max)` per
+node.  Derivable from node position and bit-widths, but explicit storage
+enables ray-box intersection without recomputing decomposition.  ~24
 bytes per node.
 
 ### cuTile backend notes
@@ -1262,33 +1303,45 @@ driver 591.59, cuda-tile 1.1.0,
 
 ### Medium-term items
 
-- **Idiom detection**: recognize patterns like `Over(Add, Map(xs, Gather(...)))`
-  as scatter-gather and propose optimized implementations. The chained Gather
-  fusion (v6) and masked Gather (v8) are the first two examples.
-- **Materialisation scheduling**: given a DSL expression, automatically decide
-  where to insert Gather (early vs late) based on data characteristics
-  (sparsity ratio, memory budget). This is the Halide schedule analogy.
-- **Let-bindings in Map bodies**: currently the parser only supports single
-  expressions as Map/Each bodies. Adding let-bindings would avoid the deeply
-  nested expressions needed for complex Map bodies (like the cross-leaf
-  predicate). Straightforward parser extension.
-- **`flip` in DSL**: currently Python-only. Add as a lowercase DSL keyword.
-- **Common subexpression elimination (CSE)**: the cross-leaf kernel emits
-  redundant Decompose bit-shifts (same expression appears in both the
-  level_0 and level_1 field extractions). A CSE pass over the emitted code
-  or AST would eliminate this. Low priority -- the cost is trivial.
-- **u64 popcount as default**: the u64 masked kernel is cleaner and slightly
-  faster than the i32 variant. Make it the default and deprecate the i32
-  path once confidence is established.
-- **GPU-accelerated CIG builder**: the current `build_compressed_cig` is
-  pure PyTorch (sort + scatter on CPU). A GPU-native builder using CUB
-  radix sort + scatter would close the construction-time gap with fVDB.
+- **Idiom detection**: the emitter now recognises three idioms: chained
+  Gather fusion (v6), masked Gather with abs-prefix (v8-v11), and Find
+  linear scan (v11).  Next target: the full CIG chain (Find + N masked
+  levels) as a macro-idiom for whole-program optimisation.
+- **Hardware popcount**: investigate whether cuTile's Hamming weight
+  bit-manipulation pattern lowers to `__popcll()` (single PTX instruction)
+  in the TileIR compilation pipeline.  Use `CUDA_TILE_LOGS=CUTILEIR` to
+  inspect the intermediate representation.  If not, add a `Popc` DSL
+  primitive that maps directly to the hardware intrinsic.
+- **TileIR emission backend**: the `cuda_tile` MLIR dialect is designed as
+  a code generation target for DSLs and compilers.  Retargeting the emitter
+  from Python cuTile to the MLIR dialect would enable AOT compilation via
+  `tileiras`, custom MLIR optimisation passes, and `.cutile` bytecode
+  serialisation.  The emitter logic (idiom detection, masked Gather, Find)
+  would not change -- only the string templates.  Investigated in this
+  session via `CUDA_TILE_LOGS=CUTILEIR`.
+- **Batch dimension**: fVDB's `GridBatch` wraps multiple grids.  The CIG
+  currently has no batch dimension.  Options: one kernel launch per grid
+  (simplest), jagged outer `Each` (DSL-native), or packed contiguous
+  storage (like NanoVDB's buffer).  See Recommended next steps item 3.
+- **Materialisation scheduling**: given a DSL expression, automatically
+  decide where to insert Gather (early vs late) based on data
+  characteristics (sparsity ratio, memory budget).  The Halide schedule
+  analogy.
+- **Let-bindings in Map bodies**: the parser only supports single
+  expressions as Map/Each bodies.  Adding let-bindings would avoid deeply
+  nested expressions for complex Map bodies.  Straightforward parser
+  extension.
+- **`flip` in DSL**: currently Python-only.  Add as a lowercase DSL
+  keyword.
+- **GPU-accelerated CIG builder**: `build_compressed_cig3` is pure
+  PyTorch (sort + scatter on CPU).  A GPU-native builder using CUB radix
+  sort + scatter would close the construction-time gap with fVDB.
 - **No world-to-grid transforms in CIG**: the design decision is that
   `origin`, `voxel_size`, and transform matrices are instancing metadata,
-  not structural properties of the grid. They should live outside the CIG,
-  allowing the same grid to be instanced with different transforms (as in
-  modern geometry frameworks like USD). This is a deliberate departure from
-  NanoVDB, which embeds the transform in the grid buffer.
+  not structural properties of the grid.  They should live outside the
+  CIG, allowing the same grid to be instanced with different transforms
+  (as in modern geometry frameworks like USD).  This is a deliberate
+  departure from NanoVDB, which embeds the transform in the grid buffer.
 
 ### North star
 
@@ -1300,22 +1353,23 @@ domain algorithms as tiny compositions of functions over structured tensors,
 compiled to GPU code without framework-specific imperative implementations.
 
 The compressed CIG `ijk_to_index` -- bitmask-compressed sparse grid lookup
-with hierarchical traversal and popcount -- has a similar ultra-minimal
-form:
+with hierarchical traversal, popcount, and root search -- has a similar
+ultra-minimal form.  The full 3-level version with fused root lookup:
 
 ```
-(L;m[M,O])/@q\[3;4]
+(F[R];m[M,P];m[M,P];m[M,P])/@q\[3;4;5]
 ```
 
-Decompose query `q` at bit-widths [3, 4] (`q\[3;4]`), then fold-index
-(`/@`) through two levels: `L` (the lower array, plain gather) and
-`m[M,O]` (the masked leaf, bitmask + popcount gather from masks `M` with
-offsets `O`). A third level is one more entry: `(L;U;m[M,O])/@q\[3;4;5]`.
+Decompose query `q` at bit-widths [3, 4, 5], then fold-index (`/@`)
+through four stages: `F[R]` (Find in root table `R`), then three masked
+levels `m[M,P]` (bitmask `M` + absolute prefix `P`, popcount access).
+Changing the tree configuration is changing the fold: `[3,3,3,3]` for
+four 8^3 layers, `[4,4,4]` for three 16^3, or any other stacking.
 
 Most programmers would find this impenetrable, and readability matters --
-the 4-line DSL form is the one intended for human use. But the point is
+the 10-line DSL form is the one intended for human use. But the point is
 not the syntax. The point is that a sparse grid query which previously
 required a large C++/CUDA library and thousands of lines of code can be
 expressed as a single composed expression over structured tensors, and
-that expression compiles to a GPU kernel that matches or beats the
-hand-written implementation.
+that expression compiles to a GPU kernel that is within 6-20% of the
+hand-written implementation's speed at 25-30x less memory.
