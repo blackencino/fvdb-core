@@ -18,11 +18,11 @@ import torch
 
 import cuda.tile as ct
 
-from docs.wip.prototype.cig import build_compressed_cig
-from docs.wip.prototype.dsl_eval import run as dsl_run
-from docs.wip.prototype.dsl_to_cutile import emit_runnable_kernel
-from docs.wip.prototype.ops import Value
-from docs.wip.prototype.types import Dynamic, ScalarType, Shape, Static, Type
+from fvdb_tile.prototype.cig import build_compressed_cig
+from fvdb_tile.prototype.dsl_eval import run as dsl_run
+from fvdb_tile.prototype.dsl_to_cutile import emit_runnable_kernel
+from fvdb_tile.prototype.ops import Value
+from fvdb_tile.prototype.types import Dynamic, ScalarType, Shape, Static, Type
 
 # Directory for generated kernel files
 _GEN_DIR = os.path.join(os.path.dirname(__file__), "_generated")
@@ -143,7 +143,7 @@ def test_emit_masked_cig():
 
 def test_generated_vs_pytorch_ref():
     """Compile the generated kernel and compare to PyTorch vectorized reference."""
-    from docs.wip.prototype.cig import compressed_cig_ijk_to_index
+    from fvdb_tile.prototype.cig import compressed_cig_ijk_to_index
 
     code, ts, _ = emit_runnable_kernel(
         MASKED_CIG_PROGRAM,

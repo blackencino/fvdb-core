@@ -20,7 +20,7 @@ Codex, etc.) working on this codebase. Human contributors should also refer to
 - Format Python code with **black** using the exact flags from CI:
 
   ```
-  black --target-version=py311 --line-length=120 --extend-exclude='wip/' .
+  black --target-version=py311 --line-length=120 --extend-exclude='wip/|fvdb_tile/' .
   ```
 
 - **Do not** run `black` with default settings — the default line-length (88) does
@@ -59,7 +59,7 @@ C++ files:
 
 ## Whitespace
 
-- No trailing whitespace (CI enforces this; `.wlt` files and `wip/` are excluded).
+- No trailing whitespace (CI enforces this; `.wlt` files, `wip/`, and `fvdb_tile/` are excluded).
 - Use spaces, not tabs (binary and a few config files are excluded from this check).
 
 ## Testing
@@ -70,8 +70,9 @@ C++ files:
   python -m pytest tests/ -v
   ```
 
-- The `wip/` directory is excluded from test collection (see `norecursedirs` in
-  `pyproject.toml`).
+- The `wip/` and `fvdb_tile/` directories are excluded from test collection
+  (see `norecursedirs` in `pyproject.toml`). `fvdb_tile/` tests use their
+  own runner: `python fvdb_tile/prototype/run_all_tests.py`.
 
 ## Opening Issues
 

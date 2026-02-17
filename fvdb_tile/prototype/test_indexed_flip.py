@@ -12,8 +12,8 @@ Tests are split into two groups:
 
 import numpy as np
 
-from docs.wip.prototype.dsl_eval import run
-from docs.wip.prototype.layouts import (
+from fvdb_tile.prototype.dsl_eval import run
+from fvdb_tile.prototype.layouts import (
     cut_by_size,
     flip,
     indexed,
@@ -21,8 +21,8 @@ from docs.wip.prototype.layouts import (
     struct_layout,
     StructElement,
 )
-from docs.wip.prototype.ops import FlipStruct, Gather, Map, StructValue, Value, Where
-from docs.wip.prototype.types import (
+from fvdb_tile.prototype.ops import FlipStruct, Gather, Map, StructValue, Value, Where
+from fvdb_tile.prototype.types import (
     Dynamic,
     Jagged,
     ScalarType,

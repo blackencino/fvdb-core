@@ -9,13 +9,13 @@ so we can verify the comparison is fair.
 
 Usage:
     source ~/.venvs/fvdb_cutile/bin/activate
-    python docs/wip/prototype/verify_memory.py
+    python fvdb_tile/prototype/verify_memory.py
 """
 
 import numpy as np
 import torch
 
-from docs.wip.prototype.cig import build_compressed_cig3
+from fvdb_tile.prototype.cig import build_compressed_cig3
 
 try:
     import fvdb

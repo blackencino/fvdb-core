@@ -17,10 +17,10 @@ import torch
 
 import cuda.tile as ct
 
-from docs.wip.prototype.cig import build_compressed_cig3
-from docs.wip.prototype.dsl_to_cutile import emit_runnable_kernel
-from docs.wip.prototype.test_cig3 import cig3_ijk_to_index_numpy
-from docs.wip.prototype.types import Dynamic, ScalarType, Shape, Static, Type
+from fvdb_tile.prototype.cig import build_compressed_cig3
+from fvdb_tile.prototype.dsl_to_cutile import emit_runnable_kernel
+from fvdb_tile.prototype.test_cig3 import cig3_ijk_to_index_numpy
+from fvdb_tile.prototype.types import Dynamic, ScalarType, Shape, Static, Type
 
 try:
     import fvdb

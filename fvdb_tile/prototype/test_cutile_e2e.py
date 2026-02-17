@@ -19,10 +19,10 @@ import torch
 
 import cuda.tile as ct
 
-from docs.wip.prototype.dsl_to_cutile import emit_runnable_kernel
-from docs.wip.prototype.dsl_eval import run as dsl_run
-from docs.wip.prototype.ops import Value
-from docs.wip.prototype.types import ScalarType, Shape, Static, Type
+from fvdb_tile.prototype.dsl_to_cutile import emit_runnable_kernel
+from fvdb_tile.prototype.dsl_eval import run as dsl_run
+from fvdb_tile.prototype.ops import Value
+from fvdb_tile.prototype.types import ScalarType, Shape, Static, Type
 
 ConstInt = ct.Constant[int]
 

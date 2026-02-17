@@ -426,10 +426,10 @@ optimiser choose based on measured characteristics.
 
 ## Prototype Results
 
-Code in `docs/wip/prototype/`. Environment:
+Code in `fvdb_tile/prototype/`. Environment:
 `source ~/.venvs/fvdb_cutile/bin/activate` (Python 3.12, cuda-tile 1.1.0,
 torch 2.10, numpy 2.2; RTX PRO 6000 Blackwell, compute 12.0).
-Run all: `python docs/wip/prototype/run_all_tests.py`.
+Run all: `python fvdb_tile/prototype/run_all_tests.py`.
 
 ### v0: Fundamentals
 
@@ -1041,9 +1041,9 @@ launches and library calls.
 Read this document top-to-bottom for the thesis, vocabulary, layout wrappers,
 adverb semantics, and worked examples. Then:
 
-- **Prototype code**: `docs/wip/prototype/`
-- **Run all tests**: `python docs/wip/prototype/run_all_tests.py` (20 tests, ~2s)
-- **Design doc**: this file (`docs/wip/compact_index_grid_notes.md`)
+- **Prototype code**: `fvdb_tile/prototype/`
+- **Run all tests**: `python fvdb_tile/prototype/run_all_tests.py` (20 tests, ~2s)
+- **Design doc**: this file (`fvdb_tile/README.md`)
 
 File inventory:
 

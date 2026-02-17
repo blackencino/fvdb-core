@@ -15,10 +15,10 @@ Demonstrates:
 
 import numpy as np
 
-from docs.wip.prototype.dsl_eval import run
-from docs.wip.prototype.layouts import cut_by_size, indexed
-from docs.wip.prototype.ops import Value
-from docs.wip.prototype.types import (
+from fvdb_tile.prototype.dsl_eval import run
+from fvdb_tile.prototype.layouts import cut_by_size, indexed
+from fvdb_tile.prototype.ops import Value
+from fvdb_tile.prototype.types import (
     Dynamic,
     ScalarType,
     Shape,

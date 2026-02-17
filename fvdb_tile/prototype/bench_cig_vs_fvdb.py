@@ -14,10 +14,10 @@ import time
 import numpy as np
 import torch
 
-from docs.wip.prototype.cig import CIG, build_cig, cig_ijk_to_index
-from docs.wip.prototype.cig import CompressedCIG, build_compressed_cig, compressed_cig_ijk_to_index
-from docs.wip.prototype.cig_cutile import run_cig_ijk_to_index
-from docs.wip.prototype.cig_masked_cutile import run_compressed_cig_ijk_to_index
+from fvdb_tile.prototype.cig import CIG, build_cig, cig_ijk_to_index
+from fvdb_tile.prototype.cig import CompressedCIG, build_compressed_cig, compressed_cig_ijk_to_index
+from fvdb_tile.prototype.cig_cutile import run_cig_ijk_to_index
+from fvdb_tile.prototype.cig_masked_cutile import run_compressed_cig_ijk_to_index
 
 try:
     import fvdb

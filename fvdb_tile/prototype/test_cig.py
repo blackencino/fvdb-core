@@ -15,7 +15,7 @@ Tests:
 import numpy as np
 import torch
 
-from docs.wip.prototype.cig import CIG, build_cig, cig_ijk_to_index, cig_ijk_to_index_numpy
+from fvdb_tile.prototype.cig import CIG, build_cig, cig_ijk_to_index, cig_ijk_to_index_numpy
 
 
 def _make_coords(n_voxels=1000, seed=42):

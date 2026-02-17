@@ -15,10 +15,10 @@ import torch
 
 import cuda.tile as ct
 
-from docs.wip.prototype.dsl_to_cutile import emit_program
-from docs.wip.prototype.dsl_eval import run as dsl_run
-from docs.wip.prototype.ops import Value
-from docs.wip.prototype.types import ScalarType, Shape, Static, Type
+from fvdb_tile.prototype.dsl_to_cutile import emit_program
+from fvdb_tile.prototype.dsl_eval import run as dsl_run
+from fvdb_tile.prototype.ops import Value
+from fvdb_tile.prototype.types import ScalarType, Shape, Static, Type
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +126,7 @@ def test_numpy_vs_cutile():
         dsl_results[i] = result.data
 
     # Run through the hand-written cuTile kernel
-    from docs.wip.prototype.test_cutile_gather import run_neighbor_predicate
+    from fvdb_tile.prototype.test_cutile_gather import run_neighbor_predicate
 
     cutile_results = run_neighbor_predicate(leaf_data, active_coords, FACE_OFFSETS)
 

@@ -13,9 +13,9 @@ Verifies:
 
 import numpy as np
 
-from docs.wip.prototype.dsl_eval import run
-from docs.wip.prototype.ops import Value
-from docs.wip.prototype.types import ScalarType, Shape, Static, Type
+from fvdb_tile.prototype.dsl_eval import run
+from fvdb_tile.prototype.ops import Value
+from fvdb_tile.prototype.types import ScalarType, Shape, Static, Type
 
 
 def _pack_mask(active_positions, n_words=8):
