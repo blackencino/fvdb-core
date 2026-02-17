@@ -349,3 +349,129 @@ EachRight/EachLeft, outer product via nested adverbs (both nesting
 orders), type inference for multi-rank leading shapes, let-bound composed
 functions, and backward compatibility with the mesh centroid program.
 All 30 existing tests continue to pass.
+
+---
+
+## GPU Hash Map + Dialect Lowering: Feb 17 2026
+
+Hand-written CUDA kernels for hash map build (atomicCAS), lookup (probe
+loop), and scatter-reduce (atomicOr/Add).  JIT-compiled via NVRTC and
+launched on torch's CUDA stream.  MurmurHash3 64-bit finalizer.
+
+### What was added
+
+- `hashmap_cuda.py`: GPU hash map build/lookup/scatter_reduce kernels
+  via NVRTC JIT.  `conv_grid_dilate_kernel`: fused mask shift + boundary
+  decomposition + hash probe + atomicOr (see conv_grid_leafwise below).
+- `cuda_launch.py`: generic NVRTC compile-and-launch utility (shared by
+  all CUDA kernels).
+- `dialect_hashmap.py`: HashMapBuild and HashMapLookup as DSL dialect
+  nodes.  `dsl_lower.py` lowers dialect nodes to core AST via rewrite
+  passes.
+- Pipeline hooks for GPU collectives: `hashmap_build_hook` and
+  `hashmap_lookup_hook` in `dsl_pipeline.py` dispatch to GPU kernels
+  when `device="cuda"`.
+- `test_hashmap.py`, `test_cutile_hashmap.py`, `bench_hashmap.py`,
+  `bench_gpu_hashmap.py`.
+
+### Design note
+
+The GPU hash map is OUT_OF_DSL infrastructure.  The kernels are
+hand-written CUDA, not DSL-generated.  The dialect mechanism wraps them
+so pipeline programs can reference hash map operations, but the actual
+work bypasses the emitter.  Future: express as DSL programs with idiom
+recognition that emits the fused kernels.
+
+---
+
+## conv_grid_leafwise: Feb 17 2026
+
+Topology expansion via leaf-level bitmask dilation.  Instead of the
+N*K dense expansion of `conv_grid`, shifts entire 8x8x8 leaf masks
+and accumulates via hash-map scatter-reduce with OR.  Work is O(L*K)
+word-level ops where L is the number of input leaves (typically
+50-100x fewer than active voxels N).
+
+### GPU path (3 kernel launches, 0 Python loops)
+
+1. HashMapBuild: build output leaf hash map from expanded leaf coords.
+2. `conv_grid_dilate_kernel`: fused mask shift + boundary decomposition
+   + hash probe + atomicOr over all L*K pairs.  Single launch.
+3. MaskToCoords: popcount + extract voxel coords from accumulated masks.
+
+### OUT_OF_DSL status
+
+The algorithm corresponds to a DSL program (documented in the
+`conv_grid_leafwise.py` docstring), but the GPU path is a hand-fused
+kernel that bypasses the DSL/AST pipeline.  This is the prime candidate
+for AST-level fusion: express in the DSL, then have the compiler
+recognise the pattern and emit the fused kernel.
+
+### What was added
+
+- `conv_grid_leafwise.py`: public API + CPU reference + GPU path.
+- `conv_grid_dilate_kernel` in `hashmap_cuda.py`: the fused CUDA kernel.
+- `test_conv_grid_leafwise.py`, `bench_conv_grid.py`,
+  `bench_conv_grid_leafwise.py`.
+
+---
+
+## Pipeline Cleanup Pass: Feb 17 2026
+
+Systematic audit and consolidation of the prototype, removing CPU
+operations from the GPU hot path and annotating out-of-DSL code for
+future fusion work.
+
+### GPU pipeline CPU round-trip removed (hypothesis-breaking)
+
+The collective hooks in `_make_collective_hooks` (dsl_pipeline.py)
+previously moved every GPU result back to CPU after each collective
+operation.  The `_run_cutile_segment` result was also moved to CPU.
+This was a workaround for the evaluator assuming CPU tensors.
+
+Fixed: removed all `.cpu()` calls from hooks and cutile segment
+results.  Data now stays on the target device throughout pipeline
+execution.  Also removed the double-compute pattern in `sort_hook`
+(was sorting on CPU then re-sorting on GPU) and `unique_hook` (same).
+
+### conv_grid pipeline device pass-through (hypothesis-weakening)
+
+`conv_grid.py` hardcoded `device=None` in `pipeline.run()`, meaning the
+GPU compilation path was never used even when called with `device="cuda"`.
+
+Fixed: the `device` parameter now passes through to `pipeline.run()`.
+
+### CPU loops over tensor data vectorized
+
+- `_build_masked_level` in `cig.py`: Python loop with O(M) implicit
+  `.item()` calls replaced with vectorized `scatter_add_` over bit
+  values (non-overlapping single bits, so add = OR).
+- `_unique_leading_axis` in `dsl_eval.py`: Python loop with O(N) GPU
+  syncs for first-occurrence finding replaced with vectorized
+  `scatter_reduce_("amin")`.
+
+### CPU-only reference hashmap guarded
+
+`hash_map_build`, `hash_map_lookup`, `hash_map_scatter_reduce` in
+`ops.py` now assert `not keys.is_cuda` to prevent accidental GPU use.
+Docstrings updated to point to GPU alternatives.
+
+### Dead code removed
+
+- `cig3_ijk_to_index_numpy` alias (zero callers).
+
+### OUT_OF_DSL annotations added
+
+Consistent `# DSL status:` headers and `# OUT_OF_DSL:` markers added
+to the four application-level files:
+
+- `conv_grid.py`: fully DSL-driven
+- `conv_grid_leafwise.py`: out-of-DSL (GPU path is hand-fused)
+- `cig.py`: out-of-DSL (construction is imperative torch)
+- `hashmap_cuda.py`: out-of-DSL (hand-written CUDA kernels)
+
+### Test fixes
+
+Two tests that compared GPU pipeline output against CPU references now
+move the GPU result to CPU at the test level before comparison,
+reflecting the corrected behaviour (results stay on device).
