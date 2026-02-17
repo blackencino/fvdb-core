@@ -1,10 +1,14 @@
 # Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: Apache-2.0
 """
-DSL-to-cuTile emitter.
+DSL-to-cuTile emitter (preferred backend, preference #1).
 
 Produces a complete, compilable @ct.kernel with grid parallelism, per-axis
 decomposition, and ct.scatter output via emit_runnable_kernel().
+
+Handles: Map, Each, Over (inline fold for commutative verbs), Gather
+(with chained and masked fusion), Decompose, Find, HierarchicalKey/Decode,
+Morton3d, InBounds, arithmetic, bitwise, and boolean ops.
 
 Key insight: multi-component values (like 3D coordinates) must be decomposed
 into per-axis tiles for ct.gather index tuples. The emitter tracks whether

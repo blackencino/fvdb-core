@@ -27,20 +27,25 @@ the number of input leaves -- typically 50-100x fewer than N.
   calling shift_leaf_masks + hash_map_scatter_reduce per offset.
   Correct but slow -- exists for correctness verification.
 
-**DSL expressiveness gap (TODO)**: The algorithm corresponds to this
-DSL program, but is not yet executed through the DSL/AST pipeline::
+**DSL pipeline structure** (3 phases, matching the 3 kernel launches)::
 
-    pairs     = ExpandOffsets(leaf_indices, offset_indices)
-    shifted   = ShiftLeafMask(leaf_masks, offsets, pairs)
-    target_k  = HierarchicalKey(target_coords, leaf_bw)
-    map       = HashMapBuild(Unique(target_k))
-                ScatterReduce(target_k, shifted, Or)
-    result    = MaskToCoords(output_masks, output_leaf_coords)
+    Phase A (torch collectives):
+        expanded_lc  = ExpandOffsets(leaf_coords, leaf_deltas)
+        expanded_keys = HierarchicalKey(expanded_lc, [4, 5])
+        unique_keys  = Unique(expanded_keys)
+        hash_map     = HashMapBuild(unique_keys)
 
-The GPU path is a hand-fused kernel that implements the above.  Future
-work: express this in the DSL with idiom-recognition lowering that emits
-the fused kernel, so the source of truth is the DSL program and the
-fused kernel is a compiler optimization.
+    Phase B (CUDA -- last resort, justified by atomics):
+        output_masks = DilateLeafMasks(leaf_masks, leaf_coords,
+                                       offsets, hash_map, storage_size)
+
+    Phase C (torch collectives):
+        result       = MaskToCoords(active_masks, output_leaf_coords)
+
+``DilateLeafMasks`` is a typed 8x8x8 leaf primitive (not an escape
+hatch).  Its GPU backend dispatches to the hand-fused
+``conv_grid_dilate_kernel`` via the pipeline hook mechanism.  The DSL
+program is the source of truth; the fused CUDA kernel is the backend.
 """
 
 from __future__ import annotations

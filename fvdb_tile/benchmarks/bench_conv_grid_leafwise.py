@@ -214,8 +214,8 @@ def main():
         print("  fvdb_conv  -- fVDB conv_grid only (grid already built)")
         print("  speedup    -- fvdb_conv / leaf_gpu (> 1.0 = leaf wins)")
     print()
-    print("NOTE: leaf_gpu uses a hand-fused CUDA kernel, not yet DSL-expressed.")
-    print("Future: DSL program + idiom-recognition lowering -> fused kernel.")
+    print("NOTE: leaf_gpu is DSL-driven via DilateLeafMasks pipeline primitive.")
+    print("The fused CUDA kernel is the backend (dispatched via pipeline hook).")
 
 
 if __name__ == "__main__":

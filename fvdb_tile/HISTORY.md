@@ -475,3 +475,68 @@ to the four application-level files:
 Two tests that compared GPU pipeline output against CPU references now
 move the GPU result to CPU at the test level before comparison,
 reflecting the corrected behaviour (results stay on device).
+
+---
+
+## OUT_OF_DSL Compliance: Feb 17 2026
+
+Phased work to bring out-of-DSL components under DSL/AST control.
+Backend preference order: cuTile > torch GPU > CUDA/NVRTC.
+
+### Phase 1: Adverb emission in cuTile
+
+- `EachNode` handler in `dsl_to_cutile.py` -- same semantics as
+  MapNode, emittable in cuTile.
+- `OverNode` handler in `dsl_to_cutile.py` -- inline fold of per-axis
+  decomposed values (Add, Mul, Or, Max, Min).
+- Over torch GPU collective hook -- dispatches standalone Over to
+  `torch.sum`, `torch.prod`, `torch.amax`, `torch.amin`, bitwise_or.
+- AST normalization: `_normalize_adverb_node` rewrites parser's
+  `ApplyNode(AdverbApplyNode("Over"), ...)` to canonical `OverNode`
+  before planning.
+- Barrier relaxation: `_check_barriers` allows `OverNode` inside
+  Map/Each bodies (tile-level reduction, not a global collective).
+
+### Phase 2: CUDA C++ emitter (last-resort backend)
+
+- New `dsl_to_cuda.py`: generates CUDA C++ from DSL AST nodes.
+  Grid-stride loops, arithmetic/bitwise ops, array indexing,
+  Map/Each/Over.  Compiled in-memory via NVRTC (no files on disk).
+- Preference #3 -- used ONLY when cuTile and torch cannot handle the
+  operation (atomics, inline hash probing, boundary decomposition).
+
+### Phase 3: Pipeline segment routing
+
+- `PipelineSegment.kind` extended to `{"cutile", "collective", "cuda"}`.
+- `_run_cuda_segment`: compiles CUDA segments via `dsl_to_cuda.py` +
+  `cuda_launch.py`.  Same infrastructure as hand-written CUDA kernels.
+
+### Phase 4: conv_grid_leafwise as DSL pipeline
+
+- `DilateLeafMasksNode` in `dsl_ast.py`: typed 8x8x8 leaf primitive
+  for fused mask dilation (shift + hash probe + atomicOr).
+- CPU evaluation in `dsl_eval.py`: sequential shift + scatter-OR
+  (reference path, not GPU hot path).
+- GPU dispatch hook in `dsl_pipeline.py`: calls existing
+  `gpu_conv_grid_dilate` CUDA kernel.  Zero CPU inner loops in GPU path.
+- `conv_grid_leafwise.py` rewritten as three-phase DSL pipeline:
+  torch collectives (hash map build) + DilateLeafMasks (CUDA hook) +
+  torch collectives (MaskToCoords + sort).
+- DSL status changed from `out-of-DSL` to `DSL-driven`.
+- All 14 leafwise tests pass (11 CPU + 3 GPU).
+
+### Phase 5: Adverb idiom mapping
+
+- Adverb-to-GPU-pattern mapping documented inline in the pipeline
+  hooks and both emitters: Add/Mul/Max/Min/Or mapped across cuTile,
+  torch, and CUDA backends.
+- `Over(Or)` extended to all three backends (bitwise_or fold in torch,
+  `|` operator in cuTile and CUDA emitters).
+
+### Current OUT_OF_DSL status after this work
+
+- `conv_grid.py`: fully DSL-driven (unchanged)
+- `conv_grid_leafwise.py`: **DSL-driven** (was out-of-DSL)
+- `cig.py`: out-of-DSL (construction is imperative torch -- unchanged)
+- `hashmap_cuda.py`: out-of-DSL (hand-written CUDA -- unchanged, but
+  now invoked through DSL hooks rather than bypassing the pipeline)

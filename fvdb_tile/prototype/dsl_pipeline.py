@@ -5,21 +5,24 @@ Barrier-aware pipeline planner and executor for the prototype DSL.
 
 This module provides:
   - planning: partition top-level bindings into execution segments
+  - AST normalization: rewrite parser adverb patterns to canonical nodes
   - execution: run planned segments through a single immutable pipeline API
 
-Segment kinds:
+Segment kinds (strict preference order: cuTile > torch > CUDA):
 
-  "cutile"     -- tile-parallel pointwise/gather work that can be fused into a
-                  single @ct.kernel launch via dsl_to_cutile.emit_runnable_kernel.
-  "collective" -- operations requiring cross-thread coordination (Sort, Unique,
-                  Where, Over).  These are GPU-accelerated via torch ops (e.g.
-                  torch.sort, torch.unique) and require a synchronization barrier
-                  between kernel launches.
+  "cutile"     -- tile-parallel pointwise/gather work fused into a single
+                  @ct.kernel launch via dsl_to_cutile.  Preferred backend.
+  "collective" -- operations requiring cross-thread coordination (Sort,
+                  Unique, Where, Over, HashMapBuild/Lookup, DilateLeafMasks,
+                  MaskToCoords).  GPU-accelerated via torch ops or CUDA hooks.
+  "cuda"       -- last-resort backend for operations requiring atomics or
+                  control flow that cuTile cannot express.  Compiled via
+                  dsl_to_cuda + NVRTC (in-memory, no files on disk).
 
-Both segment kinds target GPU execution.  When ``device`` is set on
-``PipelineExecutable.run()``, cutile segments compile to cuTile kernels
-and collective segments dispatch to torch ops.  When ``device`` is None,
-the pure torch evaluator handles everything (correctness reference).
+When ``device`` is set on ``PipelineExecutable.run()``, cutile segments
+compile to cuTile kernels, collective segments dispatch to torch/CUDA ops
+via hooks, and cuda segments compile to CUDA C++ kernels.  When ``device``
+is None, the pure torch evaluator handles everything (correctness ref).
 """
 
 from __future__ import annotations

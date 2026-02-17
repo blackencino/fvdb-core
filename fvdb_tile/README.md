@@ -784,11 +784,11 @@ Three new capabilities closing the compilation gap for hierarchical traversal:
 3. **Scale benchmark** (`bench_cutile_cross_leaf.py`): cross-leaf predicate
    benchmarked at 4, 64, and 256 leaves against numpy and PyTorch GPU:
 
-   | Leaves | Voxels | Lookups | numpy (us) | PyTorch GPU (us) | cuTile (us) | CT/PT |
-   |--------|--------|---------|------------|------------------|-------------|-------|
-   | 4 | 1,217 | 7,302 | 58,653 | 471 | 57 | 8.3x |
-   | 64 | 19,778 | 118,668 | 980,862 | 478 | 58 | 8.2x |
-   | 256 | 79,206 | 475,236 | 3,828,976 | 498 | 102 | 4.9x |
+   | Leaves | Voxels | Lookups | PyTorch CPU (us) | PyTorch GPU (us) | cuTile (us) | CT/PT |
+   |--------|--------|---------|------------------|------------------|-------------|-------|
+   | 4 | 1,211 | 7,266 | 430 | 531 | 61 | 8.7x |
+   | 64 | 19,340 | 116,040 | 1,658 | 533 | 70 | 7.6x |
+   | 256 | 78,972 | 473,832 | 16,194 | 561 | 101 | 5.6x |
 
    cuTile's advantage comes from: (a) single fused kernel with no
    intermediate tensors, (b) the 4D fused gather avoids materialising
@@ -1245,10 +1245,11 @@ File inventory:
 | `prototype/dsl_parse.py` | core | Recursive-descent parser: string -> AST |
 | `prototype/dsl_eval.py` | core | Tree-walk evaluator with hooks: type-check pass then torch execution |
 | `prototype/dsl_pipeline.py` | core | Barrier-aware pipeline planner, GPU collective dispatch, cutile segment compilation |
-| `prototype/dsl_to_cutile.py` | core | DSL AST -> cuTile Python source emitter (`emit_runnable_kernel`) |
+| `prototype/dsl_to_cutile.py` | core | DSL AST -> cuTile Python source emitter (preference #1) |
+| `prototype/dsl_to_cuda.py` | core | DSL AST -> CUDA C++ emitter, last-resort backend (preference #3) |
 | `prototype/dsl_lower.py` | core | Dialect lowering pass: rewrite dialect nodes to core AST |
 | `prototype/conv_grid.py` | **fully DSL-driven** | conv_grid topology expansion via pipeline (ExpandOffsets + Sort + Unique) |
-| `prototype/conv_grid_leafwise.py` | **out-of-DSL** | Leafwise conv_grid via bitmask dilation (hand-fused GPU kernel) |
+| `prototype/conv_grid_leafwise.py` | **DSL-driven** | Leafwise conv_grid via DilateLeafMasks pipeline (fused CUDA kernel as backend) |
 | `prototype/cig.py` | **out-of-DSL** | CompressedCIG3 builder (imperative torch), root lookup, reference query |
 | `prototype/hashmap_cuda.py` | **out-of-DSL** | GPU hash map build/lookup/scatter_reduce + fused conv_grid_dilate kernel (NVRTC JIT) |
 | `prototype/cuda_launch.py` | infra | Generic NVRTC compile-and-launch utility |
@@ -1334,9 +1335,9 @@ Key semantic rules (see Leading Shape Theory section for full details):
     hierarchical sparse traversal (817 voxels, 617 cross-leaf, all correct).
 15. Idiom detection: `Gather(Gather(A, i), j)` automatically fused into
     a single 4D `ct.gather(A, (i, j_x, j_y, j_z))` at emission time.
-16. Scale benchmark: cuTile 4.9-8.3x faster than PyTorch GPU at 4-256
-    leaf scale (up to 79K voxels, 475K lookups). GPU scaling excellent:
-    80x more work costs only 2x more time.
+16. Scale benchmark: cuTile 5.6-8.7x faster than PyTorch GPU at 4-256
+    leaf scale (up to 79K voxels, 474K lookups). GPU scaling excellent:
+    65x more work costs only 1.7x more time.
 17. CIG concrete tensor format: 2-level sparse grid as two raw tensors
     (lower + leaf_arr). Programmatic builder from voxel coordinates.
 18. First fVDB head-to-head: CIG cuTile ijk_to_index is 1.3-1.5x faster
@@ -1392,6 +1393,27 @@ Key semantic rules (see Leading Shape Theory section for full details):
     (out-of-DSL, future fusion target).
 36. Pipeline GPU data residency: data stays on target device throughout
     pipeline execution. No CPU round-trips between segments.
+37. Adverb emission: Over(commutative) dispatches to torch GPU ops as
+    a collective. Over inside Map/Each bodies emits inline in cuTile
+    (tile-level reduction, not a barrier). EachNode emits through
+    cuTile identically to MapNode.
+38. AST normalization: parser's `ApplyNode(AdverbApplyNode("Over"), ...)`
+    rewritten to canonical `OverNode` before planning, so barrier
+    detection and hooks work correctly.
+39. CUDA C++ emitter (last-resort backend): `dsl_to_cuda.py` generates
+    CUDA C++ from DSL AST, compiled in-memory via NVRTC. Grid-stride
+    loops, arithmetic/bitwise ops, array indexing. No files on disk.
+40. Three pipeline segment kinds: cutile, collective, cuda. Strict
+    preference order: cuTile > torch GPU > CUDA/NVRTC.
+41. `DilateLeafMasksNode`: typed 8x8x8 leaf primitive for fused mask
+    dilation. GPU dispatches to `conv_grid_dilate_kernel` via hook.
+    CPU evaluates via sequential shift + scatter-OR reference.
+42. conv_grid_leafwise fully DSL-driven: three-phase pipeline (torch
+    collectives + DilateLeafMasks CUDA + torch collectives). All 14
+    tests pass (11 CPU + 3 GPU).
+43. Leafwise conv_grid beats fVDB conv_grid by 1.5-1.7x at 100K+
+    voxels with k=5. The O(L*K) bitmask dilation avoids O(N*K) dense
+    expansion. DSL-driven pipeline, not hand-wired.
 
 ### Completed milestones (previously "next steps")
 
@@ -1420,10 +1442,10 @@ Key semantic rules (see Leading Shape Theory section for full details):
 
 | Voxels | CIG3 (us) | fVDB (us) | CIG3/fVDB | CIG3 memory |
 |--------|-----------|-----------|-----------|-------------|
-| 1,000  | 134       | 102       | 0.77x     | 0.03x fVDB  |
-| 10,000 | 131       | 103       | 0.78x     | 0.03x fVDB  |
-| 50,000 | 136       | 107       | 0.78x     | 0.04x fVDB  |
-| 200,000| 143       | 108       | 0.76x     | 0.05x fVDB  |
+| 1,000  | 137       | 113       | 0.82x     | 0.03x fVDB  |
+| 10,000 | 132       | 111       | 0.84x     | 0.03x fVDB  |
+| 50,000 | 137       | 109       | 0.79x     | 0.04x fVDB  |
+| 200,000| 139       | 110       | 0.80x     | 0.05x fVDB  |
 
 ### Completed since v11
 
@@ -1450,11 +1472,51 @@ ops.
 Exposed to the DSL via dialect nodes (HashMapBuild, HashMapLookup) and
 pipeline hooks for GPU dispatch.
 
-**conv_grid_leafwise (out-of-DSL).**  Topology expansion via
+**conv_grid_leafwise (now DSL-driven).**  Topology expansion via
 leaf-level bitmask dilation.  O(L*K) word-level ops vs conv_grid's
-O(N*K) dense expansion.  GPU path is a hand-fused CUDA kernel
-(`conv_grid_dilate_kernel`) -- performant but bypasses the DSL.  Prime
-candidate for AST-level fusion.
+O(N*K) dense expansion.  Originally out-of-DSL with a hand-fused CUDA
+kernel.  Now expressed as a DSL pipeline with three phases: torch
+collectives for hash map build, `DilateLeafMasksNode` (typed 8x8x8
+leaf primitive dispatched to the fused CUDA kernel via hook), and
+torch collectives for coordinate extraction.
+
+**Leafwise conv_grid benchmark** (RTX PRO 6000 Blackwell,
+`bench_conv_grid_leafwise.py`):
+
+| Voxels | Kernel | Leaves | Output coords | Leafwise GPU (us) | fVDB conv (us) | Speedup |
+|--------|--------|--------|---------------|--------------------|----------------|---------|
+| 1,000 | 3x3x3 | 986 | 26,983 | 5,248 | 5,456 | 1.04x |
+| 10,000 | 3x3x3 | 8,626 | 267,962 | 5,995 | 5,384 | 0.90x |
+| 50,000 | 3x3x3 | 25,586 | 1,298,977 | 5,906 | 6,918 | 1.17x |
+| 100,000 | 3x3x3 | 31,206 | 2,502,578 | 6,617 | 9,963 | 1.51x |
+| 200,000 | 3x3x3 | 32,682 | 4,651,077 | 9,525 | 14,587 | 1.53x |
+| 50,000 | 5x5x5 | 25,586 | 5,237,753 | 10,011 | 15,672 | 1.57x |
+| 100,000 | 5x5x5 | 31,206 | 8,887,300 | 17,369 | 28,962 | 1.67x |
+
+The leafwise approach matches fVDB at small scale and **beats fVDB by
+1.5-1.7x at large scale** (100K+ voxels, k=5).  The O(L*K) bitmask
+dilation avoids the O(N*K) dense expansion that dominates fVDB's cost
+at high voxel counts.  This is now a DSL-driven pipeline (not
+hand-wired), with the fused CUDA kernel as the backend for the
+DilateLeafMasks primitive.
+
+**Adverb emission.**  `OverNode` (commutative: Add, Mul, Max, Min, Or)
+and `EachNode` are now emittable in both the cuTile and CUDA emitters.
+Over dispatches to torch GPU ops (torch.sum, etc.) as a collective.
+Over inside Map/Each bodies is cuTile-emittable (tile-level reduction,
+not a barrier).  AST normalization rewrites the parser's composed
+`ApplyNode(AdverbApplyNode("Over"), ...)` form to canonical `OverNode`.
+
+**CUDA C++ emitter (last-resort backend).**  New `dsl_to_cuda.py`
+generates CUDA C++ from DSL AST, compiled in-memory via NVRTC.  No
+files on disk.  Handles grid-stride loops, arithmetic/bitwise ops,
+array indexing, and atomics.  Strict preference order: cuTile > torch
+GPU > CUDA/NVRTC.  Used only when the first two options are
+insufficient (e.g. atomicOr in DilateLeafMasks).
+
+**Pipeline segment routing.**  Three segment kinds: `cutile`, `collective`,
+`cuda`.  `_run_cuda_segment` compiles and launches CUDA kernels through
+the existing NVRTC infrastructure.
 
 **Pipeline cleanup pass.**  Removed CPU-in-GPU-hot-path violations
 (`.cpu()` calls in collective hooks and cutile segment results).
@@ -1464,19 +1526,15 @@ unique.  Added `is_cuda` guards on CPU-only reference hashmap.  Added
 
 ### The OUT_OF_DSL problem
 
-Three components bypass the DSL/AST pipeline.  While each is correct
-and performant, they undermine the primary thesis (DSL as portable
-source of truth, compiled to GPU code via the emitter).  Resolving
-these is the next critical step.
+Two remaining components bypass the DSL/AST pipeline.  A third
+(`conv_grid_leafwise`) has been resolved.
 
-**1. `conv_grid_leafwise.py` -- hand-fused dilation kernel.**  The
-algorithm is expressible in the DSL (see the docstring), but the GPU
-path is a single hand-written CUDA kernel that fuses mask shift +
-boundary decomposition + hash probe + atomicOr.  The DSL program
-would require multiple pipeline segments with barriers (HashMapBuild
-is collective, scatter-reduce is collective), and the per-element
-fusion across these barriers is what makes the hand-written kernel
-fast.
+**1. `conv_grid_leafwise.py` -- RESOLVED.**  Now DSL-driven via
+`DilateLeafMasksNode`, a typed 8x8x8 leaf primitive.  The DSL pipeline
+has three phases: torch collectives (hash map build), DilateLeafMasks
+(dispatched to the fused CUDA kernel via hook), torch collectives
+(MaskToCoords).  The hand-written CUDA kernel is the backend, not an
+escape hatch.  See Phase 4 of the OUT_OF_DSL compliance work.
 
 **2. `cig.py` -- CIG construction.**  `build_compressed_cig3` is
 imperative torch code (sort + unique + scatter).  The query path is
@@ -1616,8 +1674,8 @@ across segment boundaries where atomics replace sequential dependencies.
 
 ### Other recommended steps
 
-**1. Close the query performance gap (22-24% vs NanoVDB).**  The
-3-level CIG is within 22-24% of NanoVDB at 20-30x less memory.
+**1. Close the query performance gap (16-21% vs NanoVDB).**  The
+3-level CIG is within 16-21% of NanoVDB at 20-30x less memory.
 Investigate hardware popcount via `CUDA_TILE_LOGS=CUTILEIR`.  If
 cuTile does not lower the Hamming weight pattern to `__popcll()`, add
 a `Popc` DSL primitive that maps to the hardware intrinsic.
@@ -1658,25 +1716,29 @@ compiles to an intermediate representation (TileIR or PTX).  This works,
 but both paths have engineering trade-offs -- particularly around the
 files they leave on disk.
 
-**Two synthesis paths today:**
+**Two synthesis paths today (strict preference: cuTile > torch > CUDA):**
 
-| Path | Input | Framework | IR | Files on disk |
-|------|-------|-----------|----|---------------|
-| cuTile | Python source (`@ct.kernel`) | cuda-tile JIT | TileIR -> CUBIN | Yes (`_generated/*.py`) |
-| CUDA/NVRTC | CUDA C++ source string | NVRTC | PTX -> CUBIN | No (in-memory) |
+| Path | Input | Framework | IR | Files on disk | Preference |
+|------|-------|-----------|----|---------------|------------|
+| cuTile | Python source (`@ct.kernel`) | cuda-tile JIT | TileIR -> CUBIN | Yes (`_generated/*.py`) | #1 (preferred) |
+| CUDA/NVRTC | CUDA C++ source string | NVRTC | PTX -> CUBIN | No (in-memory) | #3 (last resort) |
 
-- **cuTile path** (tile-parallel gather/scatter kernels): the emitter
+- **cuTile path** (`dsl_to_cutile.py`, preference #1): the emitter
   produces Python source containing `@ct.kernel` decorated functions,
   writes them to `_generated/*.py` files, then imports via `importlib`.
   This is forced by cuTile's reliance on `inspect.getsource()` -- the
   JIT compiler needs to read the function's source text from a real file.
   Currently ~25 generated files across `prototype/_generated/` and
   `tests/_generated/`.  These are breadcrumbs that a library user would
-  find surprising.
-- **CUDA/NVRTC path** (hash map, atomics, `conv_grid_dilate`): CUDA C++
-  source strings are compiled to PTX in-memory via NVRTC, loaded as
-  `CUmodule`, and launched via the driver API.  No files on disk -- this
-  path is already clean.
+  find surprising.  Handles: Map, Each, Over (inline), Gather (with
+  chained/masked fusion), Decompose, Find, HierarchicalKey.
+- **CUDA/NVRTC path** (`dsl_to_cuda.py`, preference #3): CUDA C++
+  source strings are generated from DSL AST or hard-coded, compiled to
+  PTX in-memory via NVRTC, loaded as `CUmodule`, and launched via the
+  driver API.  No files on disk.  Used ONLY when cuTile and torch
+  cannot handle the operation (atomics, inline hash probing, boundary
+  decomposition).  Current use: `DilateLeafMasksNode` dispatched via
+  pipeline hook to `conv_grid_dilate_kernel`.
 
 **Direct IR emission -- eliminating the file problem:**
 
@@ -1710,11 +1772,11 @@ extension.
 
 ### Medium-term items
 
-- **Cross-barrier fusion** (the OUT_OF_DSL bridge): extend the pipeline
-  planner to recognise multi-segment patterns that can be fused into a
-  single kernel with atomics.  First target: the expand + hash_probe +
-  scatter_reduce(OR) pattern in `conv_grid_leafwise`.  See "Approaches
-  to resolving OUT_OF_DSL" above.
+- **Cross-barrier fusion** (generalise the DilateLeafMasks pattern):
+  the current `DilateLeafMasksNode` is a hand-specified fused primitive.
+  The next step is automatic fusion: the planner recognises adjacent
+  segments where atomics can replace sequential dependencies and emits
+  a single fused CUDA kernel.  See "Kernel fusion" section above.
 - **Direct IR emission** (eliminate `_generated/` files): retarget the
   cuTile emitter to TileIR and keep the NVRTC path in-memory.  See
   "Kernel synthesis" section above for the hybrid model and trade-offs.

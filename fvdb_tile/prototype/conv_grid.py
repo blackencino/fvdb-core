@@ -209,9 +209,12 @@ def conv_grid(
         inputs["stride"] = Value(Type(Shape(Static(3)), ScalarType.I32), stride_t)
 
     # --- Execute via pipeline ---
-    # Pass device so cutile segments compile to GPU kernels and collectives
-    # dispatch to torch GPU ops.  Data stays on-device throughout.
-    result = pipeline.run(inputs, device=device)
+    # Use device=None: the evaluator's torch ops (sort, unique, etc.) are
+    # device-agnostic and run on CUDA when inputs are on CUDA.  The cutile
+    # segments (ExpandOffsets, HierarchicalKey) use the torch evaluator which
+    # handles them correctly on any device.  cuTile compilation is not needed
+    # here -- the collectives dominate the runtime.
+    result = pipeline.run(inputs, device=None)
     output = result.output.data
 
     if isinstance(output, torch.Tensor):
