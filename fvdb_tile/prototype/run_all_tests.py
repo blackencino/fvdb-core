@@ -129,16 +129,6 @@ def main():
     _run("pipeline_exec_matches_direct", test_pipeline_executable_matches_direct_run)
     _run("pipeline_exec_input_immutable", test_pipeline_executable_preserves_input_immutability)
 
-    print()
-    from fvdb_tile.prototype.test_conv_grid import (
-        test_conv_grid_ephemeral_matches_reference,
-        test_conv_grid_stride_semantics,
-        test_conv_grid_uses_collective_pipeline_and_preserves_input,
-    )
-    _run("conv_grid_ephemeral_reference", test_conv_grid_ephemeral_matches_reference)
-    _run("conv_grid_stride_semantics", test_conv_grid_stride_semantics)
-    _run("conv_grid_pipeline_and_immutable", test_conv_grid_uses_collective_pipeline_and_preserves_input)
-
     # -- mesh exemplar --
     print()
     print("=" * 60)

@@ -787,14 +787,3 @@ def {kernel_name}({params_str}):
 """
 
     return code, tile_size, map_len
-
-
-def compile_pipeline(source: str):
-    """Compile a DSL source to a barrier-aware executable pipeline.
-
-    This bridges existing codegen entrypoints with the multi-step pipeline
-    path without changing DSL semantics.
-    """
-    from .dsl_pipeline import compile_source
-
-    return compile_source(source)

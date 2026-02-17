@@ -7,10 +7,18 @@ This module provides:
   - planning: partition top-level bindings into execution segments
   - execution: run planned segments through a single immutable pipeline API
 
-Execution currently prioritizes correctness and semantic stability over backend
-specialization: both "cutile" and "collective" segments are evaluated via the
-same pure DSL evaluator path, while preserving explicit barrier boundaries in
-the plan for future backend lowering.
+Segment kinds:
+
+  "cutile"     -- tile-parallel pointwise/gather work that can be fused into a
+                  single @ct.kernel launch via dsl_to_cutile.emit_runnable_kernel.
+  "collective" -- operations requiring cross-thread coordination (Sort, Unique,
+                  Where, Over).  These are GPU-accelerated via torch ops (e.g.
+                  torch.sort, torch.unique) and require a synchronization barrier
+                  between kernel launches.
+
+Both segment kinds target GPU execution.  The prototype evaluator executes all
+segments through the pure DSL evaluator as a correctness reference; the segment
+boundaries it identifies are the plan for backend dispatch.
 """
 
 from __future__ import annotations
@@ -40,7 +48,7 @@ class PlannedBinding:
 
 @dataclass(frozen=True)
 class PipelineSegment:
-    kind: str  # "cutile" | "collective"
+    kind: str  # "cutile" (kernel-fusible) | "collective" (torch GPU barrier)
     reason: str
     bindings: tuple[PlannedBinding, ...]
 
@@ -156,11 +164,6 @@ def compile_program(program: Program) -> PipelineExecutable:
 
 def compile_source(source: str) -> PipelineExecutable:
     return compile_program(parse(source))
-
-
-def compile_pipeline(source: str) -> PipelineExecutable:
-    """Alias for compile_source; explicit name for compiler-facing call sites."""
-    return compile_source(source)
 
 
 def _clone_value(val: Value) -> Value:
