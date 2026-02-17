@@ -53,9 +53,13 @@ analyzable, optimizable descriptions that lower to GPU tensor operations.
 **Key technical insight.** Nested layouts serve the role of **Halide's
 schedule** -- they describe how to traverse the data, while operations
 describe what to compute. APL/J/K conflate data shape with iteration
-structure; this system **decouples** them via the iteration-space /
-element-type separation. This decoupling is what makes it possible to write
-domain algorithms as tiny compositions of functions and layouts:
+structure; this system **decouples** them via leading-shape theory: a type
+is a recursive nesting `S_1 / S_2 / ... / scalar` where each `/` is a
+nesting boundary. Operations always work on the leading shape `S_1`; the
+rest is "one element." Layouts (`cut`, `fuse`, `reshape`) move the `/`
+boundary without moving data -- the schedule lives in the type, not in the
+operation. This decoupling is what makes it possible to write domain
+algorithms as tiny compositions of functions and layouts:
 
 The entire SPH density calculation can be written as `(R/P/:)\:':` in K9
 syntax -- a tacit composition of a reduction, a product, and structured
@@ -109,6 +113,12 @@ Cleanly separates shape (structural index data) from data (per-voxel values).
 
 ## Vocabulary
 
+**Notation.** Types are written as `S_1 / S_2 / ... / scalar`, where `/`
+separates nesting levels (see Leading Shape Theory below). The `Type.__repr__`
+in Python prints `over` instead of `/`: `(5, 6, 7) over (3, 4) over i32`
+means the same as `(5, 6, 7) / (3, 4) / i32`. Both notations appear in this
+document; they are interchangeable.
+
 A **scalar type** (`stype`): `f32`, `f16`, `i32`, `i64`, etc.
 
 A **scalar**: a single value of some stype. Rank 0.
@@ -141,23 +151,27 @@ so the type system keeps them distinct.
 - `~ + ~` = `~` (offsets must agree at runtime)
 - `n + ~` or `* + ~` = **type error** (uniform vs. non-uniform mismatch)
 
-**Indexing rule**: an object of rank `r` requires an index of rank `r` to
-produce an element. No partial indexing. A rank-3 tensor requires a rank-3
-index and yields a scalar.
+**Indexing rule**: a value whose leading shape has rank `r` requires an
+index of rank `r` to produce one element (the inner type). No partial
+indexing. A value with leading shape `(8, 8, 8)` requires a `(3,) i32`
+coordinate and yields its inner type.
 
-**Coordinate convention**: an index into a rank-`r` iteration space is
+**Coordinate convention**: an index into a rank-`r` leading shape is
 `(r,) i32`. For rank 1, a scalar `i32` is the degenerate case.
 
-**Elementwise rule**: binary ops require identical iteration shapes. No
-broadcasting -- reshape beforehand.
+**Elementwise rule**: binary ops require identical leading shapes. No
+implicit broadcasting -- use `EachBoth(f)` for explicit zip-iteration over
+matching leading shapes, or `EachRight`/`EachLeft` for asymmetric iteration.
 
-**Logical vs. physical**: every object has a **logical type** (iteration shape
-+ element type) and a **physical storage** (actual tensors). For raw tensors
-these coincide. For compound structures they diverge. The algebra operates at
-the logical level; lowering to physical storage is a compilation pass.
+**Logical vs. physical**: every object has a **logical type** (recursive
+nesting of leading shape / inner type -- see Leading Shape Theory) and a
+**physical storage** (actual tensors). For raw tensors these coincide. For
+compound structures they diverge. The algebra operates at the logical level;
+lowering to physical storage is a compilation pass.
 
 **Shape notation**: `(*, ~, 3)` = outer dynamic, middle jagged, inner
-static 3.
+static 3. This describes extents within a single leading shape. The `/`
+separator denotes nesting levels: `(5,) / (*, ~, 3) / i32`.
 
 ### Shorthand vs. C++ type_traits
 
@@ -335,11 +349,14 @@ see PascalCase it does work.
 | Operations (work) | PascalCase | `Map`, `Each`, `Over`, `Where`, `Gather`, `Add`, `Decompose` |
 | Connectors | PascalCase | `Input`, `Const` |
 
-K-derived adverbs (`Over`, `Scan`, `EachRight`, `EachLeft`, `Prior`, `Map`,
-`Each`) are higher-order functions: they take a verb and an iterable and
-produce new data. They do not need a separate notational tier. The DSL is
-functional; adverbs are functions. The compiler recognises reduction, scan, and
-iteration patterns by matching AST node types, not by reading case conventions.
+K-derived adverbs (`Over`, `Scan`, `EachRight`, `EachLeft`, `EachBoth`,
+`Prior`) are **function transformers**: they take a verb (function value) and
+return a **new function** with different iteration behaviour. Application is
+a separate step: `Over(Add, xs)` is syntactic sugar for
+`Apply(Over(Add), xs)`. This two-step separation enables composition --
+`EachRight(EachLeft(Add))` is a function, not an application. The compiler
+recognises reduction, scan, and iteration patterns by matching AST node types,
+not by reading case conventions.
 
 ---
 
@@ -357,28 +374,31 @@ policy decision, but the type system itself only recognises eligibility.
 
 ### Cut
 
-Splits the leading axis into outer (new iteration) and inner (element type).
+Deepens nesting by splitting the outermost extent of the leading shape.
+Introduces a new `/` boundary: the outer portion becomes the new leading
+shape, the inner portion joins the inner type.
 
-| Mode | Spec | Result iteration | Result element |
-|------|------|-----------------|----------------|
-| By count | `cut(n, x)` | `(n,)` | `(D/n, ...) over E` |
-| By size | `cut(-s, x)` | `(D/s,)` | `(s, ...) over E` |
-| By offsets | `cut(offs, x)` | `(*,)` | `(~, ...) over E` |
+| Mode | Spec | New leading shape | New inner type |
+|------|------|-------------------|----------------|
+| By count | `cut(n, x)` | `(n,)` | `(D/n, ...) / E` |
+| By size | `cut(-s, x)` | `(D/s,)` | `(s, ...) / E` |
+| By offsets | `cut(offs, x)` | `(*,)` | `(~, ...) / E` |
 
 ### Indexed
 
 Associates an **indexer** with a **target**:
-- Result iteration space = indexer's iteration space.
-- Result element type = target's element type.
-- Constraint: indexer element type matches target iteration rank.
+- Result leading shape = indexer's leading shape.
+- Result inner type = target's inner type.
+- Constraint: indexer's inner type must be a coordinate matching the target's
+  leading shape rank.
 
 As a layout (`indexed`): pure type-level, no work. As an operation (`Gather`): materialises.
 
 ### Tuple
 
 Ordered group of sub-layouts, no shape constraints.
-- Iteration space: rank 1, length = number of children.
-- Element type: heterogeneous (K's generic list).
+- Leading shape: rank 1, length = number of children.
+- Inner type: heterogeneous (K's generic list).
 
 ### Struct
 
@@ -387,7 +407,7 @@ Definition-ordered. K parallel: struct = dict.
 
 ### Flip
 
-Applied to tuple/struct with compatible iteration spaces. Transposes
+Applied to tuple/struct with compatible leading shapes. Transposes
 "collection of arrays" into "array of collections." K parallel:
 flip(dict) = table.
 
@@ -401,8 +421,8 @@ Fixed-shape space with **sparse occupancy**. The counterpart of `jagged`
 (variable-length segments): where `jagged` handles "how many elements per
 group?", `masked` handles "which positions in a fixed block have data?"
 
-- Iteration space: from the mask shape (e.g. `(8,8,8)` for a leaf block).
-- Element type: from the flat data array.
+- Leading shape: from the mask shape (e.g. `(8,8,8)` for a leaf block).
+- Inner type: from the flat data array.
 - Access: bitmask check + **popcount** for dense index. `masked(mask, offset)`
   wraps a packed bitmask and a base offset into a flat data array. Gather
   through a masked layout computes `offset + popcount(mask, position)` if the
@@ -413,6 +433,33 @@ group?", `masked` handles "which positions in a fixed block have data?"
   NanoVDB's `LeafData<ValueIndex>` uses the same structure (64-byte mask +
   `mValueOff` + `countOn(i)` popcount). The `masked` layout exposes the same
   mechanism as a first-class, transparent, composable type-system concept.
+
+### Fuse
+
+Merge the two outermost nesting levels into one. The inverse of `cut`.
+
+`fuse(S_1 / S_2 / E)` = `(S_1 ++ S_2) / E` -- shape concatenation.
+
+No data movement. Constraint: the inner leading shape must not contain
+Jagged extents (jagged means "varies per parent" and cannot be fused into
+a uniform shape). Dynamic extents are fine.
+
+### Flatten
+
+Recursively fuse ALL nesting levels into a single leading shape.
+
+`flatten(S_1 / S_2 / ... / S_n / scalar)` = `(S_1 ++ ... ++ S_n) / scalar`.
+
+Same jagged constraint as fuse at each level.
+
+### Permute
+
+Reorder axes within the leading shape. Does not cross nesting boundaries.
+
+`permute((a, b, c) / E, [2, 0, 1])` = `(c, a, b) / E`.
+
+To permute across nesting levels: `fuse` first, then `permute`, then `cut`
+to re-establish the boundary.
 
 ---
 
@@ -462,8 +509,8 @@ Example: face centroids = `Each(faces, f => Div(Over(Add, verts_of_f), Const(3))
 
 ### Core Operations
 
-- **Map(xs, x => body)**: scalar function per element. Preserves iteration.
-- **Where(xs)**: coords of truthy elements. `S over bool` => `(*,) over (r,) i32`.
+- **Map(xs, x => body)**: scalar function per element. Preserves leading shape.
+- **Where(xs)**: coords of truthy elements. `S / bool` => `(*,) / (rank(S),) i32`.
 - **Gather(target, indexer)**: materialise an Indexed layout.
 
 ### Scalar Primitives
@@ -480,7 +527,8 @@ Example: face centroids = `Each(faces, f => Div(Over(Add, verts_of_f), Const(3))
 | Name | Convention | Kind | New data? |
 |------|-----------|------|-----------|
 | `cut`, `indexed`, `tuple`, `struct`, `flip`, `jagged`, `reshape`, `field`, `masked` | lowercase | Layout (free) | No |
-| `Over`, `Scan`, `EachRight`, `EachLeft`, `Prior` | PascalCase | Adverb (function -> function) | Deferred |
+| `fuse`, `flatten`, `permute` | lowercase | Layout (free) | No |
+| `Over`, `Scan`, `EachRight`, `EachLeft`, `EachBoth`, `Prior` | PascalCase | Adverb (function -> function) | Deferred |
 | `Each`, `Map` | PascalCase | Iteration (with lambda body) | Yes |
 | `Apply` | PascalCase | Function application | Yes |
 | `Where` | PascalCase | Operation | Yes (data-dependent) |
@@ -829,7 +877,7 @@ First apples-to-apples comparison with fVDB. Three components:
 
 The key structural addition: `masked` as a first-class layout in the type
 system. This is the sparse-occupancy counterpart of `jagged` (variable-
-length segments). A masked layout wraps a fixed-shape iteration space with a
+length segments). A masked layout wraps a fixed-shape leading shape with a
 bitmask indicating which positions have data, plus a base offset into a flat
 data array. Access computes: bitmask check + popcount for the dense index.
 
@@ -1071,9 +1119,9 @@ Three optimisations that close the performance gap with NanoVDB:
 
 ## Working Theory
 
-**Claim**: nested layouts + rank-matched adverbs can fully specify structured
-geometric and scientific computations -- sparse grids, meshes, point clouds,
-scene graphs -- in a form that is:
+**Claim**: nested layouts + leading-shape-theory adverbs can fully specify
+structured geometric and scientific computations -- sparse grids, meshes,
+point clouds, scene graphs -- in a form that is:
 
 - **Portable**: backed by tensors, described by metadata. Any system that can
   store tensors can store and exchange the full structure.
@@ -1190,10 +1238,10 @@ File inventory:
 
 | File | Role |
 |------|------|
-| `prototype/types.py` | Extent kinds (Static/Dynamic/Jagged), Shape, Type, ScalarType |
-| `prototype/layouts.py` | Layout wrappers (lowercase): cut, indexed, tuple, struct, flip, jagged, masked |
-| `prototype/ops.py` | Python-level operations: Map, Each, Where, Gather, FlipStruct, Decompose, morton3d |
-| `prototype/dsl_ast.py` | AST node classes (~25 nodes) with `infer_type` methods |
+| `prototype/types.py` | Extent kinds (Static/Dynamic/Jagged), Shape, Type, ScalarType, FnType |
+| `prototype/layouts.py` | Layout wrappers (lowercase): cut, indexed, tuple, struct, flip, jagged, masked, fuse, flatten, permute |
+| `prototype/ops.py` | Python-level operations: Map, Each, Where, Gather, FlipStruct, Decompose, morton3d; FnValue + VERBS registry |
+| `prototype/dsl_ast.py` | AST node classes (~30 nodes) with `infer_type` methods; includes VerbRefNode, AdverbApplyNode, ApplyNode, FuseNode, FlattenNode, PermuteNode |
 | `prototype/dsl_parse.py` | Recursive-descent parser: string -> AST |
 | `prototype/dsl_eval.py` | Tree-walk evaluator with hooks: type-check pass then numpy execution |
 | `prototype/dsl_pipeline.py` | Barrier-aware pipeline planner, GPU collective dispatch, cutile segment compilation |
@@ -1209,6 +1257,8 @@ File inventory:
 | `tests/test_sort_unique.py` | Sort/Unique DSL primitive correctness |
 | `tests/test_pipeline.py` | Pipeline planning, collective dispatch, cutile segment compilation |
 | `tests/test_conv_grid.py` | conv_grid correctness, stride semantics, immutability |
+| `tests/test_adverbs.py` | Nested adverbs, outer product, function values, EachRight(EachLeft(f)) |
+| `tests/test_layouts_advanced.py` | fuse, flatten, permute, EachBoth, cut/fuse round-trip, dot product |
 | `tests/test_masked.py` | v8: masked layout DSL tests |
 | `tests/test_cig3.py` | v10: 3-level CIG builder, root lookup, numpy reference |
 | `tests/test_cross_leaf.py` | v5: cross-leaf neighbors via DSL evaluator |
@@ -1230,17 +1280,21 @@ The DSL has ~25 keywords. **Layouts use lowercase** (`cut`, `reshape`,
 at a glance. Programs are text strings parsed into typed ASTs, type-checked
 without data, then executed against numpy.
 
-Key semantic rules:
-- Higher-order functions operate over the **full iteration space**. No axis
-  parameter. `cut` to isolate the axis you want. The layout IS the axis
-  specification.
-- Each promotes Dynamic to Jagged at type-check time (body runs independently
-  per element).
-- Over reduces the full iteration space (commutative+associative for rank > 1).
-  Scan and Prior require rank 1.
+Key semantic rules (see Leading Shape Theory section for full details):
+- Adverbs are function transformers: `Over(Add)` produces a new function;
+  `Apply(Over(Add), xs)` applies it. `Over(Add, xs)` is syntactic sugar.
+- All adverbs operate over the **full leading shape**. No axis parameter.
+  `cut` to set the nesting boundary. The layout IS the schedule.
+- Each/EachRight/EachLeft/EachBoth promote Dynamic to Jagged at type-check
+  time (body runs independently per element).
+- Over reduces the full leading shape (commutative+associative for rank > 1).
+  Scan and Prior require rank-1 leading shape.
 - `indexed` is a layout (free, lowercase); `Gather` is its materialisation
   (work, PascalCase). When to resolve is a scheduling decision, not an
   algorithmic one.
+- `fuse` merges nesting levels (inverse of `cut`); `flatten` merges all.
+  `permute` reorders axes within the leading shape. All free (no data
+  movement).
 
 ### What has been demonstrated
 
