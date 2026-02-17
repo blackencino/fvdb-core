@@ -443,6 +443,13 @@ class FindNode(Node):
 
 @dataclass(frozen=True)
 class Morton3dNode(Node):
+    """Morton3d: unsigned morton encoding for non-negative coordinates.
+
+    (3,) i32 -> () i32, or (*,3) i32 -> (*,) i32.
+    Used for indexing into morton-linearized arrays.
+    For signed coordinates, use Morton3dSigned.
+    """
+
     input: Node
 
     def infer_type(self, env: Env, inputs: InputDecls) -> Type:
@@ -452,6 +459,52 @@ class Morton3dNode(Node):
 
     def __repr__(self) -> str:
         return f"Morton3d({self.input})"
+
+
+@dataclass(frozen=True)
+class Morton3dSignedNode(Node):
+    """Morton3dSigned: signed morton encoding for arbitrary i32 coordinates.
+
+    Offsets each axis by 2^20 to handle negative values.
+    (3,) i32 -> () i64, or (*,) / (3,) i32 -> (*,) i64.
+    21 bits per axis x 3 = 63 bits, fits in i64.
+    """
+
+    input: Node
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        input_ty = self.input.infer_type(env, inputs)
+        # Batched: (*,) / (3,) i32 -> (*,) / i64
+        if isinstance(input_ty.element_type, Type):
+            return Type(input_ty.iteration_shape, ScalarType.I64)
+        # Scalar: (3,) i32 -> () / i64
+        return Type(Shape(), ScalarType.I64)
+
+    def __repr__(self) -> str:
+        return f"Morton3dSigned({self.input})"
+
+
+@dataclass(frozen=True)
+class MortonDecode3dNode(Node):
+    """Decode morton codes back to signed 3D coordinates.
+
+    Inverse of Morton3d.  Extracts per-axis bits and subtracts the
+    2^20 offset to restore signed i32 coordinates.
+    """
+
+    input: Node
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        input_ty = self.input.infer_type(env, inputs)
+        coord_elem = Type(Shape(Static(3)), ScalarType.I32)
+        # Batched: (*,) / i64 -> (*,) / (3,) i32
+        if input_ty.rank > 0:
+            return Type(input_ty.iteration_shape, coord_elem)
+        # Scalar: () / i64 -> (3,) i32
+        return coord_elem
+
+    def __repr__(self) -> str:
+        return f"MortonDecode3d({self.input})"
 
 
 # ---------------------------------------------------------------------------

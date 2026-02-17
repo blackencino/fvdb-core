@@ -499,14 +499,49 @@ def _compact1by2(x: np.ndarray) -> np.ndarray:
     return x.astype(np.int32)
 
 
+_MORTON_OFFSET = 1 << 20  # 1,048,576 -- shift signed coords to non-negative
+
+
 def morton3d(coord: np.ndarray) -> np.ndarray:
     """Encode (3,) i32 or (N, 3) i32 coordinates to morton indices.
 
     Returns i32 scalar or (N,) i32 array.
+
+    .. deprecated:: Use :func:`morton3d_signed` for new code.
     """
     if coord.ndim == 1:
         return (_part1by2(coord[0]) | (_part1by2(coord[1]) << 1) | (_part1by2(coord[2]) << 2)).astype(np.int32)
     else:
         return (_part1by2(coord[:, 0]) | (_part1by2(coord[:, 1]) << 1) | (_part1by2(coord[:, 2]) << 2)).astype(np.int32)
+
+
+def morton3d_signed(coord: np.ndarray) -> np.ndarray:
+    """Encode signed (3,) i32 or (N, 3) i32 coordinates to morton codes.
+
+    Offsets each axis by 2^20 so that the range [-2^20, 2^20) maps to
+    [0, 2^21).  21 bits per axis x 3 axes = 63 bits, fits in i64.
+
+    Returns i64 scalar or (N,) i64 array.
+    """
+    c = coord.astype(np.int64) + _MORTON_OFFSET
+    if c.ndim == 1:
+        return (_part1by2(c[0]) | (_part1by2(c[1]) << 1) | (_part1by2(c[2]) << 2)).astype(np.int64)
+    else:
+        return (_part1by2(c[:, 0]) | (_part1by2(c[:, 1]) << 1) | (_part1by2(c[:, 2]) << 2)).astype(np.int64)
+
+
+def morton3d_decode(codes: np.ndarray) -> np.ndarray:
+    """Decode morton codes back to signed (3,) i32 or (N, 3) i32 coordinates.
+
+    Inverse of :func:`morton3d_signed`.  Extracts per-axis bits via
+    ``_compact1by2`` and subtracts the 2^20 offset to restore sign.
+    """
+    codes_i64 = codes.astype(np.int64)
+    x = _compact1by2(codes_i64) - _MORTON_OFFSET
+    y = _compact1by2(codes_i64 >> 1) - _MORTON_OFFSET
+    z = _compact1by2(codes_i64 >> 2) - _MORTON_OFFSET
+    if codes.ndim == 0:
+        return np.array([int(x), int(y), int(z)], dtype=np.int32)
+    return np.stack([x, y, z], axis=-1).astype(np.int32)
 
 

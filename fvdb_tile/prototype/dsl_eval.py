@@ -38,6 +38,8 @@ from .dsl_ast import (
     MapNode,
     MaskedNode,
     Morton3dNode,
+    Morton3dSignedNode,
+    MortonDecode3dNode,
     MulNode,
     Node,
     NotNode,
@@ -406,6 +408,24 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
         result = np_morton3d(coord_val.data)
         return Value(Type(Shape(), ScalarType.I32), result)
 
+    if isinstance(node, Morton3dSignedNode):
+        coord_val = eval_node(node.input, env)
+        from .ops import morton3d_signed
+        result = morton3d_signed(coord_val.data)
+        input_types = {k: v.type for k, v in env.inputs.items()}
+        type_env = {k: v.type for k, v in {**env.bindings, **env.locals}.items()}
+        result_type = node.infer_type(type_env, input_types)
+        return Value(result_type, result)
+
+    if isinstance(node, MortonDecode3dNode):
+        codes_val = eval_node(node.input, env)
+        from .ops import morton3d_decode
+        result = morton3d_decode(codes_val.data)
+        input_types = {k: v.type for k, v in env.inputs.items()}
+        type_env = {k: v.type for k, v in {**env.bindings, **env.locals}.items()}
+        result_type = node.infer_type(type_env, input_types)
+        return Value(result_type, result)
+
     if isinstance(node, FindNode):
         table_val = eval_node(node.table, env)
         key_val = eval_node(node.key, env)
@@ -447,7 +467,14 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
         new_type = reshape_layout(input_val.type, node.new_shape)
         data = input_val.data
         if isinstance(data, np.ndarray):
-            data = data.reshape(node.new_shape)
+            old_rank = input_val.type.rank
+            elem_dims = data.shape[old_rank:]
+            new_iter = tuple(
+                -1 if (isinstance(s, int) and s < 0) or s == "*" else int(s)
+                for s in node.new_shape
+            )
+            target = new_iter + elem_dims
+            data = data.reshape(target)
         return Value(new_type, data)
 
     if isinstance(node, FuseNode):

@@ -44,6 +44,8 @@ from .dsl_ast import (
     MapNode,
     MaskedNode,
     Morton3dNode,
+    Morton3dSignedNode,
+    MortonDecode3dNode,
     MulNode,
     Node,
     NotNode,
@@ -110,6 +112,8 @@ _BUILTINS = {
     "Count",
     "Decompose",
     "Morton3d",
+    "Morton3dSigned",
+    "MortonDecode3d",
     "Find",
     "Input",
     "Const",
@@ -389,6 +393,12 @@ class Parser:
 
         if name == "Morton3d":
             return Morton3dNode(_expr(args[0]))
+
+        if name == "Morton3dSigned":
+            return Morton3dSignedNode(_expr(args[0]))
+
+        if name == "MortonDecode3d":
+            return MortonDecode3dNode(_expr(args[0]))
 
         if name == "Find":
             return FindNode(_expr(args[0]), _expr(args[1]))

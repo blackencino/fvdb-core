@@ -110,6 +110,8 @@ def reshape(ty: Type, new_extents: tuple[int | str, ...]) -> Type:
 
     def _parse(e) -> Extent:
         if isinstance(e, int):
+            if e < 0:
+                return Dynamic()
             return Static(e)
         if e == "*":
             return Dynamic()

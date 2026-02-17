@@ -257,10 +257,10 @@ def _node_to_source(node: Node) -> str:
         return node.name
     from .dsl_ast import ConstNode, AddNode, SubNode, GENode, AndNode, NotNode
     from .dsl_ast import InBoundsNode, GatherNode, DecomposeNode, FindNode
-    from .dsl_ast import MaskedNode, CutNode, ReshapeNode
-    from .dsl_ast import DivNode, MulNode, CountNode, Morton3dNode
+    from .dsl_ast import MaskedNode, CutNode, ReshapeNode, FuseNode, FlattenNode, PermuteNode
+    from .dsl_ast import DivNode, MulNode, CountNode, Morton3dNode, Morton3dSignedNode, MortonDecode3dNode
     from .dsl_ast import OverNode, ScanNode, EachRightNode, EachLeftNode, PriorNode
-    from .dsl_ast import FieldNode
+    from .dsl_ast import FieldNode, VerbRefNode, AdverbApplyNode, ApplyNode
 
     if isinstance(node, ConstNode):
         return f"Const({node.value!r})"
@@ -306,6 +306,27 @@ def _node_to_source(node: Node) -> str:
         return f"Over({node.verb}, {_node_to_source(node.input)})"
     if isinstance(node, Morton3dNode):
         return f"Morton3d({_node_to_source(node.input)})"
+    if isinstance(node, Morton3dSignedNode):
+        return f"Morton3dSigned({_node_to_source(node.input)})"
+    if isinstance(node, MortonDecode3dNode):
+        return f"MortonDecode3d({_node_to_source(node.input)})"
+    if isinstance(node, FuseNode):
+        return f"fuse({_node_to_source(node.input)})"
+    if isinstance(node, FlattenNode):
+        return f"flatten({_node_to_source(node.input)})"
+    if isinstance(node, ReshapeNode):
+        return f"reshape({_node_to_source(node.input)}, Const({list(node.new_shape)!r}))"
+    if isinstance(node, VerbRefNode):
+        return node.name
+    if isinstance(node, AdverbApplyNode):
+        return f"{node.adverb}({_node_to_source(node.fn)})"
+    if isinstance(node, ApplyNode):
+        arg_strs = ", ".join(_node_to_source(a) for a in node.args)
+        if isinstance(node.fn, AdverbApplyNode):
+            inner_src = _node_to_source(node.fn.fn)
+            return f"{node.fn.adverb}({inner_src}, {arg_strs})"
+        fn_src = _node_to_source(node.fn)
+        return f"Apply({fn_src}, {arg_strs})"
     raise TypeError(f"Cannot serialize {type(node).__name__} to DSL source")
 
 
