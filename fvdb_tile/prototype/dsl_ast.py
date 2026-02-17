@@ -25,6 +25,7 @@ from .layouts import (
 from .types import (
     Dynamic,
     Extent,
+    FnType,
     Jagged,
     ScalarType,
     Shape,
@@ -616,6 +617,197 @@ class PriorNode(Node):
 
 
 # ---------------------------------------------------------------------------
+# Functions as values: VerbRef, AdverbApply, Apply
+# ---------------------------------------------------------------------------
+
+# The set of adverb names recognised by AdverbApplyNode.
+_ADVERB_NAMES = {"Over", "Scan", "EachRight", "EachLeft", "Prior", "Each"}
+
+# Arity of the function produced by each adverb.
+_ADVERB_ARITY = {
+    "Over": 1,      # Over(f): monadic -- consumes leading shape
+    "Scan": 1,      # Scan(f): monadic -- rank-1 running accumulation
+    "Prior": 1,     # Prior(f): monadic -- rank-1 adjacent pairs
+    "Each": 1,      # Each(f): monadic -- iterate leading shape
+    "EachRight": 2, # EachRight(f): dyadic -- x whole, iterate y
+    "EachLeft": 2,  # EachLeft(f): dyadic -- iterate x, y whole
+}
+
+
+@dataclass(frozen=True)
+class VerbRefNode(Node):
+    """Reference to a built-in verb (Add, Sub, etc.) as a function value.
+
+    Evaluates to a FnValue at runtime. Type is () / FnType(arity, name).
+    """
+    name: str
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        from .ops import VERBS
+        if self.name not in VERBS:
+            raise TypeError(f"Unknown verb: {self.name!r}")
+        v = VERBS[self.name]
+        return Type(Shape(), FnType(v.arity, self.name))
+
+    def __repr__(self) -> str:
+        return self.name
+
+
+@dataclass(frozen=True)
+class AdverbApplyNode(Node):
+    """Apply an adverb to a function, producing a new function.
+
+    EachLeft(Add)  ->  AdverbApplyNode("EachLeft", VerbRefNode("Add"))
+
+    The result is a function value; no data is consumed.
+    """
+    adverb: str  # one of _ADVERB_NAMES
+    fn: Node     # must evaluate to a FnValue
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        if self.adverb not in _ADVERB_NAMES:
+            raise TypeError(f"Unknown adverb: {self.adverb!r}")
+        result_arity = _ADVERB_ARITY[self.adverb]
+        return Type(Shape(), FnType(result_arity, f"{self.adverb}(...)"))
+
+    def __repr__(self) -> str:
+        return f"{self.adverb}({self.fn})"
+
+
+@dataclass(frozen=True)
+class ApplyNode(Node):
+    """Apply a function value to data arguments.
+
+    Apply(EachLeft(Add), x, y)  ->  ApplyNode(AdverbApplyNode(...), [x, y])
+    Over(Add, xs)               ->  ApplyNode(AdverbApplyNode("Over", VerbRefNode("Add")), [xs])
+
+    The fn node must evaluate to a FnValue. Type inference resolves the
+    function structurally: it pattern-matches on the fn node to compute
+    the output type from the argument types.
+    """
+    fn: Node
+    args: tuple  # tuple of Node
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        arg_types = [a.infer_type(env, inputs) for a in self.args]
+        return _infer_apply_type(self.fn, arg_types, env, inputs)
+
+    def __repr__(self) -> str:
+        arg_strs = ", ".join(repr(a) for a in self.args)
+        return f"Apply({self.fn}, {arg_strs})"
+
+
+def _as_element_type(ty: Type):
+    """Convert a Type to an ElementType suitable for nesting.
+
+    When a function returns () / scalar (rank-0 with scalar element), the
+    result should nest as just the ScalarType, not as a rank-0 Type wrapper.
+    This keeps types clean: (5,) / i32 instead of (5,) / (() / i32).
+
+    When a function returns something with rank > 0, it nests as a Type.
+    """
+    if ty.rank == 0 and isinstance(ty.element_type, ScalarType):
+        return ty.element_type  # unwrap: () / i32 -> i32
+    return ty  # keep as Type: (3, 4) / i32 stays as-is
+
+
+def _infer_apply_type(fn_node: Node, arg_types: list[Type], env: Env, inputs: InputDecls) -> Type:
+    """Structurally infer the return type of applying fn_node to arg_types.
+
+    This walks the fn_node AST to determine what the composed function
+    does to the argument types. No runtime data needed.
+    """
+    # Case 1: VerbRefNode -- apply a built-in verb directly
+    if isinstance(fn_node, VerbRefNode):
+        from .ops import VERBS
+        verb = VERBS[fn_node.name]
+        return verb.type_fn(*arg_types)
+
+    # Case 2: AdverbApplyNode -- apply an adverb-wrapped function
+    if isinstance(fn_node, AdverbApplyNode):
+        adverb = fn_node.adverb
+        inner_fn = fn_node.fn
+
+        if adverb == "Over":
+            # Over(f)(xs: S / E) -> E
+            xs_ty = arg_types[0]
+            et = xs_ty.element_type
+            return et if isinstance(et, Type) else Type(Shape(), et)
+
+        if adverb == "Scan":
+            # Scan(f)(xs: (D,) / E) -> (D,) / E  -- rank 1 only
+            xs_ty = arg_types[0]
+            if xs_ty.rank != 1:
+                raise TypeError(f"Scan requires rank-1 leading shape, got rank {xs_ty.rank}")
+            return xs_ty
+
+        if adverb == "Prior":
+            # Prior(f)(xs: (D,) / E) -> (D-1,) / E  -- rank 1 only
+            xs_ty = arg_types[0]
+            if xs_ty.rank != 1:
+                raise TypeError(f"Prior requires rank-1 leading shape, got rank {xs_ty.rank}")
+            lead = xs_ty.iteration_shape.extents[0]
+            new_lead = Static(lead.n - 1) if isinstance(lead, Static) else lead
+            return Type(Shape(new_lead), xs_ty.element_type)
+
+        if adverb == "Each":
+            # Each(f)(xs: S / E) -> S / f(E)
+            xs_ty = arg_types[0]
+            elem_ty = xs_ty.element_type
+            elem_as_type = elem_ty if isinstance(elem_ty, Type) else Type(Shape(), elem_ty)
+            result_inner = _infer_apply_type(inner_fn, [elem_as_type], env, inputs)
+            result_elem = _as_element_type(result_inner)
+            if isinstance(result_elem, Type):
+                result_elem = _promote_dynamic_to_jagged(result_elem)
+            return Type(xs_ty.iteration_shape, result_elem)
+
+        if adverb == "EachRight":
+            # EachRight(f)(x: T, y: S_y / E_y) -> S_y / f(T, E_y)
+            x_ty, y_ty = arg_types[0], arg_types[1]
+            y_elem = y_ty.element_type
+            y_elem_as_type = y_elem if isinstance(y_elem, Type) else Type(Shape(), y_elem)
+            result_inner = _infer_apply_type(inner_fn, [x_ty, y_elem_as_type], env, inputs)
+            result_elem = _as_element_type(result_inner)
+            if isinstance(result_elem, Type):
+                result_elem = _promote_dynamic_to_jagged(result_elem)
+            return Type(y_ty.iteration_shape, result_elem)
+
+        if adverb == "EachLeft":
+            # EachLeft(f)(x: S_x / E_x, y: T) -> S_x / f(E_x, T)
+            x_ty, y_ty = arg_types[0], arg_types[1]
+            x_elem = x_ty.element_type
+            x_elem_as_type = x_elem if isinstance(x_elem, Type) else Type(Shape(), x_elem)
+            result_inner = _infer_apply_type(inner_fn, [x_elem_as_type, y_ty], env, inputs)
+            result_elem = _as_element_type(result_inner)
+            if isinstance(result_elem, Type):
+                result_elem = _promote_dynamic_to_jagged(result_elem)
+            return Type(x_ty.iteration_shape, result_elem)
+
+        raise TypeError(f"Unknown adverb in type inference: {adverb!r}")
+
+    # Case 3: RefNode -- a let-bound function value.
+    # Look up the original expression node from the program's bindings
+    # and recurse structurally.
+    if isinstance(fn_node, RefNode):
+        # The env maps names -> Types, but we need the original AST node
+        # to do structural inference. We look it up from the enclosing
+        # Program's bindings, which ApplyNode.infer_type passes through
+        # the env via a special key.
+        original_node = env.get(f"__ast__{fn_node.name}")
+        if original_node is not None:
+            return _infer_apply_type(original_node, arg_types, env, inputs)
+        # Fallback: check if the type is a FnType
+        fn_ty = fn_node.infer_type(env, inputs)
+        if isinstance(fn_ty.element_type, FnType):
+            raise TypeError(
+                f"Cannot infer Apply result type for let-bound function {fn_node.name!r} "
+                f"(AST node not found in env for structural inference)"
+            )
+
+    raise TypeError(f"Cannot infer Apply result type for fn node: {type(fn_node).__name__}")
+
+
+# ---------------------------------------------------------------------------
 # Additional scalar primitives
 # ---------------------------------------------------------------------------
 
@@ -676,6 +868,9 @@ class Program:
         for name, node in self.bindings:
             ty = node.infer_type(env, inputs)
             env[name] = ty
+            # Store the AST node so that ApplyNode can do structural
+            # type inference on let-bound function values.
+            env[f"__ast__{name}"] = node
             result[name] = ty
         return result
 

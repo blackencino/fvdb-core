@@ -16,7 +16,9 @@ import numpy as np
 
 from .dsl_ast import (
     AddNode,
+    AdverbApplyNode,
     AndNode,
+    ApplyNode,
     ConstNode,
     CountNode,
     CutNode,
@@ -46,13 +48,14 @@ from .dsl_ast import (
     SortNode,
     SubNode,
     UniqueNode,
+    VerbRefNode,
     WhereNode,
 )
 from .dsl_parse import parse
 from .layouts import MaskedElement
-from .ops import StructValue, Value
+from .ops import FnValue, StructValue, Value, VERBS
 from .ops import morton3d as np_morton3d
-from .types import Dynamic, Jagged, ScalarType, Shape, Static, Type, coord_type
+from .types import Dynamic, FnType, Jagged, ScalarType, Shape, Static, Type, coord_type
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +193,26 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
 
     if isinstance(node, RefNode):
         return env.lookup(node.name)
+
+    # -- Functions as values --
+
+    if isinstance(node, VerbRefNode):
+        fn_val = VERBS[node.name]
+        fn_type = Type(Shape(), FnType(fn_val.arity, node.name))
+        return Value(fn_type, fn_val)
+
+    if isinstance(node, AdverbApplyNode):
+        inner_val = eval_node(node.fn, env)
+        inner_fn = inner_val.data  # FnValue
+        wrapped = _wrap_adverb(node.adverb, inner_fn)
+        fn_type = Type(Shape(), FnType(wrapped.arity, f"{node.adverb}({inner_fn.name})"))
+        return Value(fn_type, wrapped)
+
+    if isinstance(node, ApplyNode):
+        fn_val = eval_node(node.fn, env)
+        fn = fn_val.data  # FnValue
+        arg_vals = [eval_node(a, env) for a in node.args]
+        return fn.apply_fn(*arg_vals)
 
     if isinstance(node, FieldNode):
         struct_val = eval_node(node.expr, env)
@@ -642,7 +665,10 @@ def _gather(target: Value, indexer: Value) -> Value:
 
 
 def _resolve_verb(name: str):
-    """Map a verb name to a binary numpy function."""
+    """Map a verb name to a binary numpy function.
+
+    Legacy helper -- new code should use VERBS registry instead.
+    """
     verbs = {
         "Add": lambda a, b: a + b,
         "Sub": lambda a, b: a - b,
@@ -656,6 +682,181 @@ def _resolve_verb(name: str):
     if name not in verbs:
         raise TypeError(f"Unknown verb: {name!r}")
     return verbs[name]
+
+
+# ---------------------------------------------------------------------------
+# Adverb wrapping -- compose FnValues via leading-shape iteration
+# ---------------------------------------------------------------------------
+
+
+def _extract_elements(val: Value) -> list[Value]:
+    """Extract elements from a value by iterating its leading shape.
+
+    For ndarray data, slices along the first axis (each slice has shape
+    corresponding to remaining axes). For list data, returns elements directly.
+    """
+    data = val.data
+    elem_type = val.type.element_type
+    elem_as_type = elem_type if isinstance(elem_type, Type) else Type(Shape(), elem_type)
+
+    if isinstance(data, np.ndarray):
+        if val.type.rank == 0:
+            return [val]
+        n = data.shape[0]
+        elements = []
+        for i in range(n):
+            slice_data = data[i]
+            if val.type.rank == 1:
+                elements.append(Value(elem_as_type, slice_data))
+            else:
+                remaining_shape = Shape(*val.type.iteration_shape.extents[1:])
+                remaining_type = Type(remaining_shape, elem_type)
+                elements.append(Value(remaining_type, slice_data))
+        return elements
+    elif isinstance(data, list):
+        return data
+    else:
+        return [val]
+
+
+def _wrap_adverb(adverb: str, inner_fn: FnValue) -> FnValue:
+    """Wrap a FnValue with adverb iteration logic, producing a new FnValue.
+
+    The returned FnValue's apply_fn implements the leading-shape iteration
+    rule for the given adverb, delegating to inner_fn for each element.
+    """
+    if adverb == "Over":
+        def over_apply(xs: Value) -> Value:
+            elements = _extract_elements(xs)
+            if not elements:
+                raise TypeError("Over on empty input")
+            acc = elements[0]
+            for e in elements[1:]:
+                acc = inner_fn.apply_fn(acc, e)
+            return acc
+
+        def over_type(xs_ty: Type) -> Type:
+            et = xs_ty.element_type
+            return et if isinstance(et, Type) else Type(Shape(), et)
+
+        return FnValue(1, over_apply, over_type, f"Over({inner_fn.name})")
+
+    if adverb == "Scan":
+        def scan_apply(xs: Value) -> Value:
+            elements = _extract_elements(xs)
+            if not elements:
+                raise TypeError("Scan on empty input")
+            results = [elements[0]]
+            for e in elements[1:]:
+                results.append(inner_fn.apply_fn(results[-1], e))
+            return _collect_adverb_results(xs.type, results)
+
+        def scan_type(xs_ty: Type) -> Type:
+            if xs_ty.rank != 1:
+                raise TypeError(f"Scan requires rank 1, got {xs_ty.rank}")
+            return xs_ty
+
+        return FnValue(1, scan_apply, scan_type, f"Scan({inner_fn.name})")
+
+    if adverb == "Prior":
+        def prior_apply(xs: Value) -> Value:
+            elements = _extract_elements(xs)
+            results = []
+            for i in range(1, len(elements)):
+                results.append(inner_fn.apply_fn(elements[i], elements[i - 1]))
+            lead = xs.type.iteration_shape.extents[0]
+            new_lead = Static(lead.n - 1) if isinstance(lead, Static) else lead
+            return _collect_adverb_results_with_shape(Shape(new_lead), results)
+
+        def prior_type(xs_ty: Type) -> Type:
+            if xs_ty.rank != 1:
+                raise TypeError(f"Prior requires rank 1, got {xs_ty.rank}")
+            lead = xs_ty.iteration_shape.extents[0]
+            new_lead = Static(lead.n - 1) if isinstance(lead, Static) else lead
+            return Type(Shape(new_lead), xs_ty.element_type)
+
+        return FnValue(1, prior_apply, prior_type, f"Prior({inner_fn.name})")
+
+    if adverb == "Each":
+        def each_apply(xs: Value) -> Value:
+            elements = _extract_elements(xs)
+            results = [inner_fn.apply_fn(e) for e in elements]
+            return _collect_adverb_results(xs.type, results)
+
+        def each_type(xs_ty: Type) -> Type:
+            et = xs_ty.element_type
+            et_as_type = et if isinstance(et, Type) else Type(Shape(), et)
+            result_et = inner_fn.type_fn(et_as_type)
+            result_et = _promote_dynamic_to_jagged(result_et)
+            return Type(xs_ty.iteration_shape, result_et)
+
+        return FnValue(1, each_apply, each_type, f"Each({inner_fn.name})")
+
+    if adverb == "EachRight":
+        def each_right_apply(x: Value, y: Value) -> Value:
+            y_elements = _extract_elements(y)
+            results = [inner_fn.apply_fn(x, ye) for ye in y_elements]
+            return _collect_adverb_results(y.type, results)
+
+        def each_right_type(x_ty: Type, y_ty: Type) -> Type:
+            y_et = y_ty.element_type
+            y_et_as_type = y_et if isinstance(y_et, Type) else Type(Shape(), y_et)
+            result_et = inner_fn.type_fn(x_ty, y_et_as_type)
+            result_et = _promote_dynamic_to_jagged(result_et)
+            return Type(y_ty.iteration_shape, result_et)
+
+        return FnValue(2, each_right_apply, each_right_type, f"EachRight({inner_fn.name})")
+
+    if adverb == "EachLeft":
+        def each_left_apply(x: Value, y: Value) -> Value:
+            x_elements = _extract_elements(x)
+            results = [inner_fn.apply_fn(xe, y) for xe in x_elements]
+            return _collect_adverb_results(x.type, results)
+
+        def each_left_type(x_ty: Type, y_ty: Type) -> Type:
+            x_et = x_ty.element_type
+            x_et_as_type = x_et if isinstance(x_et, Type) else Type(Shape(), x_et)
+            result_et = inner_fn.type_fn(x_et_as_type, y_ty)
+            result_et = _promote_dynamic_to_jagged(result_et)
+            return Type(x_ty.iteration_shape, result_et)
+
+        return FnValue(2, each_left_apply, each_left_type, f"EachLeft({inner_fn.name})")
+
+    raise TypeError(f"Unknown adverb: {adverb!r}")
+
+
+def _collect_adverb_results(input_type: Type, results: list[Value]) -> Value:
+    """Collect adverb iteration results under the input's leading shape."""
+    if not results:
+        raise TypeError("Empty result list in adverb")
+    outer_extent = input_type.iteration_shape.extents[0] if input_type.rank > 0 else Static(len(results))
+    return _collect_adverb_results_with_shape(Shape(outer_extent), results)
+
+
+def _collect_adverb_results_with_shape(outer_shape: Shape, results: list[Value]) -> Value:
+    """Collect results under a given outer shape."""
+    if not results:
+        raise TypeError("Empty result list in adverb")
+
+    first_type = results[0].type
+    inner_type = _promote_dynamic_to_jagged(first_type) if isinstance(first_type, Type) else first_type
+
+    all_ndarray = all(isinstance(r.data, np.ndarray) for r in results)
+    all_same_shape = all_ndarray and all(r.data.shape == results[0].data.shape for r in results[1:])
+
+    if all_same_shape and all_ndarray:
+        stacked = np.stack([r.data for r in results])
+        result_type = Type(outer_shape, inner_type)
+        return Value(result_type, stacked)
+
+    all_scalar = all(isinstance(r.data, (np.bool_, np.integer, np.floating)) for r in results)
+    if all_scalar:
+        stacked = np.array([r.data for r in results])
+        result_type = Type(outer_shape, inner_type)
+        return Value(result_type, stacked)
+
+    result_type = Type(outer_shape, inner_type)
+    return Value(result_type, results)
 
 
 def _sort_leading_axis(data: np.ndarray) -> np.ndarray:

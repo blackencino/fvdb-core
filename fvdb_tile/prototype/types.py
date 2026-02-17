@@ -147,8 +147,31 @@ class ScalarType(enum.Enum):
 # Type  (iteration_shape, element_type)
 # ---------------------------------------------------------------------------
 
-# Element type is either a ScalarType (leaf) or another Type (nested iterable).
-ElementType = Union[ScalarType, "Type"]
+# ---------------------------------------------------------------------------
+# Function type (for first-class function values)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class FnType:
+    """Type of a function value (verb or composed adverb).
+
+    Carried in a Type with rank-0 leading shape: () / FnType(...).
+    FnType is polymorphic -- it does not carry input/output type signatures.
+    The output type is determined at application time from the concrete
+    input types, via the FnValue's type_fn callable.
+    """
+
+    arity: int  # 1 (monadic) or 2 (dyadic)
+    name: str = ""  # for debugging/display
+
+    def __repr__(self) -> str:
+        label = self.name or "fn"
+        return f"Fn({label}/{self.arity})"
+
+
+# Element type is a ScalarType (leaf), another Type (nested iterable),
+# or a FnType (first-class function value).
+ElementType = Union[ScalarType, "Type", FnType]
 
 
 @dataclass(frozen=True)

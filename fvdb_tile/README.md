@@ -190,6 +190,136 @@ template<>              struct Resolve<Jag, Jag>   { using type = Jag; };
 
 ---
 
+## Leading Shape Theory
+
+K's core abstraction is **leading-axis theory**: every value is a list,
+operations apply along the leading (outermost) axis, and nesting gives you
+depth. To go deeper, you compose adverbs (`f'` = each, `f''` = each-each).
+
+Our system generalises this to **leading-shape theory**: every value has a
+**leading shape** (potentially multi-rank), operations apply over the full
+leading shape, and nesting gives you depth. The leading shape can be `(8,8,8)`
+or `(*)` or `(5,6,7)` -- not just a single-axis list. This is the
+generalisation that makes "nested layouts" more than "nested lists."
+
+### Types as recursive nesting
+
+A type is a recursive nesting terminated by a scalar:
+
+```
+S_1 / S_2 / ... / S_n / scalar
+```
+
+Each `/` is a **nesting boundary**. `S_1` is the **leading shape**.
+Everything after the first `/` is the **inner type**. The inner type itself
+has the same structure -- its own leading shape, its own inner type. This
+recurses until a scalar leaf.
+
+The `Type` dataclass already represents this:
+
+```python
+Type(Shape(5,6,7), Type(Shape(3,4), ScalarType.I32))
+# is:  (5, 6, 7) / (3, 4) / i32
+```
+
+### Why this matters (it is not cosmetic)
+
+**The nesting structure is a property of the value, not of the operation.**
+When you `cut` a `(30,) / i32` into `(5,) / (6,) / i32`, you haven't
+changed the data -- you've changed what operations see as "one element."
+The layout IS the schedule, and the schedule lives in the data's type.
+
+This is the Halide analogy made precise. The same data under different
+nesting structures produces different iteration patterns. The algorithm
+(what to compute) is separate from the schedule (how to iterate).
+
+### The leading shape rule
+
+Every operation has one rule: **it operates on the leading shape.** The
+inner type is what the operation receives as "elements."
+
+| Operation | Input type | Output type | Rule |
+|-----------|-----------|-------------|------|
+| Over(f) | `S / E` | `E` | Consume leading shape (fold) |
+| Each(f) | `S / E` | `S / f(E)` | Preserve leading shape |
+| Where | `S / bool` | `(*,) / (rank(S),) i32` | Consume leading shape |
+| Gather | `S_t / E`, `S_i / coord` | `S_i / E` | Indexer's shape replaces target's |
+
+No `axis` parameter. To operate on a specific axis, `cut` first to make
+it the leading shape. To go deeper, compose adverbs.
+
+### Functions as values, adverbs as function transformers
+
+A **verb** (Add, Sub, Mul, ...) is a function value. An **adverb** (Over,
+EachRight, EachLeft, ...) takes a function and returns a **new function**
+with different iteration behaviour. Application is always separate:
+
+```
+EachLeft(f)          -- adverb applied to f, produces a new function g
+g(x, y)              -- g applied to data
+EachLeft(f)(x, y)    -- equivalent: two steps in one expression
+```
+
+This separation is essential for composition:
+
+```
+EachRight(EachLeft(f))   -- a function, not an application
+Apply(EachRight(EachLeft(f)), x, y)   -- applying that function
+```
+
+### Adverb type rules for dyadic functions
+
+Given a dyadic verb `f`:
+
+- **EachRight(f)(x, y)**: x is passed whole, y is iterated over its
+  leading shape. Result type: `S_y / f(T_x, E_y)` where `T_x` is x's
+  full type and `E_y` is y's inner type.
+
+- **EachLeft(f)(x, y)**: x is iterated over its leading shape, y is
+  passed whole. Result type: `S_x / f(E_x, T_y)` where `E_x` is x's
+  inner type and `T_y` is y's full type.
+
+### Nesting composes
+
+```
+EachRight(EachLeft(f))(x: S_x / A, y: S_y / B)
+  = S_y / EachLeft(f)(S_x / A, B)     -- EachRight iterates y
+  = S_y / (S_x / f(A, B))             -- EachLeft iterates x
+
+EachLeft(EachRight(f))(x: S_x / A, y: S_y / B)
+  = S_x / EachRight(f)(A, S_y / B)    -- EachLeft iterates x
+  = S_x / (S_y / f(A, B))             -- EachRight iterates y
+```
+
+Concrete example with `x: (3, 4) / A` and `y: (5, 6, 7) / B`:
+
+- `EachRight(EachLeft(f))(x, y)` produces `(5, 6, 7) / (3, 4) / f(A, B)`
+- `EachLeft(EachRight(f))(x, y)` produces `(3, 4) / (5, 6, 7) / f(A, B)`
+
+The adverb nesting order determines the result's nesting order. This
+replaces broadcasting: instead of implicit shape-matching rules, the
+programmer explicitly controls iteration with adverb composition.
+
+### Jaggedness propagation
+
+When an adverb applies a function independently per element (Each,
+EachRight, EachLeft), any Dynamic extent in the result's leading shape
+becomes Jagged -- each element could produce a different size. Static
+extents are preserved (guaranteed uniform). This is the same rule already
+used by Each, extended to all iteration adverbs.
+
+### Relationship to K
+
+| | K | Our system |
+|---|---|---|
+| **Structure** | Leading axis (rank 1) / rest | Leading shape (any rank) / rest |
+| **Depth control** | Implicit nesting of lists | Explicit `cut`, `reshape` |
+| **Adverbs** | `f'` = each, `f/:` = each-right | `Each(f)`, `EachRight(f)` |
+| **Composition** | `f/:\:` = each-right(each-left) | `EachRight(EachLeft(f))` |
+| **Broadcasting** | Atomic extension | None -- use adverb composition |
+
+---
+
 ## Notation Convention
 
 **lowercase = free.  PascalCase = work.**
@@ -288,35 +418,41 @@ group?", `masked` handles "which positions in a fixed block have data?"
 
 ## Operations (PascalCase)
 
-Operations do computational work. All use PascalCase. Higher-order functions
-(K-derived) modify how a verb is applied across an iteration space.
+Operations do computational work. All use PascalCase.
 
-**Key rule: higher-order functions operate over the full iteration space.**
-No `axis` parameter. The layout IS the axis specification. To reduce along a
-specific axis, `cut` first to isolate it as the iteration space.
+**Key rule: operations operate on the leading shape.** No `axis` parameter.
+The layout IS the axis specification. To reduce along a specific axis,
+`cut` first to move it into the leading shape. See "Leading Shape Theory"
+above.
 
-### Higher-Order Functions (K-derived)
+### Adverbs (function transformers)
 
-**Parallel** (order-independent, any rank):
+Adverbs take a verb (function value) and return a new function. Application
+is a separate step. `Over(Add, xs)` is syntactic sugar for
+`Apply(Over(Add), xs)` -- the adverb produces a function, then Apply
+consumes data.
 
-| Function | Syntax | Input | Output |
-|----------|--------|-------|--------|
-| Over | `Over(f, xs)` | `S over E` | `E` (full reduction) |
-| Each | `Each(xs, x => body)` | `S over E` | `S over R` |
-| EachRight | `EachRight(f, x, ys)` | fixed x, iterate ys | `S_ys over R` |
-| EachLeft | `EachLeft(f, xs, y)` | iterate xs, fixed y | `S_xs over R` |
+**Parallel** (order-independent, any leading shape rank):
 
-**Sequential** (require rank 1, inherently ordered):
+| Adverb | Produces | Type rule |
+|--------|----------|-----------|
+| `Over(f)` | monadic | `S / E` -> `E` (consume leading shape) |
+| `Each(f)` | monadic | `S / E` -> `S / f(E)` (preserve leading shape) |
+| `EachRight(f)` | dyadic | `(T, S / E)` -> `S / f(T, E)` (x whole, iterate y) |
+| `EachLeft(f)` | dyadic | `(S / E, T)` -> `S / f(E, T)` (iterate x, y whole) |
 
-| Function | Syntax | Input | Output |
-|----------|--------|-------|--------|
-| Scan | `Scan(f, xs)` | `(D,) over E` | `(D,) over E` (running accumulation) |
-| Prior | `Prior(f, xs)` | `(D,) over E` | `(D-1,) over R` (adjacent pairs) |
+**Sequential** (require rank-1 leading shape):
 
-**Each promotes Dynamic to Jagged**: the body runs independently per element,
-so any `*` in the result becomes `~`. Static extents are preserved.
+| Adverb | Produces | Type rule |
+|--------|----------|-----------|
+| `Scan(f)` | monadic | `(D,) / E` -> `(D,) / E` (running accumulation) |
+| `Prior(f)` | monadic | `(D,) / E` -> `(D-1,) / E` (adjacent pairs) |
 
-**Over reduces the full iteration space** to one element. For commutative +
+**Jaggedness**: Each, EachRight, EachLeft promote Dynamic to Jagged in the
+result's inner type (each element could independently produce a different
+size). Static extents are preserved.
+
+**Over reduces the full leading shape** to one element. For commutative +
 associative operations (Add, Mul, Min, Max), this is well-defined regardless
 of rank and maps to GPU parallel tree reduction. For non-commutative ops,
 require rank 1.
@@ -344,10 +480,12 @@ Example: face centroids = `Each(faces, f => Div(Over(Add, verts_of_f), Const(3))
 | Name | Convention | Kind | New data? |
 |------|-----------|------|-----------|
 | `cut`, `indexed`, `tuple`, `struct`, `flip`, `jagged`, `reshape`, `field`, `masked` | lowercase | Layout (free) | No |
-| `Map`, `Each`, `Over`, `Scan`, `EachRight`, `EachLeft`, `Prior` | PascalCase | Higher-order function | Yes |
+| `Over`, `Scan`, `EachRight`, `EachLeft`, `Prior` | PascalCase | Adverb (function -> function) | Deferred |
+| `Each`, `Map` | PascalCase | Iteration (with lambda body) | Yes |
+| `Apply` | PascalCase | Function application | Yes |
 | `Where` | PascalCase | Operation | Yes (data-dependent) |
 | `Gather` | PascalCase | Operation | Yes (materialise) |
-| `Add`, `Sub`, `Mul`, `Div`, `GE`, `And`, `Not`, `InBounds`, `Count` | PascalCase | Scalar function | Yes |
+| `Add`, `Sub`, `Mul`, `Div`, `GE`, `And`, `Not`, `InBounds`, `Count` | PascalCase | Verb (function value) | Yes |
 | `Decompose`, `Morton3d` | PascalCase | Domain function | Yes |
 | `Input`, `Const` | PascalCase | Connector | Introduces data |
 

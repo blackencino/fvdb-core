@@ -289,3 +289,63 @@ by the executor.
 Five tests in `test_conv_grid.py`: correctness vs numpy reference,
 stride semantics, input immutability, torch tensor input, larger scale
 (500 unique active coords -> expanded and deduped).
+
+---
+
+## Leading Shape Theory + Functions as Values
+
+### Conceptual reframe
+
+Renamed the core abstraction from "iteration space + element type" to
+**leading shape theory**: a generalisation of K's leading-axis theory to
+multi-rank shapes.  A type is a recursive nesting `S_1 / S_2 / ... / scalar`
+where `S_1` is the leading shape.  Operations always operate on the leading
+shape.  The nesting structure is a property of the value, not the operation.
+`cut` deepens nesting, `reshape` reorganises within a level.
+
+This is not cosmetic.  The nesting boundary determines what operations see
+as "one element."  The layout IS the schedule, and the schedule lives in
+the data's type.
+
+### Functions as values
+
+Verbs (Add, Sub, Mul, etc.) are first-class `FnValue` objects with both
+`apply_fn` (numpy execution) and `type_fn` (type inference without data).
+`FnType` added to the type system `ElementType` union.  `VERBS` registry
+in `ops.py` holds all built-in verb FnValues.
+
+### Adverbs as function transformers
+
+Adverbs (Over, EachRight, EachLeft, Scan, Prior) take a function and
+return a **new** function.  Application is always separate:
+`EachLeft(Add)(x, y)` is two steps -- produce a function, then apply it.
+
+Three new AST nodes:
+- `VerbRefNode(name)`: reference to a built-in verb as a function value.
+- `AdverbApplyNode(adverb, fn)`: apply an adverb to a function, producing
+  a new function.
+- `ApplyNode(fn, args)`: apply a function value to data arguments.
+
+The parser desugars `Over(Add, xs)` into
+`ApplyNode(AdverbApplyNode("Over", VerbRefNode("Add")), [xs])`.
+
+### Nested adverb composition
+
+`EachRight(EachLeft(f))` is a nested `AdverbApplyNode`.  The type rules
+compose structurally:
+
+```
+EachRight(EachLeft(f))(x: S_x / A, y: S_y / B) = S_y / (S_x / f(A, B))
+EachLeft(EachRight(f))(x: S_x / A, y: S_y / B) = S_x / (S_y / f(A, B))
+```
+
+This replaces broadcasting: the programmer explicitly controls iteration
+with adverb composition.
+
+### Tests
+
+Eight tests in `test_adverbs.py`: Over(Add) via new path, basic
+EachRight/EachLeft, outer product via nested adverbs (both nesting
+orders), type inference for multi-rank leading shapes, let-bound composed
+functions, and backward compatibility with the mesh centroid program.
+All 30 existing tests continue to pass.

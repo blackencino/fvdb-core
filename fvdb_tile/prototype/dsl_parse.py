@@ -24,15 +24,15 @@ from typing import Any
 
 from .dsl_ast import (
     AddNode,
+    AdverbApplyNode,
     AndNode,
+    ApplyNode,
     ConstNode,
     CountNode,
     CutNode,
     DecomposeNode,
     DivNode,
-    EachLeftNode,
     EachNode,
-    EachRightNode,
     FieldNode,
     FindNode,
     GatherNode,
@@ -45,16 +45,15 @@ from .dsl_ast import (
     MulNode,
     Node,
     NotNode,
-    OverNode,
-    PriorNode,
     Program,
     RefNode,
     ReshapeNode,
-    ScanNode,
     SortNode,
     SubNode,
     UniqueNode,
+    VerbRefNode,
     WhereNode,
+    _ADVERB_NAMES,
 )
 from .types import ScalarType
 
@@ -110,7 +109,16 @@ _BUILTINS = {
     "Find",
     "Input",
     "Const",
+    "Apply",
 }
+
+# Names that are adverbs (function -> function transformers).
+# When called with just a function arg, they produce AdverbApplyNode.
+# When called with function + data args, they produce ApplyNode(AdverbApplyNode(...), data).
+_PARSER_ADVERBS = {"Over", "Scan", "EachRight", "EachLeft", "Prior"}
+
+# Names that are verbs (function values) when used as bare names.
+_VERB_NAMES = {"Add", "Sub", "Mul", "Div", "GE", "And", "Not", "Min", "Max", "Or"}
 
 # Layouts (lowercase) -- zero-cost type reinterpretation, no data movement.
 _LAYOUTS = {
@@ -307,6 +315,12 @@ class Parser:
                 return arg[1], arg[2]
             raise SyntaxError(f"Expected binding (name => expr), got expression in {name}")
 
+        def _to_verb_ref(node):
+            """Convert a bare RefNode for a known verb name to VerbRefNode."""
+            if isinstance(node, RefNode) and node.name in _VERB_NAMES:
+                return VerbRefNode(node.name)
+            return node
+
         if name == "Input":
             label = _expr(args[0])
             if isinstance(label, ConstNode) and isinstance(label.value, str):
@@ -396,38 +410,27 @@ class Parser:
         if name == "masked":
             return MaskedNode(_expr(args[0]), _expr(args[1]))
 
-        # -- Adverbs --
+        # -- Adverbs: function -> function transformers --
+        # Adverbs always produce AdverbApplyNode. If data args follow,
+        # they're wrapped in ApplyNode.  This makes the two-step nature
+        # explicit: EachLeft(Add)(x, y) = Apply(EachLeft(Add), x, y).
 
-        if name == "Over":
-            # Over(VerbName, xs) -- VerbName is a bare name, not a call
-            verb_arg = _expr(args[0])
-            if isinstance(verb_arg, RefNode):
-                verb_name = verb_arg.name
-            elif isinstance(verb_arg, ConstNode) and isinstance(verb_arg.value, str):
-                verb_name = verb_arg.value
-            else:
-                raise SyntaxError(f"Over expects a verb name, got {verb_arg}")
-            return OverNode(verb_name, _expr(args[1]))
+        if name in _PARSER_ADVERBS:
+            fn_arg = _expr(args[0])
+            fn_node = _to_verb_ref(fn_arg)
+            adverb_node = AdverbApplyNode(name, fn_node)
+            data_args = [_expr(a) for a in args[1:]]
+            if data_args:
+                return ApplyNode(adverb_node, tuple(data_args))
+            return adverb_node
 
-        if name == "Scan":
-            verb_arg = _expr(args[0])
-            verb_name = verb_arg.name if isinstance(verb_arg, RefNode) else str(verb_arg)
-            return ScanNode(verb_name, _expr(args[1]))
+        # -- Apply: explicit function application --
 
-        if name == "EachRight":
-            verb_arg = _expr(args[0])
-            verb_name = verb_arg.name if isinstance(verb_arg, RefNode) else str(verb_arg)
-            return EachRightNode(verb_name, _expr(args[1]), _expr(args[2]))
-
-        if name == "EachLeft":
-            verb_arg = _expr(args[0])
-            verb_name = verb_arg.name if isinstance(verb_arg, RefNode) else str(verb_arg)
-            return EachLeftNode(verb_name, _expr(args[1]), _expr(args[2]))
-
-        if name == "Prior":
-            verb_arg = _expr(args[0])
-            verb_name = verb_arg.name if isinstance(verb_arg, RefNode) else str(verb_arg)
-            return PriorNode(verb_name, _expr(args[1]))
+        if name == "Apply":
+            fn_arg = _expr(args[0])
+            fn_node = _to_verb_ref(fn_arg) if isinstance(fn_arg, RefNode) and fn_arg.name in _VERB_NAMES else fn_arg
+            data_args = tuple(_expr(a) for a in args[1:])
+            return ApplyNode(fn_node, data_args)
 
         # -- Scalar primitives --
 

@@ -21,6 +21,7 @@ from .types import (
     Dynamic,
     ElementType,
     Extent,
+    FnType,
     Jagged,
     ScalarType,
     Shape,
@@ -87,6 +88,87 @@ def _numpy_dtype_to_stype(dtype: np.dtype) -> ScalarType:
         if dtype == np.dtype(np_dt):
             return st
     raise TypeError(f"No ScalarType for numpy dtype {dtype}")
+
+
+# ---------------------------------------------------------------------------
+# FnValue -- first-class function values
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FnValue:
+    """Runtime representation of a function (verb or composed adverb).
+
+    A FnValue carries:
+      - arity: 1 (monadic) or 2 (dyadic)
+      - apply_fn: callable that takes Value args and returns a Value
+      - type_fn: callable that takes Type args and returns a Type
+                 (for type inference without data)
+      - name: for debugging and display
+    """
+
+    arity: int
+    apply_fn: Callable  # (Value, ...) -> Value
+    type_fn: Callable  # (Type, ...) -> Type
+    name: str = ""
+
+    def __repr__(self) -> str:
+        return f"FnValue({self.name}/{self.arity})"
+
+
+def _verb_apply_add(a: Value, b: Value) -> Value:
+    return Value(a.type, (a.data + b.data).astype(a.data.dtype))
+
+def _verb_apply_sub(a: Value, b: Value) -> Value:
+    return Value(a.type, (a.data - b.data).astype(a.data.dtype))
+
+def _verb_apply_mul(a: Value, b: Value) -> Value:
+    return Value(a.type, (a.data * b.data).astype(a.data.dtype))
+
+def _verb_apply_div(a: Value, b: Value) -> Value:
+    b_data = b.data if isinstance(b.data, np.ndarray) else float(b.data)
+    result = (a.data / b_data).astype(np.float32)
+    if a.type.rank == 0:
+        return Value(Type(Shape(), ScalarType.F32), result)
+    return Value(Type(a.type.iteration_shape, ScalarType.F32), result)
+
+def _verb_apply_min(a: Value, b: Value) -> Value:
+    return Value(a.type, np.minimum(a.data, b.data))
+
+def _verb_apply_max(a: Value, b: Value) -> Value:
+    return Value(a.type, np.maximum(a.data, b.data))
+
+def _verb_apply_and(a: Value, b: Value) -> Value:
+    return Value(a.type, a.data & b.data)
+
+def _verb_apply_or(a: Value, b: Value) -> Value:
+    return Value(a.type, a.data | b.data)
+
+
+def _verb_type_preserving(ta: Type, tb: Type) -> Type:
+    """Type rule for verbs that preserve the left argument's type (Add, Sub, Mul, etc.)."""
+    return ta
+
+def _verb_type_div(ta: Type, tb: Type) -> Type:
+    """Type rule for Div: produces f32."""
+    if ta.rank == 0:
+        return Type(Shape(), ScalarType.F32)
+    return Type(ta.iteration_shape, ScalarType.F32)
+
+def _verb_type_bool(ta: Type, tb: Type) -> Type:
+    """Type rule for comparison verbs: preserves shape, produces bool."""
+    return Type(ta.iteration_shape, ScalarType.BOOL) if ta.rank > 0 else Type(Shape(), ScalarType.BOOL)
+
+
+VERBS: dict[str, FnValue] = {
+    "Add": FnValue(2, _verb_apply_add, _verb_type_preserving, "Add"),
+    "Sub": FnValue(2, _verb_apply_sub, _verb_type_preserving, "Sub"),
+    "Mul": FnValue(2, _verb_apply_mul, _verb_type_preserving, "Mul"),
+    "Div": FnValue(2, _verb_apply_div, _verb_type_div, "Div"),
+    "Min": FnValue(2, _verb_apply_min, _verb_type_preserving, "Min"),
+    "Max": FnValue(2, _verb_apply_max, _verb_type_preserving, "Max"),
+    "And": FnValue(2, _verb_apply_and, _verb_type_preserving, "And"),
+    "Or":  FnValue(2, _verb_apply_or,  _verb_type_preserving, "Or"),
+}
 
 
 # ---------------------------------------------------------------------------
