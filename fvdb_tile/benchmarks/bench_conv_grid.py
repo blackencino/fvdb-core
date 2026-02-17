@@ -3,13 +3,9 @@
 """
 Benchmark: fvdb_tile conv_grid vs fVDB GridBatch.conv_grid().
 
-Compares the adverb-based DSL pipeline (EachLeft(EachRight(EachBoth(Add)))
-+ fuse + reshape + Morton3dSigned + Sort + Unique + MortonDecode3d) against
+Compares the expand+dedup pipeline (broadcast-add, sort, unique) against
 fVDB's compiled C++/CUDA implementation at multiple scales, kernel sizes,
 and strides.
-
-The fvdb_tile path currently runs through the Python evaluator (not cuTile
-compiled).  This benchmark establishes the baseline for future GPU codegen.
 
 Run:  source ~/.venvs/fvdb_cutile/bin/activate && python fvdb_tile/benchmarks/bench_conv_grid.py
 """
@@ -31,6 +27,8 @@ try:
 except (ImportError, RuntimeError):
     HAS_FVDB = False
     print("WARNING: fvdb or CUDA not available -- fVDB measurements will be skipped.\n")
+
+HAS_CUDA = torch.cuda.is_available()
 
 
 # ---------------------------------------------------------------------------
@@ -133,18 +131,33 @@ def bench_one(
         "kernel_volume": kernel_volume,
     }
 
-    # --- fvdb_tile path ---
-    # Run once to get result + verify
+    # --- fvdb_tile CPU path ---
     tile_result = conv_grid(active_t, kernel_size=kernel_size, stride=stride, device="cpu")
     results["dst_voxels"] = tile_result.shape[0]
 
-    # Time tile path
-    t_tile = _time_cpu_fn(
+    t_tile_cpu = _time_cpu_fn(
         lambda: conv_grid(active_t, kernel_size=kernel_size, stride=stride, device="cpu"),
-        warmup=0,
-        repeats=3,
+        warmup=1,
+        repeats=5,
     )
-    results["tile_us"] = t_tile
+    results["tile_cpu_us"] = t_tile_cpu
+
+    # --- fvdb_tile GPU path (torch ops on CUDA) ---
+    if HAS_CUDA:
+        tile_result_gpu = conv_grid(active_t, kernel_size=kernel_size, stride=stride, device="cuda")
+        tile_result_gpu_cpu = tile_result_gpu.cpu()
+
+        gpu_cpu_ok = _assert_same_coord_set(
+            tile_result_gpu_cpu, tile_result, f"GPU vs CPU n={n_voxels} k={kernel_size} s={stride}"
+        )
+        results["gpu_cpu_agreement"] = gpu_cpu_ok
+
+        t_tile_gpu = _time_fn(
+            lambda: conv_grid(active_t, kernel_size=kernel_size, stride=stride, device="cuda"),
+            warmup=3,
+            repeats=20,
+        )
+        results["tile_gpu_us"] = t_tile_gpu
 
     # --- fVDB path ---
     if HAS_FVDB:
@@ -153,15 +166,12 @@ def bench_one(
         ijks = JaggedTensor(coords_t)
         grid = GridBatch.from_ijk(ijks, device=dev)
 
-        # Run once to get result
         dst_grid = grid.conv_grid(kernel_size=kernel_size, stride=stride)
         fvdb_coords = dst_grid.ijk.jdata.cpu().to(torch.int32)
 
-        # Verify agreement
         ok = _assert_same_coord_set(tile_result, fvdb_coords, f"n={n_voxels} k={kernel_size} s={stride}")
         results["agreement"] = ok
 
-        # Time (end-to-end: from_ijk + conv_grid)
         def fvdb_fn():
             g = GridBatch.from_ijk(JaggedTensor(coords_t), device=dev)
             _ = g.conv_grid(kernel_size=kernel_size, stride=stride)
@@ -169,7 +179,6 @@ def bench_one(
         t_fvdb = _time_fn(fvdb_fn, warmup=3, repeats=20)
         results["fvdb_us"] = t_fvdb
 
-        # Also time just the conv_grid call (grid already built)
         def fvdb_conv_only():
             _ = grid.conv_grid(kernel_size=kernel_size, stride=stride)
 
@@ -185,12 +194,12 @@ def bench_one(
 
 
 def main():
-    print("=" * 90)
-    print("conv_grid Benchmark: fvdb_tile (DSL pipeline) vs fVDB (C++/CUDA)")
-    print("=" * 90)
+    print("=" * 100)
+    print("conv_grid Benchmark: fvdb_tile (expand+dedup pipeline) vs fVDB (C++/CUDA)")
+    print("=" * 100)
 
     configs = []
-    sizes = [1_000, 10_000]
+    sizes = [1_000, 10_000, 100_000]
     kernels = [(3, 3, 3)]
     strides = [(1, 1, 1), (2, 2, 2)]
 
@@ -204,30 +213,32 @@ def main():
         print(f"\n--- {n:>7,} voxels, kernel={ks}, stride={st} ---")
         r = bench_one(n, ks, st)
 
-        status = ""
         if HAS_FVDB:
             status = "OK" if r.get("agreement", False) else "MISMATCH"
-            print(f"  Agreement: {status}")
-        print(f"  dst_voxels: {r['dst_voxels']:,}")
-        print(f"  tile (evaluator): {r['tile_us']:>12,.0f} us")
+            print(f"  fVDB agreement: {status}")
+        if HAS_CUDA:
+            gpu_status = "OK" if r.get("gpu_cpu_agreement", False) else "MISMATCH"
+            print(f"  GPU/CPU agreement: {gpu_status}")
+        print(f"  dst_voxels:  {r['dst_voxels']:>10,}")
+        print(f"  tile CPU:    {r['tile_cpu_us']:>10,.0f} us")
+        if HAS_CUDA:
+            print(f"  tile GPU:    {r['tile_gpu_us']:>10,.0f} us")
         if HAS_FVDB:
-            print(f"  fVDB (build+conv): {r['fvdb_us']:>10,.0f} us")
-            print(f"  fVDB (conv only):  {r['fvdb_conv_us']:>10,.0f} us")
+            print(f"  fVDB e2e:    {r['fvdb_us']:>10,.0f} us")
+            print(f"  fVDB conv:   {r['fvdb_conv_us']:>10,.0f} us")
 
         all_results.append(r)
 
     # --- Summary table ---
-    print("\n\n" + "=" * 100)
+    print("\n\n" + "=" * 120)
     print("Summary")
-    print("=" * 100)
+    print("=" * 120)
 
-    hdr = (
-        f"  {'Voxels':>8}  {'Kernel':>9}  {'Stride':>9}"
-        f"  {'dst_vox':>9}"
-        f"  {'tile (us)':>12}"
-    )
+    hdr = f"  {'Voxels':>8}  {'Kernel':>9}  {'Stride':>9}  {'dst_vox':>9}  {'tile CPU':>12}"
+    if HAS_CUDA:
+        hdr += f"  {'tile GPU':>12}"
     if HAS_FVDB:
-        hdr += f"  {'fVDB e2e':>12}  {'fVDB conv':>12}  {'tile/conv':>10}"
+        hdr += f"  {'fVDB e2e':>12}  {'fVDB conv':>12}  {'GPU/conv':>10}"
     print(hdr)
     print(f"  {'-' * (len(hdr) - 2)}")
 
@@ -239,10 +250,13 @@ def main():
             f"  {ks_str:>9}"
             f"  {st_str:>9}"
             f"  {r['dst_voxels']:>9,}"
-            f"  {r['tile_us']:>12,.0f}"
+            f"  {r['tile_cpu_us']:>12,.0f}"
         )
+        if HAS_CUDA:
+            line += f"  {r['tile_gpu_us']:>12,.0f}"
         if HAS_FVDB:
-            ratio = r["tile_us"] / r["fvdb_conv_us"] if r.get("fvdb_conv_us") else 0
+            gpu_us = r.get("tile_gpu_us", r["tile_cpu_us"])
+            ratio = gpu_us / r["fvdb_conv_us"] if r.get("fvdb_conv_us") else 0
             line += (
                 f"  {r['fvdb_us']:>12,.0f}"
                 f"  {r['fvdb_conv_us']:>12,.0f}"
@@ -250,10 +264,12 @@ def main():
             )
         print(line)
 
+    print()
+    if HAS_CUDA:
+        print("  tile GPU = fvdb_tile conv_grid with device='cuda' (torch ops on GPU).")
     if HAS_FVDB:
-        print(f"\n  tile/conv = ratio of fvdb_tile evaluator time to fVDB conv_grid-only time.")
-        print(f"  fVDB e2e = fVDB from_ijk + conv_grid (includes grid construction).")
-        print(f"  tile includes expansion + morton encode + sort + unique + decode (Python evaluator).")
+        print("  GPU/conv = ratio of tile GPU time to fVDB conv_grid-only time.")
+        print("  fVDB e2e = fVDB from_ijk + conv_grid (includes grid construction).")
         all_ok = all(r.get("agreement", False) for r in all_results)
         print(f"\n  All results agree: {'YES' if all_ok else 'NO -- CHECK MISMATCHES'}")
 

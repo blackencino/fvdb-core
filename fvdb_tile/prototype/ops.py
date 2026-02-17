@@ -587,6 +587,96 @@ def hierarchical_key(coord: torch.Tensor, bit_widths: list[int]) -> torch.Tensor
     return key[0] if single else key
 
 
+# ---------------------------------------------------------------------------
+# Coordinate primitives for topology operations
+# ---------------------------------------------------------------------------
+
+
+def expand_offsets(coords: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+    """Broadcast-add coordinates with offsets and flatten.
+
+    This is the leading-shape equivalent of::
+
+        fuse(EachLeft(EachRight(EachBoth(Add)), coords, offsets))
+
+    For each coordinate in ``coords`` and each offset in ``offsets``,
+    produce ``coord + offset``, then flatten the (N, K, 3) result into
+    (N*K, 3).
+
+    Args:
+        coords: (N, 3) i32 active coordinates.
+        offsets: (K, 3) i32 kernel offsets.
+
+    Returns:
+        (N*K, 3) i32 expanded coordinates.
+    """
+    return (coords.unsqueeze(1) + offsets.unsqueeze(0)).reshape(-1, 3)
+
+
+def stride_filter(coords: torch.Tensor, stride: tuple[int, int, int]) -> torch.Tensor:
+    """Filter coordinates by stride divisibility and divide.
+
+    Keeps only coordinates where all components are divisible by the
+    corresponding stride component, then integer-divides.  For stride
+    ``(1, 1, 1)`` this is a no-op (returns input unchanged).
+
+    In DSL terms::
+
+        divisible = Map(coords, c => All(Eq(Mod(c, stride), 0)))
+        filtered  = Gather(coords, Where(divisible))
+        result    = Map(filtered, c => FloorDiv(c, stride))
+
+    Args:
+        coords: (N, 3) i32 coordinates.
+        stride: (sx, sy, sz) stride values (all positive).
+
+    Returns:
+        (M, 3) i32 filtered and divided coordinates.
+    """
+    if stride == (1, 1, 1):
+        return coords
+    dev = coords.device
+    stride_t = torch.tensor(stride, dtype=torch.int32, device=dev)
+    divisible = (coords % stride_t == 0).all(dim=1)
+    result = coords[divisible]
+    if result.shape[0] == 0:
+        return torch.empty((0, 3), dtype=torch.int32, device=dev)
+    return result // stride_t
+
+
+def dedup_coords(coords: torch.Tensor, bit_widths: list[int]) -> torch.Tensor:
+    """Deduplicate (N, 3) i32 coords via hierarchical key sort + unique.
+
+    Computes a hierarchical sort key for each coordinate, sorts, removes
+    duplicates, and returns unique coordinates in CIG-compatible
+    tree-traversal order.
+
+    This is the key deduplication primitive for topology operations
+    (conv_grid, dilated_grid, etc.).  It composes::
+
+        keys    = HierarchicalKey(coords, bit_widths)
+        sorted  = Sort(keys)
+        unique  = Unique(sorted)
+        result  = HierarchicalKeyDecode(unique, bit_widths)
+
+    Args:
+        coords: (N, 3) i32 coordinates (may contain duplicates).
+        bit_widths: CIG level bit-widths, leaf-first.  Default [3, 4, 5].
+
+    Returns:
+        (M, 3) i32 unique coordinates sorted by hierarchical key.
+    """
+    if coords.shape[0] == 0:
+        return coords
+    keys = hierarchical_key(coords.to(torch.int32), bit_widths)
+    keys_t = keys.to(torch.int64).to(coords.device)
+    sorted_keys, sort_idx = torch.sort(keys_t, stable=True)
+    sorted_coords = coords[sort_idx]
+    keep = torch.ones(sorted_keys.shape[0], dtype=torch.bool, device=coords.device)
+    keep[1:] = sorted_keys[1:] != sorted_keys[:-1]
+    return sorted_coords[keep]
+
+
 def hierarchical_key_decode(key: torch.Tensor, bit_widths: list[int]) -> torch.Tensor:
     """Decode a hierarchical sort key back to 3D coordinates.
 
