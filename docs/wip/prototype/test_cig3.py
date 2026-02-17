@@ -28,14 +28,11 @@ def cig3_ijk_to_index_numpy(cig: CompressedCIG3, query_np: np.ndarray) -> np.nda
     """Numpy reference ijk_to_index for 3-level CIG."""
     root_np = cig.root_coords.cpu().numpy()
     u_masks = cig.upper_masks.cpu().numpy()
-    u_prefix = cig.upper_prefix.cpu().numpy()
-    u_offsets = cig.upper_offsets.cpu().numpy()
+    u_abs_prefix = cig.upper_abs_prefix.cpu().numpy()
     l_masks = cig.lower_masks.cpu().numpy()
-    l_prefix = cig.lower_prefix.cpu().numpy()
-    l_offsets = cig.lower_offsets.cpu().numpy()
+    l_abs_prefix = cig.lower_abs_prefix.cpu().numpy()
     k_masks = cig.leaf_masks.cpu().numpy()
-    k_prefix = cig.leaf_prefix.cpu().numpy()
-    k_offsets = cig.leaf_offsets.cpu().numpy()
+    k_abs_prefix = cig.leaf_abs_prefix.cpu().numpy()
 
     N = query_np.shape[0]
     result = np.full(N, -1, dtype=np.int32)
@@ -58,26 +55,26 @@ def cig3_ijk_to_index_numpy(cig: CompressedCIG3, query_np: np.ndarray) -> np.nda
 
         # Upper -> lower
         flat_ul = int(ul[0]) * 1024 + int(ul[1]) * 32 + int(ul[2])
-        lower_idx = _masked_lookup(u_masks[upper_idx], u_prefix[upper_idx], int(u_offsets[upper_idx]), flat_ul)
+        lower_idx = _masked_lookup(u_masks[upper_idx], u_abs_prefix[upper_idx], flat_ul)
         if lower_idx < 0:
             continue
 
         # Lower -> leaf
         flat_ll = int(ll[0]) * 256 + int(ll[1]) * 16 + int(ll[2])
-        leaf_idx = _masked_lookup(l_masks[lower_idx], l_prefix[lower_idx], int(l_offsets[lower_idx]), flat_ll)
+        leaf_idx = _masked_lookup(l_masks[lower_idx], l_abs_prefix[lower_idx], flat_ll)
         if leaf_idx < 0:
             continue
 
         # Leaf -> voxel
         flat_fl = int(fl[0]) * 64 + int(fl[1]) * 8 + int(fl[2])
-        voxel_idx = _masked_lookup(k_masks[leaf_idx], k_prefix[leaf_idx], int(k_offsets[leaf_idx]), flat_fl)
+        voxel_idx = _masked_lookup(k_masks[leaf_idx], k_abs_prefix[leaf_idx], flat_fl)
         result[i] = voxel_idx
 
     return result
 
 
-def _masked_lookup(mask_words, prefix, base_offset, flat_idx):
-    """Single masked lookup: check bitmask + prefix popcount."""
+def _masked_lookup(mask_words, abs_prefix, flat_idx):
+    """Single masked lookup: check bitmask + absolute prefix popcount."""
     word_idx = flat_idx >> 6
     bit_pos = flat_idx & 63
     if word_idx < 0 or word_idx >= len(mask_words):
@@ -85,9 +82,9 @@ def _masked_lookup(mask_words, prefix, base_offset, flat_idx):
     word = int(mask_words[word_idx])
     if not ((word >> bit_pos) & 1):
         return -1
-    cum = int(prefix[word_idx])
+    cum = int(abs_prefix[word_idx])
     partial = bin(word & ((1 << bit_pos) - 1) & 0xFFFFFFFFFFFFFFFF).count("1")
-    return base_offset + cum + partial
+    return cum + partial
 
 
 # ---------------------------------------------------------------------------
@@ -112,11 +109,11 @@ def test_build_cig3():
     assert cig.root_coords.shape[1] == 3
     assert cig.n_upper == cig.root_coords.shape[0]
     assert cig.upper_masks.shape == (cig.n_upper, 512)
-    assert cig.upper_prefix.shape == (cig.n_upper, 512)
+    assert cig.upper_abs_prefix.shape == (cig.n_upper, 512)
     assert cig.lower_masks.shape == (cig.n_lower, 64)
-    assert cig.lower_prefix.shape == (cig.n_lower, 64)
+    assert cig.lower_abs_prefix.shape == (cig.n_lower, 64)
     assert cig.leaf_masks.shape == (cig.n_leaves, 8)
-    assert cig.leaf_prefix.shape == (cig.n_leaves, 8)
+    assert cig.leaf_abs_prefix.shape == (cig.n_leaves, 8)
 
     print(
         f"  build_cig3: {cig.n_active} voxels, {cig.n_leaves} leaves, "
@@ -192,7 +189,7 @@ def test_cig3_numpy_reference():
 
 MASKED_CIG3_LEAF_PROGRAM = """
 parts = Decompose(Input("query"), Const([3, 4, 5]))
-leaf = masked(Gather(Input("leaf_masks"), Input("leaf_idx")), Gather(Input("leaf_prefix"), Input("leaf_idx")), Gather(Input("leaf_offsets"), Input("leaf_idx")))
+leaf = masked(Gather(Input("leaf_masks"), Input("leaf_idx")), Gather(Input("leaf_abs_prefix"), Input("leaf_idx")))
 voxel_idx = Gather(leaf, field(parts, "level_0"))
 voxel_idx
 """
@@ -214,16 +211,12 @@ def test_cig3_dsl_leaf_level():
     ul = (query_np >> 7) & 31
     ll = (query_np >> 3) & 15
 
-    # Find upper, lower, leaf indices via numpy reference
     ref_result = cig3_ijk_to_index_numpy(cig, query_np.reshape(1, 3))
     assert ref_result[0] >= 0, "First grid coord should be active"
 
-    # Now test just the leaf level via DSL (given a known leaf_idx)
-    # We need to find the leaf_idx for this voxel
     flat_ul = int(ul[0]) * 1024 + int(ul[1]) * 32 + int(ul[2])
     flat_ll = int(ll[0]) * 256 + int(ll[1]) * 16 + int(ll[2])
 
-    # Find upper_idx
     root_np = cig.root_coords.cpu().numpy()
     upper_idx = -1
     for r in range(root_np.shape[0]):
@@ -234,42 +227,34 @@ def test_cig3_dsl_leaf_level():
 
     lower_idx = _masked_lookup(
         cig.upper_masks.cpu().numpy()[upper_idx],
-        cig.upper_prefix.cpu().numpy()[upper_idx],
-        int(cig.upper_offsets.cpu().numpy()[upper_idx]),
+        cig.upper_abs_prefix.cpu().numpy()[upper_idx],
         flat_ul,
     )
     assert lower_idx >= 0
 
     leaf_idx = _masked_lookup(
         cig.lower_masks.cpu().numpy()[lower_idx],
-        cig.lower_prefix.cpu().numpy()[lower_idx],
-        int(cig.lower_offsets.cpu().numpy()[lower_idx]),
+        cig.lower_abs_prefix.cpu().numpy()[lower_idx],
         flat_ll,
     )
     assert leaf_idx >= 0
 
-    # Run DSL with the known leaf_idx
     query_val = Value(Type(Shape(Static(3)), ScalarType.I32), query_np)
     leaf_idx_val = Value(Type(Shape(), ScalarType.I32), np.int32(leaf_idx))
     masks_val = Value(
         Type(Shape(Static(cig.n_leaves)), Type(Shape(Static(8)), ScalarType.I64)),
         cig.leaf_masks.cpu().numpy(),
     )
-    prefix_val = Value(
+    abs_prefix_val = Value(
         Type(Shape(Static(cig.n_leaves)), Type(Shape(Static(8)), ScalarType.I32)),
-        cig.leaf_prefix.cpu().numpy(),
-    )
-    offsets_val = Value(
-        Type(Shape(Static(cig.n_leaves)), ScalarType.I64),
-        cig.leaf_offsets.cpu().numpy(),
+        cig.leaf_abs_prefix.cpu().numpy(),
     )
 
     _, result = dsl_run(MASKED_CIG3_LEAF_PROGRAM, {
         "query": query_val,
         "leaf_idx": leaf_idx_val,
         "leaf_masks": masks_val,
-        "leaf_prefix": prefix_val,
-        "leaf_offsets": offsets_val,
+        "leaf_abs_prefix": abs_prefix_val,
     })
 
     dsl_idx = int(result.data)

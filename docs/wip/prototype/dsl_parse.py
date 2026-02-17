@@ -34,6 +34,7 @@ from .dsl_ast import (
     EachNode,
     EachRightNode,
     FieldNode,
+    FindNode,
     GatherNode,
     GENode,
     InBoundsNode,
@@ -102,6 +103,7 @@ _BUILTINS = {
     "Count",
     "Decompose",
     "Morton3d",
+    "Find",
     "Input",
     "Const",
 }
@@ -357,6 +359,9 @@ class Parser:
         if name == "Morton3d":
             return Morton3dNode(_expr(args[0]))
 
+        if name == "Find":
+            return FindNode(_expr(args[0]), _expr(args[1]))
+
         if name == "field":
             expr_node = _expr(args[0])
             field_node = _expr(args[1])
@@ -379,7 +384,7 @@ class Parser:
             raise SyntaxError(f"reshape expects list shape, got {shape_node}")
 
         if name == "masked":
-            return MaskedNode(_expr(args[0]), _expr(args[1]), _expr(args[2]))
+            return MaskedNode(_expr(args[0]), _expr(args[1]))
 
         # -- Adverbs --
 

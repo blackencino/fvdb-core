@@ -375,6 +375,27 @@ class DecomposeNode(Node):
 
 
 @dataclass(frozen=True)
+class FindNode(Node):
+    """Find(table, key): linear search for a matching row in a small table.
+
+    table: (R, K) -- a small array of K-dimensional keys
+    key: (K,) -- the key to search for
+
+    Returns the row index (i32 scalar) of the first match, or -1 if not found.
+    General-purpose search primitive, not CIG-specific.
+    """
+
+    table: Node
+    key: Node
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        return Type(Shape(), ScalarType.I32)
+
+    def __repr__(self) -> str:
+        return f"Find({self.table}, {self.key})"
+
+
+@dataclass(frozen=True)
 class Morton3dNode(Node):
     input: Node
 
@@ -417,35 +438,31 @@ class ReshapeNode(Node):
 
 @dataclass(frozen=True)
 class MaskedNode(Node):
-    """masked(mask_expr, prefix_expr, offset_expr): layout (lowercase, free).
+    """masked(mask_expr, abs_prefix_expr): layout (lowercase, free).
 
-    Constructs a masked layout from a bitmask, prefix-sum popcounts, and
-    a base offset. Access via Gather computes bitmask check + prefix
-    lookup + partial popcount.
+    Constructs a masked layout from a bitmask and an absolute prefix-sum
+    array. Access via Gather computes bitmask check + prefix lookup +
+    partial popcount.
 
     Physical storage per node:
-      mask:   (W,) i64  -- W packed u64 words (W * 64 = total bit positions)
-      prefix: (W,) i32  -- cumulative popcount before each word
-      offset: scalar i32 -- base index into the flat data array
+      mask:       (W,) i64  -- W packed u64 words (W * 64 = total positions)
+      abs_prefix: (W,) i32  -- absolute index: node_offset + cum_popc_before_word
 
-    Works for any node shape: W=8 for 8x8x8 leaf (512 bits),
-    W=64 for 16x16x16 lower (4096 bits), W=512 for 32x32x32 upper.
+    The base offset is folded into the prefix at build time, so the query
+    is just abs_prefix[word] + partial_popcount. Two gathers per level.
+
+    Works for any node shape: W=8 for 8x8x8, W=64 for 16^3, W=512 for 32^3.
     """
 
     mask: Node
-    prefix: Node
-    offset: Node
+    abs_prefix: Node
 
     def infer_type(self, env: Env, inputs: InputDecls) -> Type:
         mask_ty = self.mask.infer_type(env, inputs)
-        # Infer the logical shape from the mask's word count:
-        # W words * 64 bits = total positions. Cube root gives the axis size.
-        # W=8 -> 512 -> 8^3, W=64 -> 4096 -> 16^3, W=512 -> 32768 -> 32^3.
-        # The element type is i64 (the computed dense index).
         return Type(Shape(), MaskedElement(Shape(Static(8), Static(8), Static(8)), ScalarType.I64))
 
     def __repr__(self) -> str:
-        return f"masked({self.mask}, {self.prefix}, {self.offset})"
+        return f"masked({self.mask}, {self.abs_prefix})"
 
 
 # ---------------------------------------------------------------------------

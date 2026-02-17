@@ -27,6 +27,7 @@ from .dsl_ast import (
     ConstNode,
     DecomposeNode,
     FieldNode,
+    FindNode,
     GatherNode,
     GENode,
     InBoundsNode,
@@ -74,6 +75,7 @@ class EmitCtx:
     input_params: dict[str, str] = field(default_factory=dict)
     bindings: dict[str, EmitVal] = field(default_factory=dict)
     locals: dict[str, EmitVal] = field(default_factory=dict)
+    hamming_constants_emitted: bool = False
 
     def fresh(self, prefix: str = "t") -> str:
         self.var_counter += 1
@@ -214,19 +216,17 @@ def emit_program(source: str, input_map: dict[str, str], kernel_name: str = "gen
 
 
 def _emit_masked_gather_prefix(ctx: EmitCtx, masked_val: dict, coord: EmitVal) -> str:
-    """Emit prefix-sum masked gather: 2 gathers + 1 popcount, any mask size.
+    """Emit absolute-prefix masked gather: 2 gathers + 1 popcount, any mask size.
 
-    Uses pre-computed prefix-sum popcounts for O(1) lookup regardless of
-    the number of mask words. Works for 8x8x8 leaf (8 words), 16x16x16
-    lower (64 words), 32x32x32 upper (512 words), or any other shape.
+    Uses pre-computed absolute prefix sums (base offset folded in) for O(1)
+    lookup regardless of mask width.  Result = abs_prefix[word] + partial.
 
     Args:
         ctx: Emitter context.
         masked_val: Masked sentinel dict with keys:
             mask_arr   -- cuTile param name for (K, W) i64 mask array
-            prefix_arr -- cuTile param name for (K, W) i32 prefix-sum array
+            prefix_arr -- cuTile param name for (K, W) i32 abs prefix array
             node_idx   -- emitted variable holding the gathered node index
-            base       -- emitted variable holding the gathered base offset
             bit_width  -- int, bits per axis (3 for 8^3, 4 for 16^3, 5 for 32^3)
         coord: Per-axis decomposed coordinate [x, y, z].
 
@@ -239,7 +239,6 @@ def _emit_masked_gather_prefix(ctx: EmitCtx, masked_val: dict, coord: EmitVal) -
     mask_arr = masked_val["mask_arr"]
     prefix_arr = masked_val["prefix_arr"]
     node_idx = masked_val["node_idx"]
-    base_var = masked_val["base"]
     bw = masked_val["bit_width"]
     l0_x, l0_y, l0_z = coord
 
@@ -248,7 +247,7 @@ def _emit_masked_gather_prefix(ctx: EmitCtx, masked_val: dict, coord: EmitVal) -
     stride_y = axis_size
     stride_x = axis_size * axis_size
 
-    ctx.emit(f"# --- Masked gather (prefix-sum, {axis_size}^3 node) ---")
+    ctx.emit(f"# --- Masked gather (abs-prefix, {axis_size}^3 node) ---")
 
     # Flat bit index
     bit_idx = ctx.fresh("bit_idx")
@@ -262,7 +261,7 @@ def _emit_masked_gather_prefix(ctx: EmitCtx, masked_val: dict, coord: EmitVal) -
     bit_pos = ctx.fresh("bit_pos")
     ctx.emit(f"{bit_pos} = ct.astype({bit_idx} & 63, ct.uint64)")
 
-    # Gather the target mask word (1 gather)
+    # Gather 1: target mask word
     tgt_word = ctx.fresh("tgt_word")
     ctx.emit(
         f"{tgt_word} = ct.astype("
@@ -275,19 +274,21 @@ def _emit_masked_gather_prefix(ctx: EmitCtx, masked_val: dict, coord: EmitVal) -
     ctx.emit(f"{is_active_u} = ({tgt_word} >> {bit_pos}) & ct.uint64(1)")
     ctx.emit(f"{is_active} = ct.astype({is_active_u}, ct.int32)")
 
-    # Gather cumulative popcount from prefix-sum array (1 gather)
-    cum_popc = ctx.fresh("cum_popc")
-    ctx.emit(f"{cum_popc} = ct.gather({prefix_arr}, ({node_idx}, {word_idx}), check_bounds=True, padding_value=0)")
+    # Gather 2: absolute prefix (includes base offset)
+    abs_popc = ctx.fresh("abs_popc")
+    ctx.emit(f"{abs_popc} = ct.gather({prefix_arr}, ({node_idx}, {word_idx}), check_bounds=True, padding_value=0)")
 
     # Partial word popcount: count bits below bit_pos in the target word
     partial_mask = ctx.fresh("pmask")
     ctx.emit(f"{partial_mask} = {tgt_word} & ((ct.uint64(1) << {bit_pos}) - ct.uint64(1))")
 
     # Hamming weight of partial word (single u64 popcount)
-    ctx.emit("m1_u64 = ct.uint64(0x5555555555555555)")
-    ctx.emit("m2_u64 = ct.uint64(0x3333333333333333)")
-    ctx.emit("m4_u64 = ct.uint64(0x0F0F0F0F0F0F0F0F)")
-    ctx.emit("h01_u64 = ct.uint64(0x0101010101010101)")
+    if not ctx.hamming_constants_emitted:
+        ctx.emit("m1_u64 = ct.uint64(0x5555555555555555)")
+        ctx.emit("m2_u64 = ct.uint64(0x3333333333333333)")
+        ctx.emit("m4_u64 = ct.uint64(0x0F0F0F0F0F0F0F0F)")
+        ctx.emit("h01_u64 = ct.uint64(0x0101010101010101)")
+        ctx.hamming_constants_emitted = True
     v1 = ctx.fresh("pc")
     ctx.emit(f"{v1} = {partial_mask} - (({partial_mask} >> ct.uint64(1)) & m1_u64)")
     v2 = ctx.fresh("pc")
@@ -297,13 +298,9 @@ def _emit_masked_gather_prefix(ctx: EmitCtx, masked_val: dict, coord: EmitVal) -
     partial_popc = ctx.fresh("pc")
     ctx.emit(f"{partial_popc} = ct.astype(({v3} * h01_u64) >> ct.uint64(56), ct.int32)")
 
-    # Total = base + prefix cumulative + partial
-    total_popc = ctx.fresh("total_popc")
-    ctx.emit(f"{total_popc} = {cum_popc} + {partial_popc}")
-
-    # Result: active -> base + total, inactive -> -1
+    # Result: active -> abs_prefix + partial, inactive -> -1
     result = ctx.fresh("masked_idx")
-    ctx.emit(f"{result} = ({base_var} + {total_popc}) * {is_active} + (-1) * (1 - {is_active})")
+    ctx.emit(f"{result} = ({abs_popc} + {partial_popc}) * {is_active} + (-1) * (1 - {is_active})")
 
     return result
 
@@ -433,37 +430,78 @@ def _emit_decomposed(node: Node, ctx: EmitCtx, input_types: dict[str, Type]) -> 
         raise TypeError(f"Field access requires struct (dict), got {type(struct_val).__name__}")
 
     # -----------------------------------------------------------------
+    # Find: linear scan of a small table for a matching row
+    # -----------------------------------------------------------------
+    if isinstance(node, FindNode):
+        table_val = _emit_decomposed(node.table, ctx, input_types)
+        key_val = _emit_decomposed(node.key, ctx, input_types)
+
+        table_str = table_val if isinstance(table_val, str) else table_val[0]
+        if not isinstance(key_val, list):
+            raise TypeError(f"Find key must be decomposed (list), got {type(key_val).__name__}")
+
+        # Determine R (table size) from the input type
+        table_name = node.table.name if isinstance(node.table, InputNode) else None
+        R = None
+        if table_name and table_name in input_types:
+            ty = input_types[table_name]
+            if ty.rank > 0 and isinstance(ty.iteration_shape.extents[0], Static):
+                R = ty.iteration_shape.extents[0].n
+        if R is None:
+            raise TypeError("Find requires a table with Static leading extent (R must be known at emit time)")
+
+        K = len(key_val)
+        ctx.emit(f"# --- Find: linear scan of {R} entries ---")
+
+        result_var = ctx.fresh("find_idx")
+        ctx.emit(f"{result_var} = -1")
+
+        for r in range(R):
+            # Gather each axis of the table at row r
+            axis_matches = []
+            for ax in range(K):
+                rc = ctx.fresh("rc")
+                ctx.emit(f"{rc} = ct.gather({table_str}, ({r}, {ax}), check_bounds=True, padding_value=-9999)")
+                m = ctx.fresh("fm")
+                ctx.emit(f"{m} = ct.astype({key_val[ax]} == {rc}, ct.int32)")
+                axis_matches.append(m)
+
+            # All axes must match
+            match_var = axis_matches[0]
+            for am in axis_matches[1:]:
+                combined = ctx.fresh("fm")
+                ctx.emit(f"{combined} = {match_var} & {am}")
+                match_var = combined
+
+            # Conditional select: if match, set result to r
+            new_result = ctx.fresh("find_idx")
+            ctx.emit(f"{new_result} = {result_var} * (1 - {match_var}) + {r} * {match_var}")
+            result_var = new_result
+
+        return result_var
+
+    # -----------------------------------------------------------------
     # Masked layout: deferred computation (no code emitted yet)
     # -----------------------------------------------------------------
     if isinstance(node, MaskedNode):
         # Pattern-match: masked(Gather(Input("masks"), idx),
-        #                       Gather(Input("prefix"), idx),
-        #                       Gather(Input("offsets"), idx))
+        #                       Gather(Input("abs_prefix"), idx))
         # Extract the underlying array names and the shared node index.
         # The actual popcount code is emitted when a GatherNode targets this.
         if not isinstance(node.mask, GatherNode) or not isinstance(node.mask.target, InputNode):
             raise TypeError("masked() mask argument must be Gather(Input(...), idx)")
-        if not isinstance(node.prefix, GatherNode) or not isinstance(node.prefix.target, InputNode):
-            raise TypeError("masked() prefix argument must be Gather(Input(...), idx)")
-        if not isinstance(node.offset, GatherNode) or not isinstance(node.offset.target, InputNode):
-            raise TypeError("masked() offset argument must be Gather(Input(...), idx)")
+        if not isinstance(node.abs_prefix, GatherNode) or not isinstance(node.abs_prefix.target, InputNode):
+            raise TypeError("masked() abs_prefix argument must be Gather(Input(...), idx)")
 
         mask_arr_name = ctx.input_params[node.mask.target.name]
-        prefix_arr_name = ctx.input_params[node.prefix.target.name]
+        prefix_arr_name = ctx.input_params[node.abs_prefix.target.name]
         node_idx_val = _emit_decomposed(node.mask.indexer, ctx, input_types)
         node_idx_str = node_idx_val if isinstance(node_idx_val, str) else node_idx_val[0]
-
-        offset_arr_name = ctx.input_params[node.offset.target.name]
-
-        # Emit the base offset gather (we need the scalar value at runtime)
-        base_var = ctx.fresh("mbase")
-        ctx.emit(f"{base_var} = ct.gather({offset_arr_name}, {node_idx_str}, check_bounds=True, padding_value=0)")
 
         # Determine bit_width from the mask array's type (W words -> axis = (W*64)^(1/3))
         mask_input_name = node.mask.target.name
         if mask_input_name in input_types:
             mask_type = input_types[mask_input_name]
-            # mask_type is (*) over (W,) i64 -- extract W from the element shape
             if isinstance(mask_type.element_type, Type):
                 w_extent = mask_type.element_type.iteration_shape.extents[0]
                 if isinstance(w_extent, Static):
@@ -471,7 +509,7 @@ def _emit_decomposed(node: Node, ctx: EmitCtx, input_types: dict[str, Type]) -> 
                     axis_size = round(total_bits ** (1 / 3))
                     bit_width = axis_size.bit_length() - 1
                 else:
-                    bit_width = 3  # default to leaf
+                    bit_width = 3
             else:
                 bit_width = 3
         else:
@@ -482,7 +520,6 @@ def _emit_decomposed(node: Node, ctx: EmitCtx, input_types: dict[str, Type]) -> 
             "mask_arr": mask_arr_name,
             "prefix_arr": prefix_arr_name,
             "node_idx": node_idx_str,
-            "base": base_var,
             "bit_width": bit_width,
         }
 
