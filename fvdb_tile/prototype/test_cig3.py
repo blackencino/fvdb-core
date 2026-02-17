@@ -13,7 +13,7 @@ Verifies:
 import numpy as np
 import torch
 
-from fvdb_tile.prototype.cig import CompressedCIG3, build_compressed_cig3, root_lookup
+from fvdb_tile.prototype.cig import CompressedCIG3, build_compressed_cig3, build_compressed_cig3_from_unique, root_lookup
 from fvdb_tile.prototype.dsl_eval import run as dsl_run
 from fvdb_tile.prototype.ops import Value
 from fvdb_tile.prototype.types import Dynamic, ScalarType, Shape, Static, Type
@@ -260,6 +260,22 @@ def test_cig3_dsl_leaf_level():
     dsl_idx = int(result.data)
     assert dsl_idx == ref_result[0], f"DSL {dsl_idx} != ref {ref_result[0]}"
     print(f"  cig3_dsl_leaf: voxel {query_np} -> idx {dsl_idx}, matches numpy ref -- PASSED")
+
+
+def test_cig3_from_unique_fast_path_matches_generic():
+    """Fast-path builder matches generic builder behavior on unique inputs."""
+    rng = np.random.RandomState(123)
+    coords = rng.randint(0, 4096, size=(500, 3)).astype(np.int32)
+    coords = np.unique(coords, axis=0)
+    ijk_unique = torch.from_numpy(coords)
+
+    cig_generic = build_compressed_cig3(ijk_unique)
+    cig_fast = build_compressed_cig3_from_unique(ijk_unique)
+
+    queries = rng.randint(0, 4096, size=(2000, 3)).astype(np.int32)
+    ref_generic = cig3_ijk_to_index_numpy(cig_generic, queries)
+    ref_fast = cig3_ijk_to_index_numpy(cig_fast, queries)
+    np.testing.assert_array_equal(ref_fast, ref_generic)
 
 
 # =========================================================================

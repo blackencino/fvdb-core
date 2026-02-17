@@ -435,7 +435,35 @@ def build_compressed_cig3(ijk: torch.Tensor) -> CompressedCIG3:
     ul = unique_parts[:, 3:6]
     ll = unique_parts[:, 6:9]
     fl = unique_parts[:, 9:]
-    N_voxels = unique_parts.shape[0]
+    return _build_compressed_cig3_from_parts(wt, ul, ll, fl, device)
+
+
+def build_compressed_cig3_from_unique(ijk_unique: torch.Tensor) -> CompressedCIG3:
+    """Build a 3-level compressed CIG from already-unique voxel coordinates.
+
+    This is a correctness-preserving fast path for callers that already
+    deduplicated voxel coordinates (e.g. conv_grid pipeline). It skips the
+    initial global unique pass and directly builds hierarchical levels.
+
+    Caller contract:
+      - ijk_unique has shape (N, 3)
+      - rows are unique coordinates
+    """
+    assert ijk_unique.ndim == 2 and ijk_unique.shape[1] == 3, f"Expected (N, 3), got {ijk_unique.shape}"
+    device = ijk_unique.device
+
+    leaf_local = ijk_unique & 7
+    lower_local = (ijk_unique >> 3) & 15
+    upper_local = (ijk_unique >> 7) & 31
+    which_top = ijk_unique >> 12
+    return _build_compressed_cig3_from_parts(which_top, upper_local, lower_local, leaf_local, device)
+
+
+def _build_compressed_cig3_from_parts(
+    wt: torch.Tensor, ul: torch.Tensor, ll: torch.Tensor, fl: torch.Tensor, device: torch.device
+) -> CompressedCIG3:
+    """Internal builder from decomposed unique parts."""
+    N_voxels = wt.shape[0]
 
     # --- Upper nodes: unique which_top values ---
     unique_wt, wt_inverse = torch.unique(wt, dim=0, return_inverse=True)

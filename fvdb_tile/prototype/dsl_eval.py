@@ -43,7 +43,9 @@ from .dsl_ast import (
     RefNode,
     ReshapeNode,
     ScanNode,
+    SortNode,
     SubNode,
+    UniqueNode,
     WhereNode,
 )
 from .dsl_parse import parse
@@ -305,6 +307,27 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
         coords = np.argwhere(input_val.data).astype(np.int32)
         result_type = Type(Shape(Dynamic()), coord_type(input_val.type.rank))
         return Value(result_type, coords)
+
+    if isinstance(node, SortNode):
+        input_val = eval_node(node.input, env)
+        data = input_val.data
+        if not isinstance(data, np.ndarray):
+            raise TypeError(f"Sort requires ndarray data, got {type(data)}")
+        sorted_data = _sort_leading_axis(data)
+        return Value(input_val.type, sorted_data)
+
+    if isinstance(node, UniqueNode):
+        input_val = eval_node(node.input, env)
+        data = input_val.data
+        if not isinstance(data, np.ndarray):
+            raise TypeError(f"Unique requires ndarray data, got {type(data)}")
+        unique_data = _unique_leading_axis(data)
+
+        # Preserve element type, but output length is data-dependent.
+        in_ty = input_val.type
+        tail = in_ty.iteration_shape.extents[1:]
+        result_type = Type(Shape(Dynamic(), *tail), in_ty.element_type)
+        return Value(result_type, unique_data)
 
     if isinstance(node, GatherNode):
         target_val = eval_node(node.target, env)
@@ -612,6 +635,27 @@ def _resolve_verb(name: str):
     if name not in verbs:
         raise TypeError(f"Unknown verb: {name!r}")
     return verbs[name]
+
+
+def _sort_leading_axis(data: np.ndarray) -> np.ndarray:
+    """Stable sort along the leading axis with immutable value semantics."""
+    if data.ndim == 1:
+        return np.sort(data, kind="stable")
+    rows = data.reshape(data.shape[0], -1)
+    # np.lexsort uses last key as primary; reverse to sort by column order.
+    order = np.lexsort(tuple(rows[:, i] for i in range(rows.shape[1] - 1, -1, -1)))
+    return data[order].copy()
+
+
+def _unique_leading_axis(data: np.ndarray) -> np.ndarray:
+    """Deduplicate along leading axis with immutable value semantics."""
+    if data.ndim == 1:
+        return np.unique(data)
+    rows = data.reshape(data.shape[0], -1)
+    _, first_idx = np.unique(rows, axis=0, return_index=True)
+    # Keep first occurrence order to preserve value-semantic predictability.
+    first_idx_sorted = np.sort(first_idx)
+    return data[first_idx_sorted].copy()
 
 
 def _promote_dynamic_to_jagged(ty: Type) -> Type:

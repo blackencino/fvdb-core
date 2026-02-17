@@ -51,7 +51,9 @@ from .dsl_ast import (
     RefNode,
     ReshapeNode,
     ScanNode,
+    SortNode,
     SubNode,
+    UniqueNode,
     WhereNode,
 )
 from .types import ScalarType
@@ -85,6 +87,8 @@ _BUILTINS = {
     "Map",
     "Each",
     "Where",
+    "Sort",
+    "Unique",
     "Gather",
     "Over",
     "Scan",
@@ -327,6 +331,12 @@ class Parser:
 
         if name == "Where":
             return WhereNode(_expr(args[0]))
+
+        if name == "Sort":
+            return SortNode(_expr(args[0]))
+
+        if name == "Unique":
+            return UniqueNode(_expr(args[0]))
 
         if name == "Gather":
             return GatherNode(_expr(args[0]), _expr(args[1]))

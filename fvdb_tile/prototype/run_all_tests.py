@@ -105,6 +105,40 @@ def main():
     _run("dsl_neighbor_program", test_neighbor_program)
     _run("dsl_chain_program", test_chain_program)
 
+    print()
+    from fvdb_tile.prototype.test_sort_unique import (
+        test_sort_unique_coords_correctness_and_types,
+        test_sort_unique_value_semantics_and_referential_transparency,
+        test_unique_idempotence_law,
+        test_sort_preserves_multiset,
+    )
+    _run("dsl_sort_unique_types", test_sort_unique_coords_correctness_and_types)
+    _run("dsl_sort_unique_semantics", test_sort_unique_value_semantics_and_referential_transparency)
+    _run("dsl_unique_idempotence", test_unique_idempotence_law)
+    _run("dsl_sort_multiset_preservation", test_sort_preserves_multiset)
+
+    print()
+    from fvdb_tile.prototype.test_pipeline import (
+        test_pipeline_partitions_collectives,
+        test_pipeline_marks_nested_barrier,
+        test_pipeline_executable_matches_direct_run,
+        test_pipeline_executable_preserves_input_immutability,
+    )
+    _run("pipeline_partition_collectives", test_pipeline_partitions_collectives)
+    _run("pipeline_nested_barrier", test_pipeline_marks_nested_barrier)
+    _run("pipeline_exec_matches_direct", test_pipeline_executable_matches_direct_run)
+    _run("pipeline_exec_input_immutable", test_pipeline_executable_preserves_input_immutability)
+
+    print()
+    from fvdb_tile.prototype.test_conv_grid import (
+        test_conv_grid_ephemeral_matches_reference,
+        test_conv_grid_stride_semantics,
+        test_conv_grid_uses_collective_pipeline_and_preserves_input,
+    )
+    _run("conv_grid_ephemeral_reference", test_conv_grid_ephemeral_matches_reference)
+    _run("conv_grid_stride_semantics", test_conv_grid_stride_semantics)
+    _run("conv_grid_pipeline_and_immutable", test_conv_grid_uses_collective_pipeline_and_preserves_input)
+
     # -- mesh exemplar --
     print()
     print("=" * 60)

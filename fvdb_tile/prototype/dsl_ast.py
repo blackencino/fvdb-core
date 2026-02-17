@@ -310,6 +310,48 @@ class WhereNode(Node):
 
 
 @dataclass(frozen=True)
+class SortNode(Node):
+    """Sort(xs): stable ascending sort over the leading iteration axis.
+
+    For scalar elements this is the usual rank-1 sort.
+    For non-scalar elements (e.g. coordinate vectors), rows are sorted
+    lexicographically over their flattened element values.
+    """
+
+    input: Node
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        input_ty = self.input.infer_type(env, inputs)
+        if input_ty.rank == 0:
+            raise TypeError("Sort requires rank >= 1")
+        return input_ty
+
+    def __repr__(self) -> str:
+        return f"Sort({self.input})"
+
+
+@dataclass(frozen=True)
+class UniqueNode(Node):
+    """Unique(xs): deduplicate elements along the leading iteration axis.
+
+    Output length is data-dependent; leading extent becomes Dynamic.
+    Element type is preserved.
+    """
+
+    input: Node
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        input_ty = self.input.infer_type(env, inputs)
+        if input_ty.rank == 0:
+            raise TypeError("Unique requires rank >= 1")
+        tail = input_ty.iteration_shape.extents[1:]
+        return Type(Shape(Dynamic(), *tail), input_ty.element_type)
+
+    def __repr__(self) -> str:
+        return f"Unique({self.input})"
+
+
+@dataclass(frozen=True)
 class GatherNode(Node):
     target: Node
     indexer: Node
