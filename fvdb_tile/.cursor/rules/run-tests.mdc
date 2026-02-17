@@ -1,0 +1,24 @@
+---
+description: How to run fvdb_tile tests and benchmarks from agent code
+globs:
+  - fvdb_tile/**
+alwaysApply: true
+---
+
+# Running fvdb_tile tests and benchmarks
+
+When executing tests or benchmarks under `fvdb_tile/`, always use the
+`fvdb_tile/run_gpu.sh` wrapper script. This sets `CUDA_HOME` and
+activates the correct venv in a single command.
+
+```bash
+fvdb_tile/run_gpu.sh fvdb_tile/tests/test_hashmap.py
+fvdb_tile/run_gpu.sh fvdb_tile/tests/test_cutile_hashmap.py
+fvdb_tile/run_gpu.sh fvdb_tile/benchmarks/bench_gpu_hashmap.py
+```
+
+Do **not** manually `source ~/.venvs/fvdb_cutile/bin/activate` or set
+`CUDA_HOME` separately. The wrapper handles both.
+
+The wrapper is on the shell allowlist, so it runs without sandbox
+restrictions and has full GPU access.

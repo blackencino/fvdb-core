@@ -942,3 +942,161 @@ def hash_map_scatter_reduce(
             raise ValueError(f"Unknown reduce_fn: {reduce_fn}")
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Leaf mask operations -- 8x8x8 bitmask primitives
+# ---------------------------------------------------------------------------
+#
+# The 8x8x8 leaf mask is the atomic unit of the sparse grid.
+# Layout: (L, 8) i64  --  8 u64 words per leaf, one per x-plane.
+#   word_index = x
+#   bit_position = y*8 + z      (within word)
+#   flat_in_leaf = x*64 + y*8 + z
+#
+# These operations are fully vectorized over L leaves (no Python loops
+# except over the small fixed set of boundary cases and the 8 x-planes
+# -- never over L or N).
+# ---------------------------------------------------------------------------
+
+
+def _to_signed_i64(val: int) -> int:
+    """Convert an unsigned 64-bit bitmask to signed int64 for torch."""
+    val = val & 0xFFFF_FFFF_FFFF_FFFF
+    if val >= (1 << 63):
+        val -= 1 << 64
+    return val
+
+
+def shift_leaf_masks(
+    masks: torch.Tensor,
+    ox: int,
+    oy: int,
+    oz: int,
+) -> list[tuple[torch.Tensor, tuple[int, int, int]]]:
+    """Shift (L, 8) i64 leaf masks by voxel offset (ox, oy, oz).
+
+    Returns a list of (shifted_masks, leaf_delta) pairs -- one for
+    each target leaf that receives contributions.  A single offset
+    produces up to 2^3 = 8 target leaves (boundary crossings in each
+    axis), but most are empty for small offsets.
+
+    Each shifted_masks is (L, 8) i64, same shape as input.  Leaves
+    with no bits set for a given target are all-zero (harmless for OR).
+
+    The leaf_delta is (dx, dy, dz) in leaf coordinates -- the offset
+    of the target leaf relative to the source leaf.
+
+    Fully vectorized over all L leaves.  The only iteration is over
+    the small fixed set of boundary cases (at most 8) and the 8
+    x-planes -- never over L.
+    """
+    device = masks.device
+    L = masks.shape[0]
+    results: list[tuple[torch.Tensor, tuple[int, int, int]]] = []
+
+    # Per axis, determine which leaf deltas are possible and which
+    # source positions (0..7) map to each delta.
+    def _axis_cases(o: int) -> list[tuple[int, int, int]]:
+        """Return list of (leaf_delta, src_lo, src_hi) for offset o."""
+        cases = []
+        lo0 = max(0, -o)
+        hi0 = min(7, 7 - o)
+        if lo0 <= hi0:
+            cases.append((0, lo0, hi0))
+        if o > 0:
+            lo1 = max(0, 8 - o)
+            if lo1 <= 7:
+                cases.append((1, lo1, 7))
+        if o < 0:
+            hi_m1 = min(7, -o - 1)
+            if 0 <= hi_m1:
+                cases.append((-1, 0, hi_m1))
+        return cases
+
+    x_cases = _axis_cases(ox)
+    y_cases = _axis_cases(oy)
+    z_cases = _axis_cases(oz)
+
+    for dx, x_lo, x_hi in x_cases:
+        for dy, y_lo, y_hi in y_cases:
+            for dz, z_lo, z_hi in z_cases:
+                # Build a 64-bit constant mask selecting valid (y,z) source
+                # positions for this boundary case.
+                src_yz_mask = 0
+                for y in range(y_lo, y_hi + 1):
+                    for z in range(z_lo, z_hi + 1):
+                        src_yz_mask |= 1 << (y * 8 + z)
+
+                # Local shift after subtracting the leaf delta
+                local_ox = ox - dx * 8
+                local_oy = oy - dy * 8
+                local_oz = oz - dz * 8
+                bit_shift = local_oy * 8 + local_oz
+
+                # Convert mask to signed i64 for torch tensor operations
+                src_yz_mask_signed = _to_signed_i64(src_yz_mask)
+
+                # Build shifted mask: iterate over the at-most-8 source
+                # x-planes (word indices), vectorized over L leaves.
+                out = torch.zeros(L, 8, dtype=torch.int64, device=device)
+                for src_x in range(x_lo, x_hi + 1):
+                    dst_x = src_x + local_ox
+                    if dst_x < 0 or dst_x >= 8:
+                        continue
+                    word = masks[:, src_x] & src_yz_mask_signed
+                    if bit_shift > 0:
+                        out[:, dst_x] |= word << bit_shift
+                    elif bit_shift < 0:
+                        # Logical right shift: arithmetic shift + mask to
+                        # clear sign-extended bits.
+                        n = -bit_shift
+                        shifted = word >> n
+                        clear_mask = _to_signed_i64((1 << (64 - n)) - 1)
+                        out[:, dst_x] |= shifted & clear_mask
+                    else:
+                        out[:, dst_x] |= word
+
+                if out.any():
+                    results.append((out, (dx, dy, dz)))
+
+    return results
+
+
+def mask_to_coords(
+    masks: torch.Tensor,
+    leaf_coords: torch.Tensor,
+) -> torch.Tensor:
+    """Extract active voxel coordinates from (L, 8) i64 leaf masks.
+
+    Args:
+        masks: (L, 8) i64 -- 8 u64 words per leaf.
+        leaf_coords: (L, 3) i32 -- leaf coordinates (voxel >> 3).
+
+    Returns:
+        (M, 3) i32 -- global voxel coordinates of all set bits.
+    """
+    L = masks.shape[0]
+    device = masks.device
+
+    if L == 0:
+        return torch.empty((0, 3), dtype=torch.int32, device=device)
+
+    # Expand masks to (L, 8, 64) bool via bit testing -- fully vectorized.
+    bit_indices = torch.arange(64, dtype=torch.int64, device=device)
+    expanded = (masks.unsqueeze(2) >> bit_indices.unsqueeze(0).unsqueeze(0)) & 1
+    active = expanded.to(torch.bool).nonzero(as_tuple=False)  # (M, 3)
+
+    if active.shape[0] == 0:
+        return torch.empty((0, 3), dtype=torch.int32, device=device)
+
+    leaf_idx = active[:, 0]
+    x_local = active[:, 1]          # word index = x
+    bit_pos = active[:, 2]
+    y_local = bit_pos >> 3          # bit_pos // 8
+    z_local = bit_pos & 7           # bit_pos % 8
+
+    base = leaf_coords[leaf_idx].to(torch.int32) * 8
+    local = torch.stack([x_local, y_local, z_local], dim=1).to(torch.int32)
+
+    return base + local

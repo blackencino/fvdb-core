@@ -53,6 +53,7 @@ from .dsl_ast import (
     InputNode,
     MapNode,
     MaskedNode,
+    MaskToCoordsNode,
     ModNode,
     Morton3dNode,
     Morton3dSignedNode,
@@ -65,6 +66,7 @@ from .dsl_ast import (
     RefNode,
     ReshapeNode,
     ScatterReduceNode,
+    ShiftLeafMaskNode,
     ShiftLeftNode,
     ShiftRightNode,
     SortNode,
@@ -141,6 +143,8 @@ _BUILTINS = {
     "HashMapBuild",
     "HashMapLookup",
     "ScatterReduce",
+    "ShiftLeafMask",
+    "MaskToCoords",
     "Input",
     "Const",
     "Apply",
@@ -512,6 +516,12 @@ class Parser:
 
         if name == "ScatterReduce":
             return ScatterReduceNode(_expr(args[0]), _expr(args[1]), _expr(args[2]))
+
+        if name == "ShiftLeafMask":
+            return ShiftLeafMaskNode(_expr(args[0]), _expr(args[1]))
+
+        if name == "MaskToCoords":
+            return MaskToCoordsNode(_expr(args[0]), _expr(args[1]))
 
         # -- Adverbs: function -> function transformers --
         # Adverbs always produce AdverbApplyNode. If data args follow,

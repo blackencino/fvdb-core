@@ -43,11 +43,13 @@ from .dsl_ast import (
     HashMapLookupNode,
     InputNode,
     MapNode,
+    MaskToCoordsNode,
     ModNode,
     Node,
     OverNode,
     Program,
     RefNode,
+    ShiftLeafMaskNode,
     ShiftLeftNode,
     ShiftRightNode,
     SortNode,
@@ -642,7 +644,11 @@ def _make_collective_hooks(device: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-_BARRIER_NODE_TYPES = (WhereNode, SortNode, UniqueNode, OverNode, HashMapBuildNode, HashMapLookupNode)
+_BARRIER_NODE_TYPES = (
+    WhereNode, SortNode, UniqueNode, OverNode,
+    HashMapBuildNode, HashMapLookupNode,
+    ShiftLeafMaskNode, MaskToCoordsNode,
+)
 
 
 def _contains_barrier(node: Node) -> bool:
@@ -671,6 +677,10 @@ def _barrier_reason(node: Node) -> str:
         return "hashmap_build_collective"
     if isinstance(node, HashMapLookupNode):
         return "hashmap_lookup_collective"
+    if isinstance(node, ShiftLeafMaskNode):
+        return "shift_leaf_mask_collective"
+    if isinstance(node, MaskToCoordsNode):
+        return "mask_to_coords_collective"
     return "contains_barrier_subgraph"
 
 

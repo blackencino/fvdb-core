@@ -1256,6 +1256,57 @@ class ExpandOffsetsNode(Node):
 
 
 # ---------------------------------------------------------------------------
+# Leaf mask operations -- 8x8x8 system-level primitives
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ShiftLeafMaskNode(Node):
+    """Shift (L, 8) i64 leaf masks by a voxel offset.
+
+    System-level primitive for the 8x8x8 leaf bitmask -- the atomic
+    unit of the sparse grid.  Operates on the MaskedElement layout.
+
+    Takes leaf masks and a constant voxel offset, returns shifted masks
+    and leaf coordinate deltas for all boundary cases.
+
+    Barrier (collective): the output count depends on boundary analysis.
+    """
+
+    masks: Node       # (L, 8) i64 leaf masks
+    offset: Node      # (3,) i32 constant voxel offset (ox, oy, oz)
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        # Returns a dynamic-length list of (shifted_mask, leaf_delta) pairs.
+        # At the type level, we model this as the shifted masks: (*) / (8,) i64
+        # The leaf deltas are produced alongside as metadata.
+        return Type(Shape(Dynamic()), Type(Shape(Static(8)), ScalarType.I64))
+
+    def __repr__(self) -> str:
+        return f"ShiftLeafMask({self.masks}, {self.offset})"
+
+
+@dataclass(frozen=True)
+class MaskToCoordsNode(Node):
+    """Extract voxel coordinates from (L, 8) i64 leaf masks.
+
+    System-level primitive for the 8x8x8 leaf bitmask.  Converts
+    bitmask representation back to explicit (M, 3) i32 coordinates.
+
+    Barrier (collective): output count depends on popcount of masks.
+    """
+
+    masks: Node        # (L, 8) i64 leaf masks
+    leaf_coords: Node  # (L, 3) i32 leaf coordinates
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        return Type(Shape(Dynamic()), Type(Shape(Static(3)), ScalarType.I32))
+
+    def __repr__(self) -> str:
+        return f"MaskToCoords({self.masks}, {self.leaf_coords})"
+
+
+# ---------------------------------------------------------------------------
 # Program: a sequence of let-bindings + an output
 # ---------------------------------------------------------------------------
 

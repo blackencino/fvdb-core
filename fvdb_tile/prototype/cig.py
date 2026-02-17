@@ -135,6 +135,7 @@ class CompressedCIG3:
     lower_abs_prefix: torch.Tensor  # (L, 64) i32
     leaf_masks: torch.Tensor        # (K, 8) i64
     leaf_abs_prefix: torch.Tensor   # (K, 8) i32
+    leaf_coords: torch.Tensor      # (K, 3) i32 -- leaf coords in leaf space (voxel >> 3)
 
     n_active: int
     n_leaves: int
@@ -149,6 +150,7 @@ class CompressedCIG3:
             self.upper_masks, self.upper_abs_prefix,
             self.lower_masks, self.lower_abs_prefix,
             self.leaf_masks, self.leaf_abs_prefix,
+            self.leaf_coords,
         ]:
             total += t.nelement() * t.element_size()
         return total
@@ -168,6 +170,7 @@ class CompressedCIG3:
             lower_abs_prefix=self.lower_abs_prefix.cuda(),
             leaf_masks=self.leaf_masks.cuda(),
             leaf_abs_prefix=self.leaf_abs_prefix.cuda(),
+            leaf_coords=self.leaf_coords.cuda(),
             n_active=self.n_active,
             n_leaves=self.n_leaves,
             n_lower=self.n_lower,
@@ -243,6 +246,14 @@ def build_compressed_cig3(ijk: torch.Tensor) -> CompressedCIG3:
         voxel_to_leaf, voxel_flat_in_leaf, K, 8, device
     )
 
+    # Reconstruct leaf coordinates in leaf space (voxel >> 3) from tree path.
+    # unique_wt_ul_ll columns: [wt_x, wt_y, wt_z, ul_x, ul_y, ul_z, ll_x, ll_y, ll_z]
+    # leaf_coord_per_axis = which_top * (1<<9) + upper_local * (1<<4) + lower_local
+    leaf_wt = unique_wt_ul_ll[:, :3]   # which_top
+    leaf_ul = unique_wt_ul_ll[:, 3:6]  # upper_local
+    leaf_ll_coords = unique_wt_ul_ll[:, 6:]  # lower_local
+    leaf_coords = (leaf_wt * (1 << 9) + leaf_ul * (1 << 4) + leaf_ll_coords).int()
+
     return CompressedCIG3(
         root_coords=root_coords,
         upper_masks=upper_masks,
@@ -251,6 +262,7 @@ def build_compressed_cig3(ijk: torch.Tensor) -> CompressedCIG3:
         lower_abs_prefix=lower_abs_prefix,
         leaf_masks=leaf_masks,
         leaf_abs_prefix=leaf_abs_prefix,
+        leaf_coords=leaf_coords,
         n_active=int(N_voxels),
         n_leaves=int(K),
         n_lower=int(L),

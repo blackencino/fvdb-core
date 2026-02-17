@@ -41,7 +41,9 @@ from .dsl_ast import (
     HashMapBuildNode,
     HashMapLookupNode,
     HierarchicalKeyDecodeNode,
+    MaskToCoordsNode,
     ScatterReduceNode,
+    ShiftLeafMaskNode,
     HierarchicalKeyNode,
     InBoundsNode,
     InputNode,
@@ -79,7 +81,9 @@ from .ops import (
     hash_map_build,
     hash_map_lookup,
     hash_map_scatter_reduce,
+    mask_to_coords,
     morton3d,
+    shift_leaf_masks,
 )
 from .types import Dynamic, FnType, Jagged, ScalarType, Shape, Static, Type, coord_type
 
@@ -725,6 +729,32 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
         active_result = result_arr[active_mask]
         result_type = Type(Shape(Dynamic()), values_val.type.element_type)
         return Value(result_type, active_result)
+
+    # -- Leaf mask operations --
+
+    if isinstance(node, ShiftLeafMaskNode):
+        masks_val = eval_node(node.masks, env)
+        offset_val = eval_node(node.offset, env)
+        ox, oy, oz = int(offset_val.data[0]), int(offset_val.data[1]), int(offset_val.data[2])
+        pairs = shift_leaf_masks(masks_val.data, ox, oy, oz)
+        # Return as list of Values: each is (shifted_mask, leaf_delta)
+        result_list = []
+        for shifted, delta in pairs:
+            delta_t = torch.tensor(delta, dtype=torch.int32, device=shifted.device)
+            result_list.append((shifted, delta_t))
+        # Pack as a tuple: (list_of_shifted_masks, list_of_deltas)
+        # For the evaluator, return the raw list for the conv_grid_leafwise to consume
+        return Value(
+            Type(Shape(Dynamic()), Type(Shape(Static(8)), ScalarType.I64)),
+            result_list,
+        )
+
+    if isinstance(node, MaskToCoordsNode):
+        masks_val = eval_node(node.masks, env)
+        leaf_coords_val = eval_node(node.leaf_coords, env)
+        coords = mask_to_coords(masks_val.data, leaf_coords_val.data)
+        elem = Type(Shape(Static(3)), ScalarType.I32)
+        return Value(Type(Shape(Dynamic()), elem), coords)
 
     # -- Additional scalar primitives --
 
