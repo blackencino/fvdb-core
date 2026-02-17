@@ -190,7 +190,6 @@ def test_emit_cross_leaf():
     assert "Fused chained gather" in code, "Expected chain fusion comment"
 
     print("  emit_cross_leaf: structure valid -- PASSED")
-    return code, tile_size, map_len
 
 
 # ---------------------------------------------------------------------------

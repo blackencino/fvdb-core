@@ -16,9 +16,12 @@ from .layouts import (
     MaskedElement,
     StructElement,
     cut_by_size,
+    flatten as flatten_layout,
     flip as flip_layout,
+    fuse as fuse_layout,
     indexed as indexed_layout,
     masked_layout,
+    permute as permute_layout,
     reshape as reshape_layout,
     struct_layout,
 )
@@ -480,6 +483,43 @@ class ReshapeNode(Node):
 
 
 @dataclass(frozen=True)
+class FuseNode(Node):
+    """fuse(x): merge the two outermost nesting levels (layout, free)."""
+    input: Node
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        return fuse_layout(self.input.infer_type(env, inputs))
+
+    def __repr__(self) -> str:
+        return f"fuse({self.input})"
+
+
+@dataclass(frozen=True)
+class FlattenNode(Node):
+    """flatten(x): merge ALL nesting levels into one (layout, free)."""
+    input: Node
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        return flatten_layout(self.input.infer_type(env, inputs))
+
+    def __repr__(self) -> str:
+        return f"flatten({self.input})"
+
+
+@dataclass(frozen=True)
+class PermuteNode(Node):
+    """permute(x, order): reorder axes within the leading shape (layout, free)."""
+    input: Node
+    order: tuple
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        return permute_layout(self.input.infer_type(env, inputs), self.order)
+
+    def __repr__(self) -> str:
+        return f"permute({self.input}, {self.order})"
+
+
+@dataclass(frozen=True)
 class MaskedNode(Node):
     """masked(mask_expr, abs_prefix_expr): layout (lowercase, free).
 
@@ -621,7 +661,7 @@ class PriorNode(Node):
 # ---------------------------------------------------------------------------
 
 # The set of adverb names recognised by AdverbApplyNode.
-_ADVERB_NAMES = {"Over", "Scan", "EachRight", "EachLeft", "Prior", "Each"}
+_ADVERB_NAMES = {"Over", "Scan", "EachRight", "EachLeft", "EachBoth", "Prior", "Each"}
 
 # Arity of the function produced by each adverb.
 _ADVERB_ARITY = {
@@ -631,6 +671,7 @@ _ADVERB_ARITY = {
     "Each": 1,      # Each(f): monadic -- iterate leading shape
     "EachRight": 2, # EachRight(f): dyadic -- x whole, iterate y
     "EachLeft": 2,  # EachLeft(f): dyadic -- iterate x, y whole
+    "EachBoth": 2,  # EachBoth(f): dyadic -- zip x and y, iterate in lockstep
 }
 
 
@@ -782,6 +823,21 @@ def _infer_apply_type(fn_node: Node, arg_types: list[Type], env: Env, inputs: In
             if isinstance(result_elem, Type):
                 result_elem = _promote_dynamic_to_jagged(result_elem)
             return Type(x_ty.iteration_shape, result_elem)
+
+        if adverb == "EachBoth":
+            # EachBoth(f)(x: S / A, y: S / B) -> S / f(A, B)
+            # Leading shapes must be compatible.
+            x_ty, y_ty = arg_types[0], arg_types[1]
+            resolved_shape = x_ty.iteration_shape.resolve(y_ty.iteration_shape)
+            x_elem = x_ty.element_type
+            y_elem = y_ty.element_type
+            x_elem_as_type = x_elem if isinstance(x_elem, Type) else Type(Shape(), x_elem)
+            y_elem_as_type = y_elem if isinstance(y_elem, Type) else Type(Shape(), y_elem)
+            result_inner = _infer_apply_type(inner_fn, [x_elem_as_type, y_elem_as_type], env, inputs)
+            result_elem = _as_element_type(result_inner)
+            if isinstance(result_elem, Type):
+                result_elem = _promote_dynamic_to_jagged(result_elem)
+            return Type(resolved_shape, result_elem)
 
         raise TypeError(f"Unknown adverb in type inference: {adverb!r}")
 

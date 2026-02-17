@@ -29,6 +29,8 @@ from .dsl_ast import (
     EachRightNode,
     FieldNode,
     FindNode,
+    FlattenNode,
+    FuseNode,
     GatherNode,
     GENode,
     InBoundsNode,
@@ -40,6 +42,7 @@ from .dsl_ast import (
     Node,
     NotNode,
     OverNode,
+    PermuteNode,
     PriorNode,
     Program,
     RefNode,
@@ -447,6 +450,48 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
             data = data.reshape(node.new_shape)
         return Value(new_type, data)
 
+    if isinstance(node, FuseNode):
+        input_val = eval_node(node.input, env)
+        from .layouts import fuse as fuse_layout
+
+        new_type = fuse_layout(input_val.type)
+        data = input_val.data
+        if isinstance(data, np.ndarray):
+            fused_shape = tuple(e.n if hasattr(e, "n") else -1 for e in new_type.iteration_shape.extents)
+            remaining = data.shape[new_type.rank :]
+            # For static shapes, reshape to the fused shape + any trailing element dims
+            target = fused_shape
+            if remaining:
+                target = fused_shape + remaining
+            data = data.reshape(target)
+        return Value(new_type, data)
+
+    if isinstance(node, FlattenNode):
+        input_val = eval_node(node.input, env)
+        from .layouts import flatten as flatten_layout
+
+        new_type = flatten_layout(input_val.type)
+        data = input_val.data
+        if isinstance(data, np.ndarray):
+            flat_shape = tuple(e.n if hasattr(e, "n") else -1 for e in new_type.iteration_shape.extents)
+            data = data.reshape(flat_shape)
+        return Value(new_type, data)
+
+    if isinstance(node, PermuteNode):
+        input_val = eval_node(node.input, env)
+        from .layouts import permute as permute_layout
+
+        new_type = permute_layout(input_val.type, node.order)
+        data = input_val.data
+        if isinstance(data, np.ndarray):
+            # Build full axis permutation: permute the leading shape axes,
+            # keep element axes in original order
+            n_leading = len(node.order)
+            n_total = data.ndim
+            full_order = list(node.order) + list(range(n_leading, n_total))
+            data = np.transpose(data, full_order)
+        return Value(new_type, data)
+
     # -- Adverbs --
 
     if isinstance(node, OverNode):
@@ -719,6 +764,20 @@ def _extract_elements(val: Value) -> list[Value]:
         return [val]
 
 
+def _unwrap_and_promote(result_et):
+    """Unwrap rank-0 scalar wrappers and promote Dynamic->Jagged for nesting.
+
+    When a verb returns () / scalar, unwrap to just the ScalarType so that
+    nesting produces (S,) / scalar instead of (S,) / (() / scalar).
+    Then apply the standard jaggedness promotion for non-scalar results.
+    """
+    if isinstance(result_et, Type) and result_et.rank == 0 and isinstance(result_et.element_type, ScalarType):
+        return result_et.element_type
+    if isinstance(result_et, Type):
+        return _promote_dynamic_to_jagged(result_et)
+    return result_et
+
+
 def _wrap_adverb(adverb: str, inner_fn: FnValue) -> FnValue:
     """Wrap a FnValue with adverb iteration logic, producing a new FnValue.
 
@@ -786,8 +845,7 @@ def _wrap_adverb(adverb: str, inner_fn: FnValue) -> FnValue:
         def each_type(xs_ty: Type) -> Type:
             et = xs_ty.element_type
             et_as_type = et if isinstance(et, Type) else Type(Shape(), et)
-            result_et = inner_fn.type_fn(et_as_type)
-            result_et = _promote_dynamic_to_jagged(result_et)
+            result_et = _unwrap_and_promote(inner_fn.type_fn(et_as_type))
             return Type(xs_ty.iteration_shape, result_et)
 
         return FnValue(1, each_apply, each_type, f"Each({inner_fn.name})")
@@ -801,8 +859,7 @@ def _wrap_adverb(adverb: str, inner_fn: FnValue) -> FnValue:
         def each_right_type(x_ty: Type, y_ty: Type) -> Type:
             y_et = y_ty.element_type
             y_et_as_type = y_et if isinstance(y_et, Type) else Type(Shape(), y_et)
-            result_et = inner_fn.type_fn(x_ty, y_et_as_type)
-            result_et = _promote_dynamic_to_jagged(result_et)
+            result_et = _unwrap_and_promote(inner_fn.type_fn(x_ty, y_et_as_type))
             return Type(y_ty.iteration_shape, result_et)
 
         return FnValue(2, each_right_apply, each_right_type, f"EachRight({inner_fn.name})")
@@ -816,11 +873,33 @@ def _wrap_adverb(adverb: str, inner_fn: FnValue) -> FnValue:
         def each_left_type(x_ty: Type, y_ty: Type) -> Type:
             x_et = x_ty.element_type
             x_et_as_type = x_et if isinstance(x_et, Type) else Type(Shape(), x_et)
-            result_et = inner_fn.type_fn(x_et_as_type, y_ty)
-            result_et = _promote_dynamic_to_jagged(result_et)
+            result_et = _unwrap_and_promote(inner_fn.type_fn(x_et_as_type, y_ty))
             return Type(x_ty.iteration_shape, result_et)
 
         return FnValue(2, each_left_apply, each_left_type, f"EachLeft({inner_fn.name})")
+
+    if adverb == "EachBoth":
+        def each_both_apply(x: Value, y: Value) -> Value:
+            x_elements = _extract_elements(x)
+            y_elements = _extract_elements(y)
+            if len(x_elements) != len(y_elements):
+                raise TypeError(
+                    f"EachBoth: leading shape length mismatch: "
+                    f"{len(x_elements)} vs {len(y_elements)}"
+                )
+            results = [inner_fn.apply_fn(xe, ye) for xe, ye in zip(x_elements, y_elements)]
+            return _collect_adverb_results(x.type, results)
+
+        def each_both_type(x_ty: Type, y_ty: Type) -> Type:
+            resolved_shape = x_ty.iteration_shape.resolve(y_ty.iteration_shape)
+            x_et = x_ty.element_type
+            y_et = y_ty.element_type
+            x_et_as_type = x_et if isinstance(x_et, Type) else Type(Shape(), x_et)
+            y_et_as_type = y_et if isinstance(y_et, Type) else Type(Shape(), y_et)
+            result_et = _unwrap_and_promote(inner_fn.type_fn(x_et_as_type, y_et_as_type))
+            return Type(resolved_shape, result_et)
+
+        return FnValue(2, each_both_apply, each_both_type, f"EachBoth({inner_fn.name})")
 
     raise TypeError(f"Unknown adverb: {adverb!r}")
 
@@ -839,7 +918,8 @@ def _collect_adverb_results_with_shape(outer_shape: Shape, results: list[Value])
         raise TypeError("Empty result list in adverb")
 
     first_type = results[0].type
-    inner_type = _promote_dynamic_to_jagged(first_type) if isinstance(first_type, Type) else first_type
+    # Unwrap rank-0 scalar wrapper so nesting is clean
+    inner_type = _unwrap_and_promote(first_type)
 
     all_ndarray = all(isinstance(r.data, np.ndarray) for r in results)
     all_same_shape = all_ndarray and all(r.data.shape == results[0].data.shape for r in results[1:])

@@ -130,6 +130,73 @@ def reshape(ty: Type, new_extents: tuple[int | str, ...]) -> Type:
 
 
 # ---------------------------------------------------------------------------
+# Fuse -- merge the two outermost nesting levels
+# ---------------------------------------------------------------------------
+
+def fuse(ty: Type) -> Type:
+    """Merge the two outermost nesting levels into one.
+
+    fuse(S_1 / S_2 / E) = (S_1 ++ S_2) / E
+
+    This is the inverse of cut. No data movement -- the physical storage
+    is already shaped as the concatenation of the two shapes.
+
+    Constraint: the inner leading shape must not contain Jagged extents
+    (jagged means "varies per parent" and cannot be fused into a uniform axis).
+    Dynamic extents are fine (uniform, just unknown at compile time).
+    """
+    if not isinstance(ty.element_type, Type):
+        raise TypeError("fuse requires nested type (S1 / S2 / E), got scalar element")
+    inner = ty.element_type
+    for e in inner.iteration_shape.extents:
+        if isinstance(e, Jagged):
+            raise TypeError(
+                f"fuse: inner leading shape contains Jagged extent -- "
+                f"cannot fuse jagged nesting into a uniform shape"
+            )
+    merged = Shape(*ty.iteration_shape.extents, *inner.iteration_shape.extents)
+    return Type(merged, inner.element_type)
+
+
+def flatten(ty: Type) -> Type:
+    """Recursively fuse ALL nesting levels into a single leading shape.
+
+    flatten(S_1 / S_2 / ... / S_n / scalar) = (S_1 ++ S_2 ++ ... ++ S_n) / scalar
+
+    Equivalent to repeated fuse until the element type is no longer a Type.
+    Same jagged constraint as fuse at each level.
+    """
+    result = ty
+    while isinstance(result.element_type, Type):
+        result = fuse(result)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Permute -- reorder axes within the leading shape
+# ---------------------------------------------------------------------------
+
+def permute(ty: Type, order: tuple[int, ...]) -> Type:
+    """Reorder axes within the leading shape.
+
+    permute((a, b, c) / E, (2, 0, 1)) = (c, a, b) / E
+
+    Does NOT cross nesting boundaries. To permute across levels,
+    fuse first, then permute, then cut to re-establish the boundary.
+    """
+    if len(order) != ty.rank:
+        raise TypeError(
+            f"permute order length {len(order)} does not match rank {ty.rank}"
+        )
+    if sorted(order) != list(range(ty.rank)):
+        raise TypeError(
+            f"permute order must be a permutation of 0..{ty.rank - 1}, got {order}"
+        )
+    new_extents = tuple(ty.iteration_shape.extents[i] for i in order)
+    return Type(Shape(*new_extents), ty.element_type)
+
+
+# ---------------------------------------------------------------------------
 # Indexed
 # ---------------------------------------------------------------------------
 

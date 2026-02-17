@@ -35,6 +35,8 @@ from .dsl_ast import (
     EachNode,
     FieldNode,
     FindNode,
+    FlattenNode,
+    FuseNode,
     GatherNode,
     GENode,
     InBoundsNode,
@@ -45,6 +47,7 @@ from .dsl_ast import (
     MulNode,
     Node,
     NotNode,
+    PermuteNode,
     Program,
     RefNode,
     ReshapeNode,
@@ -93,6 +96,7 @@ _BUILTINS = {
     "Scan",
     "EachRight",
     "EachLeft",
+    "EachBoth",
     "Prior",
     "Add",
     "Sub",
@@ -115,7 +119,7 @@ _BUILTINS = {
 # Names that are adverbs (function -> function transformers).
 # When called with just a function arg, they produce AdverbApplyNode.
 # When called with function + data args, they produce ApplyNode(AdverbApplyNode(...), data).
-_PARSER_ADVERBS = {"Over", "Scan", "EachRight", "EachLeft", "Prior"}
+_PARSER_ADVERBS = {"Over", "Scan", "EachRight", "EachLeft", "EachBoth", "Prior"}
 
 # Names that are verbs (function values) when used as bare names.
 _VERB_NAMES = {"Add", "Sub", "Mul", "Div", "GE", "And", "Not", "Min", "Max", "Or"}
@@ -126,6 +130,9 @@ _LAYOUTS = {
     "reshape",
     "field",
     "masked",
+    "fuse",
+    "flatten",
+    "permute",
 }
 
 
@@ -409,6 +416,19 @@ class Parser:
 
         if name == "masked":
             return MaskedNode(_expr(args[0]), _expr(args[1]))
+
+        if name == "fuse":
+            return FuseNode(_expr(args[0]))
+
+        if name == "flatten":
+            return FlattenNode(_expr(args[0]))
+
+        if name == "permute":
+            input_node = _expr(args[0])
+            order_node = _expr(args[1])
+            if isinstance(order_node, ConstNode) and isinstance(order_node.value, list):
+                return PermuteNode(input_node, tuple(order_node.value))
+            raise SyntaxError(f"permute expects list order, got {order_node}")
 
         # -- Adverbs: function -> function transformers --
         # Adverbs always produce AdverbApplyNode. If data args follow,

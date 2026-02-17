@@ -107,7 +107,6 @@ def test_emit_runnable():
     assert "check_bounds=True" in code
 
     print("  emit_runnable: structure valid -- PASSED")
-    return code, tile_size, map_len
 
 
 # ---------------------------------------------------------------------------

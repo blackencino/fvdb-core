@@ -146,7 +146,6 @@ def test_emit_cig3_kernel():
     assert "ct.scatter(" in code
 
     print(f"  emit_cig3_kernel: {n_lines} lines, Find + 3 masked levels -- PASSED")
-    return code
 
 
 # ---------------------------------------------------------------------------
