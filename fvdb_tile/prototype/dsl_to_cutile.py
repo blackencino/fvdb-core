@@ -24,7 +24,9 @@ from typing import Any, Union
 
 from .dsl_ast import (
     AddNode,
+    AdverbApplyNode,
     AndNode,
+    ApplyNode,
     BitXorNode,
     ConstNode,
     CountNode,
@@ -33,6 +35,7 @@ from .dsl_ast import (
     EachNode,
     FieldNode,
     FindNode,
+    FuseNode,
     GatherNode,
     GENode,
     HierarchicalKeyDecodeNode,
@@ -50,12 +53,14 @@ from .dsl_ast import (
     OverNode,
     Program,
     RefNode,
+    ReshapeNode,
     ShiftLeftNode,
     ShiftRightNode,
     SubNode,
+    VerbRefNode,
 )
 from .dsl_parse import parse
-from .types import ScalarType, Shape, Static, Type
+from .types import Dynamic, ScalarType, Shape, Static, Type
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +141,7 @@ class EmitCtx:
     bindings: dict[str, EmitVal] = field(default_factory=dict)
     locals: dict[str, EmitVal] = field(default_factory=dict)
     hamming_constants_emitted: bool = False
+    query_idx: str | None = None
 
     def fresh(self, prefix: str = "t") -> str:
         self.var_counter += 1
@@ -930,7 +936,153 @@ def _emit_decomposed(node: Node, ctx: EmitCtx, input_types: dict[str, Type]) -> 
             ctx.emit(f"{final_z} = ct.astype({az} | ({drz} << ct.int64({coord_shift})), ct.int32)")
         return [final_x, final_y, final_z]
 
+    # -----------------------------------------------------------------
+    # Layout ops: zero-cost type metadata rearrangement (no cuTile code)
+    # -----------------------------------------------------------------
+    if isinstance(node, FuseNode):
+        return _emit_decomposed(node.input, ctx, input_types)
+
+    if isinstance(node, ReshapeNode):
+        return _emit_decomposed(node.input, ctx, input_types)
+
+    # -----------------------------------------------------------------
+    # Adverb data application: EachLeft / EachRight / EachBoth chains
+    #
+    # The adverb chain is a scheduling specification.  When applied to
+    # fully-typed inputs, it resolves to index arithmetic + per-axis
+    # gather + verb application.
+    #
+    #   EachLeft  -> iterate left arg's leading dim  (left_idx)
+    #   EachRight -> iterate right arg's leading dim (right_idx)
+    #   EachBoth  -> iterate both in lockstep (axis decomposition)
+    #   Verb      -> scalar operation on decomposed elements
+    # -----------------------------------------------------------------
+    if isinstance(node, ApplyNode) and isinstance(node.fn, AdverbApplyNode):
+        return _emit_adverb_application(node, ctx, input_types)
+
     raise TypeError(f"Unsupported node for decomposed emission: {type(node).__name__}")
+
+
+# ---------------------------------------------------------------------------
+# Adverb application emission
+# ---------------------------------------------------------------------------
+
+_VERB_OP_TABLE: dict[str, str] = {"Add": "+", "Sub": "-", "Mul": "*"}
+
+
+def _peel_adverb_chain(fn: AdverbApplyNode) -> tuple[list[str], str]:
+    """Walk a nested AdverbApplyNode and return (adverb_list, verb_name).
+
+    adverb_list is outermost-first, e.g. ["EachLeft", "EachRight", "EachBoth"].
+    """
+    adverbs: list[str] = []
+    cur = fn
+    while isinstance(cur, AdverbApplyNode):
+        adverbs.append(cur.adverb)
+        cur = cur.fn
+    if not isinstance(cur, VerbRefNode):
+        raise TypeError(f"Adverb chain must bottom out at a VerbRefNode, got {type(cur).__name__}")
+    return adverbs, cur.name
+
+
+def _resolve_input_name(node: Node) -> str | None:
+    """Extract the input name from an InputNode (possibly wrapped in layout ops)."""
+    while isinstance(node, (FuseNode, ReshapeNode)):
+        node = node.input
+    if isinstance(node, InputNode):
+        return node.name
+    return None
+
+
+def _emit_adverb_application(node: ApplyNode, ctx: EmitCtx, input_types: dict[str, Type]) -> EmitVal:
+    """Emit cuTile code for an adverb data application.
+
+    Supports chains of EachLeft / EachRight / EachBoth over a simple
+    arithmetic verb.  The adverb chain determines index decomposition;
+    EachBoth maps to per-axis gather; the verb becomes the scalar op.
+    """
+    if ctx.query_idx is None:
+        raise TypeError("Adverb emission requires query_idx (adverb-parallel kernel mode)")
+
+    adverbs, verb_name = _peel_adverb_chain(node.fn)
+    if verb_name not in _VERB_OP_TABLE:
+        raise TypeError(f"Unsupported verb in adverb chain: {verb_name!r}")
+
+    if len(node.args) != 2:
+        raise TypeError(f"Adverb data application expects 2 args, got {len(node.args)}")
+
+    left_arg, right_arg = node.args
+
+    # Determine K (inner iteration dimension) from the right arg's type.
+    right_name = _resolve_input_name(right_arg)
+    if right_name is None:
+        raise TypeError("Right arg of adverb application must be an Input")
+    right_type = input_types.get(right_name)
+    if right_type is None:
+        raise TypeError(f"No type info for right arg {right_name!r}")
+    right_extent = right_type.iteration_shape.extents[0] if right_type.rank > 0 else None
+    if isinstance(right_extent, Static):
+        K_val = str(right_extent.n)
+    else:
+        K_val = "K"
+
+    # Determine element rank (number of axes) from the element type.
+    elem_type = right_type.element_type
+    if isinstance(elem_type, Type):
+        elem_rank = elem_type.rank
+        if elem_rank > 0 and isinstance(elem_type.iteration_shape.extents[0], Static):
+            n_axes = elem_type.iteration_shape.extents[0].n
+        else:
+            n_axes = 1
+    else:
+        n_axes = 0
+
+    op = _VERB_OP_TABLE[verb_name]
+    qidx = ctx.query_idx
+
+    # Index decomposition from adverb chain.
+    # EachLeft(EachRight(...)) -> left_idx = qidx // K, right_idx = qidx % K
+    has_each_left = "EachLeft" in adverbs
+    has_each_right = "EachRight" in adverbs
+
+    if has_each_left and has_each_right:
+        left_idx = ctx.fresh("li")
+        right_idx = ctx.fresh("ri")
+        ctx.emit(f"# Adverb: EachLeft(EachRight(...)) -> outer product N x {K_val}")
+        ctx.emit(f"{left_idx} = {qidx} // {K_val}")
+        ctx.emit(f"{right_idx} = {qidx} % {K_val}")
+    elif has_each_left:
+        left_idx = qidx
+        right_idx = "0"
+    elif has_each_right:
+        left_idx = "0"
+        right_idx = qidx
+    else:
+        left_idx = qidx
+        right_idx = qidx
+
+    left_arr = ctx.input_params[_resolve_input_name(left_arg)]
+    right_arr = ctx.input_params[_resolve_input_name(right_arg)]
+
+    if n_axes > 0:
+        result = []
+        for ax in range(n_axes):
+            lv = ctx.fresh("al")
+            rv = ctx.fresh("ar")
+            ctx.emit(f"{lv} = ct.gather({left_arr}, ({left_idx}, {ax}), check_bounds=True, padding_value=0)")
+            ctx.emit(f"{rv} = ct.gather({right_arr}, ({right_idx}, {ax}), check_bounds=True, padding_value=0)")
+            r = ctx.fresh("av")
+            ctx.emit(f"{r} = {lv} {op} {rv}")
+            result.append(r)
+        return result
+    else:
+        lv = ctx.fresh("al")
+        rv = ctx.fresh("ar")
+        ctx.emit(f"{lv} = ct.gather({left_arr}, {left_idx}, check_bounds=True, padding_value=0)")
+        ctx.emit(f"{rv} = ct.gather({right_arr}, {right_idx}, check_bounds=True, padding_value=0)")
+        r = ctx.fresh("av")
+        ctx.emit(f"{r} = {lv} {op} {rv}")
+        return r
 
 
 def emit_runnable_kernel(
@@ -947,10 +1099,14 @@ def emit_runnable_kernel(
     tile_input_rank: int = 0,
     tile_size: int = 256,
     tile_scalar_inputs: list[str] | None = None,
+    # --- Pattern 3: adverb-parallel (no pre-gather) ---
+    adverb_parallel: bool = False,
+    adverb_K: int | None = None,
+    adverb_output_rank: int = 0,
 ) -> tuple[str, int, int]:
     """Emit a complete, compilable @ct.kernel from a DSL program.
 
-    Two patterns are supported:
+    Three patterns are supported:
 
     **Batch + Map** (set batch_input and map_input): one block per batch
     element, one tile per inner Map. Used for neighbor predicates.
@@ -959,8 +1115,14 @@ def emit_runnable_kernel(
     element processes one query from an (N, K) input array.  Used for
     CIG ijk_to_index and similar pointwise-over-queries kernels.
 
+    **Adverb-parallel** (set adverb_parallel=True): flat parallelism over
+    an iteration space determined by adverb composition (e.g. N * K for
+    EachLeft(EachRight(...))).  No input is pre-gathered; the adverb
+    emission in _emit_decomposed handles its own index decomposition
+    and gathering.
+
     Returns:
-        (code, tile_size, map_len) where map_len is 0 for tile-parallel.
+        (code, tile_size, map_len) where map_len is 0 for tile/adverb-parallel.
     """
     prog = parse(source)
     ctx = EmitCtx()
@@ -970,6 +1132,61 @@ def emit_runnable_kernel(
     for name in input_types:
         param_map[name] = name + "_arr"
     ctx.input_params = param_map
+
+    # ------------------------------------------------------------------
+    # Pattern 3: adverb-parallel (no pre-gather, adverb handles indexing)
+    # ------------------------------------------------------------------
+    if adverb_parallel:
+        ctx.emit("bid = ct.bid(0)")
+        idx_var = ctx.fresh("idx")
+        ctx.emit(f"{idx_var} = ct.arange({tile_size}, dtype=ct.int32)")
+        query_idx = ctx.fresh("qidx")
+        ctx.emit(f"{query_idx} = bid * {tile_size} + {idx_var}")
+        ctx.query_idx = query_idx
+        ctx.emit("")
+
+        for name, node in prog.bindings:
+            val = _emit_decomposed(node, ctx, input_types)
+            ctx.bindings[name] = val
+
+        output_val = ctx.bindings.get(prog.output)
+        if output_val is None:
+            raise TypeError(f"Output {prog.output!r} not found")
+
+        ctx.emit("")
+        if isinstance(output_val, list):
+            for ax, val in enumerate(output_val):
+                r = ctx.fresh("out")
+                ctx.emit(f"{r} = ct.astype({val}, ct.int32)")
+                ctx.emit(f"ct.scatter(result_arr, ({query_idx}, {ax}), {r}, check_bounds=True)")
+        else:
+            r = ctx.fresh("out")
+            ctx.emit(f"{r} = ct.astype({output_val}, ct.int32)")
+            ctx.emit(f"ct.scatter(result_arr, {query_idx}, {r}, check_bounds=True)")
+
+        all_params = [f"{name}_arr" for name in input_types]
+        all_params.append("result_arr")
+        all_params.append("TILE: ct.Constant[int]")
+        if adverb_K is not None:
+            all_params.append("K: ct.Constant[int]")
+        params_str = ", ".join(all_params)
+        body_lines = "\n".join(ctx.lines)
+
+        code = f"""\
+import cuda.tile as ct
+import torch
+
+ConstInt = ct.Constant[int]
+
+# --- Generated from DSL (adverb-parallel) ---
+# Source: {source.strip().replace(chr(10), chr(10) + '# ')}
+# TILE={tile_size}, K={adverb_K}, output_rank={adverb_output_rank}
+
+@ct.kernel
+def {kernel_name}({params_str}):
+{body_lines}
+"""
+        return code, tile_size, 0
 
     # ------------------------------------------------------------------
     # Pattern 2: tile-parallel (flat query_idx = bid * TILE + arange)

@@ -24,11 +24,37 @@ C++ components. The opacity of the inner type impedes deconstruction,
 analysis, fusion, and optimisation. The same is true of any system that hides
 structure behind a compiled API.
 
-**The claim.** A small set of **nested layouts** (`cut`, `indexed`, `jagged`,
-`tuple`, `struct`, `flip`) applied over raw tensors, combined with a small set
-of **functions** (`Map`, `Each`, `Where`, `Gather`), form a **portable
-semantic layer** that has the same degree of fungibility as tensors but
-captures the structural richness that tensors erase.
+**The claim.** A small number of orthogonal concepts -- **nested layouts**,
+**leading-shape types**, **verbs**, and **adverbs** -- applied over raw
+tensors, form a **portable semantic layer** that has the same degree of
+fungibility as tensors but captures the structural richness that tensors
+erase.  The minimal conceptual surface:
+
+1. **Nested layouts** (`cut`, `indexed`, `jagged`, `masked`, `fuse`,
+   `reshape`, ...) are metadata over tensors.  They describe how to
+   traverse, partition, and associate the underlying data without moving it.
+   Zero-cost type reinterpretation.
+
+2. **Leading-shape types** (`S_1 / S_2 / ... / scalar`) define what
+   operations see as "the iteration space" vs "one element."  The nesting
+   structure is a property of the value, not the operation.  Layouts move
+   the nesting boundary; the type system tracks the consequences.  `() / i32`
+   is the scalar atom -- rank 0, no iterable shape.
+
+3. **Verbs** (`Add`, `Sub`, `Mul`, ...) are scalar function values.
+   They operate on `() / scalar` atoms and produce `() / scalar` results.
+
+4. **Adverbs** (`Over`, `Each`, `EachLeft`, `EachRight`, `EachBoth`,
+   `Scan`, `Prior`) are function transformers.  They take a verb and return
+   a **new function** with a different scheduling pattern.  Adverbs compose:
+   `EachLeft(EachRight(EachBoth(Add)))` is a function that, when applied to
+   typed inputs, specifies an outer-product-like iteration with componentwise
+   addition -- and compiles directly to a GPU kernel with the correct index
+   arithmetic.
+
+5. **Structural operations** (`Map`, `Where`, `Gather`) connect layouts
+   to computation: Map applies a function over the leading shape, Where
+   extracts coordinates of interest, Gather materialises an indexed layout.
 
 The physical backing is always tensors. The layouts are metadata -- they
 describe how to traverse, partition, and associate the underlying tensor data
@@ -50,16 +76,22 @@ is easy to spread. If adopted, it replaces opaque wrappers (fVDB's GridBatch,
 USD's schema types, Alembic's typed object graph) with transparent,
 analyzable, optimizable descriptions that lower to GPU tensor operations.
 
-**Key technical insight.** Nested layouts serve the role of **Halide's
-schedule** -- they describe how to traverse the data, while operations
-describe what to compute. APL/J/K conflate data shape with iteration
-structure; this system **decouples** them via leading-shape theory: a type
-is a recursive nesting `S_1 / S_2 / ... / scalar` where each `/` is a
-nesting boundary. Operations always work on the leading shape `S_1`; the
-rest is "one element." Layouts (`cut`, `fuse`, `reshape`) move the `/`
-boundary without moving data -- the schedule lives in the type, not in the
-operation. This decoupling is what makes it possible to write domain
-algorithms as tiny compositions of functions and layouts:
+**Key technical insight.** The separation into verbs, adverbs, and layouts
+serves the role of **Halide's algorithm/schedule split**.  Verbs say *what*
+to compute (scalar operations).  Adverbs say *how* to iterate (scheduling
+patterns -- outer products, reductions, scans, zips).  Layouts say *what
+constitutes one element* (nesting boundaries).  All three compose freely,
+and the composition carries enough information for a compiler to emit
+concrete GPU code.
+
+APL/J/K conflate data shape with iteration structure; this system
+**decouples** them via leading-shape theory: a type is a recursive nesting
+`S_1 / S_2 / ... / scalar` where each `/` is a nesting boundary.  Operations
+always work on the leading shape `S_1`; the rest is "one element."  Layouts
+(`cut`, `fuse`, `reshape`) move the `/` boundary without moving data.
+Adverbs compose over verbs to build scheduling specifications that become
+concrete only when applied to typed inputs.  This decoupling is what makes
+it possible to write domain algorithms as tiny compositions:
 
 The entire SPH density calculation can be written as `(R/P/:)\:':` in K9
 syntax -- a tacit composition of a reduction, a product, and structured
@@ -1432,6 +1464,16 @@ Key semantic rules (see Leading Shape Theory section for full details):
 49. cuTile fallback: cutile segments that fail compilation gracefully
     fall back to the evaluator. cuTile is an optimisation; the
     evaluator's torch ops are device-agnostic and correct on CUDA.
+50. Adverb cuTile emission: composed adverb chains
+    (`EachLeft(EachRight(EachBoth(Add)))`) compile directly to cuTile
+    GPU kernels. The adverb chain is the scheduling specification:
+    EachLeft/EachRight determine index decomposition (`qidx // K`,
+    `qidx % K`), EachBoth maps to per-axis gather, the verb becomes
+    the scalar operation. Layout ops (fuse, reshape) are no-ops in
+    the emitter. The planner classifies emittable adverb barriers as
+    `kind="cutile"` instead of `"collective"`. Multi-axis output
+    scatter and K as a kernel constant. No special-case lowering --
+    the adverb composition IS the code generation input.
 
 ### Completed milestones (previously "next steps")
 

@@ -609,3 +609,101 @@ cuTile compilation is an optimisation, not a correctness requirement.
   program, was three imperative phases)
 - `cig.py`: out-of-DSL (unchanged)
 - `hashmap_cuda.py`: out-of-DSL (unchanged, invoked through hooks)
+
+---
+
+## Adverb cuTile Emission: Feb 18 2026
+
+Composed adverb chains compile directly to cuTile GPU kernels. The
+adverb chain `EachLeft(EachRight(EachBoth(Add)))` applied to typed
+inputs `(N,) / (3,) i32` and `(K,) / (3,) i32` generates a kernel
+with N*K threads, correct index decomposition, per-axis gather, and
+componentwise addition -- without any special-case lowering.
+
+### What was changed
+
+**Planner** (`dsl_pipeline.py`):
+
+- `_is_cutile_emittable_adverb(node)`: walks an adverb chain through
+  layout wrappers (fuse, reshape) and returns True when the chain
+  consists of EachLeft/EachRight/EachBoth over a simple arithmetic
+  verb (Add, Sub, Mul, Div).
+- `plan_program`: emittable adverb barriers classified as
+  `kind="cutile"` instead of `"collective"`, routing them through
+  the cuTile try / torch-fallback path.
+- `_barrier_reason`: improved to distinguish emittable adverb barriers
+  (`adverb_data_application_cutile`) from non-emittable ones.
+- `_find_adverb_apply`, `_adverb_input_name`: helpers for detecting
+  adverb applications in segment bindings and extracting input names.
+- `_run_cutile_segment`: when an adverb application is detected,
+  computes `tile_N = N * K` (product of outer iteration dimensions),
+  allocates multi-axis result tensors, and passes K as a kernel
+  constant.
+
+**Emitter** (`dsl_to_cutile.py`):
+
+- `EmitCtx.query_idx`: new field so adverb emission can reference the
+  tile query index.
+- `FuseNode` and `ReshapeNode` handlers in `_emit_decomposed`: layout
+  ops are zero-cost metadata rearrangement, they become no-ops (pass
+  through input value unchanged).
+- `_peel_adverb_chain(fn)`: walks nested `AdverbApplyNode`s and
+  returns the adverb list (outermost-first) plus the verb name.
+- `_emit_adverb_application(node, ctx, input_types)`: the core
+  emission. Analyzes the adverb chain:
+  - EachLeft -> `left_idx = qidx // K`
+  - EachRight -> `right_idx = qidx % K`
+  - EachBoth -> per-axis gather (axis decomposition)
+  - Verb -> scalar operation via `_VERB_OP_TABLE`
+  Returns a decomposed list of per-axis result variables.
+- "Adverb-parallel" Pattern 3 in `emit_runnable_kernel`: no input
+  pre-gather, stores `query_idx` in ctx, multi-axis scatter for
+  decomposed output, K as `ct.Constant[int]` kernel parameter.
+
+### Generated kernel structure
+
+For the leafwise pipeline's coordinate expansion
+(`EachLeft(EachRight(EachBoth(Add)))` on coords and deltas):
+
+```
+qidx = bid * TILE + arange(TILE)
+left_idx = qidx // K       # EachLeft: which coord
+right_idx = qidx % K       # EachRight: which delta
+# Per-axis gather + Add (EachBoth + verb)
+for ax in [0, 1, 2]:
+    c = gather(coords, (left_idx, ax))
+    d = gather(deltas, (right_idx, ax))
+    r = c + d
+    scatter(result, (qidx, ax), r)
+```
+
+### Design principle
+
+No special-case lowering. The adverb composition IS the scheduling
+specification. The emitter reads it as-is -- EachLeft says "iterate
+left", EachRight says "iterate right", EachBoth says "zip per
+component", Add says "+". The type system provides the dimensions
+(N, K, 3). This is the verb/adverb/layout separation working as
+intended: the same framework that compiles masked Gather chains and
+hierarchical traversals also compiles composed iteration patterns,
+from the same small set of primitives.
+
+### Algebraic note
+
+Scalar verbs (Add, Sub, ...) are `() / scalar -> () / scalar`
+operations. EachBoth lifts them to componentwise over matching leading
+shapes. But since scalar verbs have no concept of "the whole thing" --
+vector addition IS componentwise addition -- EachBoth on scalar verbs
+is algebraically equivalent to auto-broadcasting (APL's "scalar
+pervasion"). The distinction matters for aggregate functions (Sort,
+Over), not for arithmetic. The axis decomposition in the cuTile
+emitter naturally handles both interpretations: Add on decomposed
+`list + list` already does componentwise addition.
+
+### Verification
+
+- Leafwise pipeline segment 0 (`expanded_lc`) now classified as
+  `kind="cutile"` with `reason="adverb_data_application_cutile"`.
+- All 14 leafwise tests pass (11 CPU + 3 GPU).
+- All existing cuTile tests pass (e2e, cross-leaf, CIG3, hashmap).
+- GPU result matches CPU reference exactly.

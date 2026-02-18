@@ -8,19 +8,19 @@ ConstInt = ct.Constant[int]
 # active_masks = Gather(Input("output_masks"), Input("occupied"))
 # active_coords = HierarchicalKeyDecode(active_keys, Const([4, 5]))
 # active_coords
-# Tile input: output_masks (rank=1), TILE=256
+# Tile input: hash_map (rank=0), TILE=256
 
 @ct.kernel
-def seg_active_coords_6d0191c2(output_masks_arr, hash_map_arr, occupied_arr, result_arr, TILE: ct.Constant[int]):
+def seg_active_coords_6d0191c2(hash_map_arr, occupied_arr, output_masks_arr, result_arr, TILE: ct.Constant[int]):
     bid = ct.bid(0)
     idx_1 = ct.arange(256, dtype=ct.int32)
     qidx_2 = bid * 256 + idx_1
     
-    qi_3 = ct.gather(output_masks_arr, (qidx_2, 0), check_bounds=True, padding_value=0)
+    qi_3 = ct.gather(hash_map_arr, qidx_2, check_bounds=True, padding_value=0)
     
     
-    gath_4 = ct.gather(hash_map_arr, occupied_arr, check_bounds=True, padding_value=-1)
-    gath_5 = ct.gather(qi_3, occupied_arr, check_bounds=True, padding_value=-1)
+    gath_4 = ct.gather(qi_3, occupied_arr, check_bounds=True, padding_value=-1)
+    gath_5 = ct.gather(output_masks_arr, occupied_arr, check_bounds=True, padding_value=-1)
     # HierarchicalKeyDecode: bit_widths=[4, 5]
     dk_6 = ct.astype(gath_4, ct.int64)
     dx_7 = ct.int64(0)

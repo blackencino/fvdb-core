@@ -44,6 +44,7 @@ from .dsl_ast import (
     EachNode,
     EqNode,
     FloorDivNode,
+    FuseNode,
     HashMapBuildNode,
     HashMapLookupNode,
     HashMapOccupiedNode,
@@ -55,6 +56,7 @@ from .dsl_ast import (
     OverNode,
     Program,
     RefNode,
+    ReshapeNode,
     ShiftLeafMaskNode,
     ShiftLeftNode,
     ShiftRightNode,
@@ -407,6 +409,28 @@ def _node_to_source(node: Node) -> str:
     raise TypeError(f"Cannot serialize {type(node).__name__} to DSL source")
 
 
+def _find_adverb_apply(node: Node) -> ApplyNode | None:
+    """Find an ApplyNode(AdverbApplyNode(...), args) inside a binding node.
+
+    Peels through layout wrappers (FuseNode, ReshapeNode) to reach the
+    actual adverb data application.
+    """
+    while isinstance(node, (FuseNode, ReshapeNode)):
+        node = node.input
+    if isinstance(node, ApplyNode) and isinstance(node.fn, AdverbApplyNode):
+        return node
+    return None
+
+
+def _adverb_input_name(node: Node) -> str | None:
+    """Extract the InputNode name from a node, peeling layout wrappers."""
+    while isinstance(node, (FuseNode, ReshapeNode)):
+        node = node.input
+    if isinstance(node, InputNode):
+        return node.name
+    return None
+
+
 def _run_cutile_segment(
     segment: PipelineSegment,
     env: EvalEnv,
@@ -448,28 +472,62 @@ def _run_cutile_segment(
     lines.append(last_name)
     source = "\n".join(lines)
 
-    tile_input, tile_input_rank = _determine_tile_input(segment_input_types)
-
     import hashlib
 
     seg_hash = hashlib.md5(source.encode()).hexdigest()[:8]
     kernel_name = f"seg_{last_name}_{seg_hash}"
 
     TILE = 256
-    code, tile_size, _ = emit_runnable_kernel(
-        source,
-        segment_input_types,
-        kernel_name=kernel_name,
-        tile_input=tile_input,
-        tile_input_rank=tile_input_rank,
-        tile_size=TILE,
-    )
+
+    # Detect adverb data application in the segment.
+    adverb_apply = None
+    for binding in segment.bindings:
+        adverb_apply = _find_adverb_apply(binding.node)
+        if adverb_apply is not None:
+            break
+
+    if adverb_apply is not None:
+        # Adverb-parallel: iteration space = product of outer dims.
+        left_name = _adverb_input_name(adverb_apply.args[0])
+        right_name = _adverb_input_name(adverb_apply.args[1])
+        if left_name is None or right_name is None:
+            raise TypeError("Adverb args must resolve to named inputs")
+
+        right_type = segment_input_types[right_name]
+        right_extent = right_type.iteration_shape.extents[0] if right_type.rank > 0 else None
+        K = right_extent.n if isinstance(right_extent, Static) else None
+
+        result_type = all_types.get(last_name)
+        output_rank = 0
+        if result_type is not None and isinstance(result_type.element_type, Type):
+            et = result_type.element_type
+            if et.rank > 0 and isinstance(et.iteration_shape.extents[0], Static):
+                output_rank = et.iteration_shape.extents[0].n
+
+        code, tile_size, _ = emit_runnable_kernel(
+            source,
+            segment_input_types,
+            kernel_name=kernel_name,
+            tile_size=TILE,
+            adverb_parallel=True,
+            adverb_K=K,
+            adverb_output_rank=output_rank,
+        )
+    else:
+        tile_input, tile_input_rank = _determine_tile_input(segment_input_types)
+        code, tile_size, _ = emit_runnable_kernel(
+            source,
+            segment_input_types,
+            kernel_name=kernel_name,
+            tile_input=tile_input,
+            tile_input_rank=tile_input_rank,
+            tile_size=TILE,
+        )
 
     kernel_fn = _compile_kernel(code, kernel_name)
 
     torch_device = torch.device(device)
     input_tensors = {}
-    tile_N = 0
     for name, ty in segment_input_types.items():
         if name in env.inputs:
             data = env.inputs[name].data
@@ -482,11 +540,21 @@ def _run_cutile_segment(
         else:
             t = torch.as_tensor(data).to(torch_device)
         input_tensors[name] = t
-        if name == tile_input:
-            tile_N = t.shape[0]
+
+    if adverb_apply is not None:
+        N_left = input_tensors[left_name].shape[0]
+        K_runtime = input_tensors[right_name].shape[0]
+        tile_N = N_left * K_runtime
+        if output_rank > 0:
+            result_shape = (math.ceil(tile_N / TILE) * TILE, output_rank)
+        else:
+            result_shape = (math.ceil(tile_N / TILE) * TILE,)
+    else:
+        tile_N = input_tensors[tile_input].shape[0]
+        result_shape = (math.ceil(tile_N / TILE) * TILE,)
 
     n_blocks = math.ceil(tile_N / TILE)
-    result_t = torch.full((n_blocks * TILE,), -1, dtype=torch.int32, device=torch_device)
+    result_t = torch.full(result_shape, -1, dtype=torch.int32, device=torch_device)
 
     import cuda.tile as ct
 
@@ -495,6 +563,8 @@ def _run_cutile_segment(
         launch_args.append(input_tensors[name])
     launch_args.append(result_t)
     launch_args.append(TILE)
+    if adverb_apply is not None and K is not None:
+        launch_args.append(K)
 
     ct.launch(
         torch.cuda.current_stream(),
@@ -894,13 +964,47 @@ def _barrier_reason(node: Node) -> str:
         return "shift_leaf_mask_collective"
     if isinstance(node, MaskToCoordsNode):
         return "mask_to_coords_collective"
+    if _is_cutile_emittable_adverb(node):
+        return "adverb_data_application_cutile"
+    # Check deeper for adverb applications wrapped in layout ops.
+    inner = node
+    while isinstance(inner, (FuseNode, ReshapeNode)):
+        inner = inner.input
     if (
-        isinstance(node, ApplyNode)
-        and isinstance(node.fn, AdverbApplyNode)
-        and node.fn.adverb in ("EachLeft", "EachRight")
+        isinstance(inner, ApplyNode)
+        and isinstance(inner.fn, AdverbApplyNode)
+        and inner.fn.adverb in ("EachLeft", "EachRight")
     ):
         return "adverb_data_application"
     return "contains_barrier_subgraph"
+
+
+_EMITTABLE_VERBS = {"Add", "Sub", "Mul", "Div"}
+
+
+def _is_cutile_emittable_adverb(node: Node) -> bool:
+    """Check whether a barrier node is an adverb data application that
+    the cuTile emitter can handle.
+
+    Returns True when the outermost barrier is an ApplyNode whose function
+    is a chain of EachLeft / EachRight / EachBoth over a simple arithmetic
+    verb.  The node may be wrapped in layout ops (fuse, reshape) which are
+    no-ops at the kernel level.
+    """
+    # Peel through layout wrappers (fuse / reshape are zero-cost metadata).
+    while isinstance(node, (FuseNode, ReshapeNode)):
+        node = node.input
+
+    if not (isinstance(node, ApplyNode) and isinstance(node.fn, AdverbApplyNode)):
+        return False
+
+    fn = node.fn
+    while isinstance(fn, AdverbApplyNode):
+        if fn.adverb not in ("EachLeft", "EachRight", "EachBoth"):
+            return False
+        fn = fn.fn
+
+    return isinstance(fn, VerbRefNode) and fn.name in _EMITTABLE_VERBS
 
 
 def _normalize_adverb_node(node: Node) -> Node:
@@ -973,9 +1077,10 @@ def plan_program(program: Program) -> PipelinePlan:
         binding = PlannedBinding(name=name, node=node)
         if _contains_barrier(node):
             flush_cutile()
+            kind = "cutile" if _is_cutile_emittable_adverb(node) else "collective"
             segments.append(
                 PipelineSegment(
-                    kind="collective",
+                    kind=kind,
                     reason=_barrier_reason(node),
                     bindings=(binding,),
                 )
