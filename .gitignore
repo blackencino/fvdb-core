@@ -70,3 +70,12 @@ scratch/
 
 # benchmark json files
 *_benchmark.json
+# Ignore generated files in fvdb_tile/prototype/_generated
+fvdb_tile/prototype/_generated/
+
+# Ignore generated files in fvdb_tile/benchmarks/_generated
+fvdb_tile/benchmarks/_generated/
+
+# Ignore generated files in fvdb_tile/tests/_generated
+fvdb_tile/tests/_generated/
+
