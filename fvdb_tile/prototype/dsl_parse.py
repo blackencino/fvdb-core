@@ -34,10 +34,10 @@ from .dsl_ast import (
     CountNode,
     CutNode,
     DecomposeNode,
+    DilateLeafMasksNode,
     DivNode,
     EachNode,
     EqNode,
-    ExpandOffsetsNode,
     FieldNode,
     FindNode,
     FlattenNode,
@@ -47,6 +47,7 @@ from .dsl_ast import (
     GENode,
     HashMapBuildNode,
     HashMapLookupNode,
+    HashMapOccupiedNode,
     HierarchicalKeyDecodeNode,
     HierarchicalKeyNode,
     InBoundsNode,
@@ -136,15 +137,16 @@ _BUILTINS = {
     "Eq",
     "FloorDiv",
     "All",
-    "ExpandOffsets",
     "ShiftLeft",
     "ShiftRight",
     "BitXor",
     "HashMapBuild",
     "HashMapLookup",
+    "HashMapOccupied",
     "ScatterReduce",
     "ShiftLeafMask",
     "MaskToCoords",
+    "DilateLeafMasks",
     "Input",
     "Const",
     "Apply",
@@ -496,9 +498,6 @@ class Parser:
         if name == "All":
             return AllNode(_expr(args[0]))
 
-        if name == "ExpandOffsets":
-            return ExpandOffsetsNode(_expr(args[0]), _expr(args[1]))
-
         if name == "ShiftLeft":
             return ShiftLeftNode(_expr(args[0]), _expr(args[1]))
 
@@ -514,6 +513,9 @@ class Parser:
         if name == "HashMapLookup":
             return HashMapLookupNode(_expr(args[0]), _expr(args[1]))
 
+        if name == "HashMapOccupied":
+            return HashMapOccupiedNode(_expr(args[0]))
+
         if name == "ScatterReduce":
             return ScatterReduceNode(_expr(args[0]), _expr(args[1]), _expr(args[2]))
 
@@ -522,6 +524,12 @@ class Parser:
 
         if name == "MaskToCoords":
             return MaskToCoordsNode(_expr(args[0]), _expr(args[1]))
+
+        if name == "DilateLeafMasks":
+            return DilateLeafMasksNode(
+                _expr(args[0]), _expr(args[1]), _expr(args[2]),
+                _expr(args[3]),
+            )
 
         # -- Adverbs: function -> function transformers --
         # Adverbs always produce AdverbApplyNode. If data args follow,

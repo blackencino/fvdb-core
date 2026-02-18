@@ -20,17 +20,19 @@ planner, and executed via the pipeline executor.  This demonstrates:
 2. The DSL can express non-trivial grid operations as small compositions
    of reusable primitives.
 
-**Stride=1 DSL program** (5 bindings, 2 barriers)::
+**Stride=1 DSL program** (5 bindings, 3 barriers)::
 
-    flat    = ExpandOffsets(Input("coords"), Input("offsets"))
+    flat    = reshape(fuse(EachLeft(EachRight(EachBoth(Add)),
+                 Input("coords"), Input("offsets"))), Const([-1]))
     codes   = HierarchicalKey(flat, Const([3, 4, 5]))
     sorted  = Sort(codes)                          # barrier
     unique  = Unique(sorted)                       # barrier
     result  = HierarchicalKeyDecode(unique, Const([3, 4, 5]))
 
-**Stride>1 DSL program** (11 bindings, 3 barriers)::
+**Stride>1 DSL program** (11 bindings, 4 barriers)::
 
-    flat      = ExpandOffsets(Input("coords"), Input("offsets"))
+    flat      = reshape(fuse(EachLeft(EachRight(EachBoth(Add)),
+                    Input("coords"), Input("offsets"))), Const([-1]))
     remainder = Mod(flat, Input("stride"))
     eq_zero   = Eq(remainder, Const([0, 0, 0]))
     all_div   = All(eq_zero)
@@ -80,7 +82,7 @@ def _conv_grid_source(stride_1: bool, bit_widths: list[int]) -> str:
     """Build the DSL source string for conv_grid."""
     bw = repr(bit_widths)
     lines = [
-        'flat = ExpandOffsets(Input("coords"), Input("offsets"))',
+        'flat = reshape(fuse(EachLeft(EachRight(EachBoth(Add)), Input("coords"), Input("offsets"))), Const([-1]))',
     ]
     if not stride_1:
         lines += [
@@ -209,11 +211,9 @@ def conv_grid(
         inputs["stride"] = Value(Type(Shape(Static(3)), ScalarType.I32), stride_t)
 
     # --- Execute via pipeline ---
-    # Use device=None: the evaluator's torch ops (sort, unique, etc.) are
-    # device-agnostic and run on CUDA when inputs are on CUDA.  The cutile
-    # segments (ExpandOffsets, HierarchicalKey) use the torch evaluator which
-    # handles them correctly on any device.  cuTile compilation is not needed
-    # here -- the collectives dominate the runtime.
+    # Use device=None: the evaluator's torch ops are device-agnostic and
+    # run on CUDA when inputs are on CUDA.  cuTile compilation is not
+    # needed here -- the collectives (Sort, Unique) dominate the runtime.
     result = pipeline.run(inputs, device=None)
     output = result.output.data
 

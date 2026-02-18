@@ -1209,6 +1209,27 @@ class HashMapLookupNode(Node):
 
 
 @dataclass(frozen=True)
+class HashMapOccupiedNode(Node):
+    """HashMapOccupied(key_arr): indices of occupied slots in a hash map.
+
+    Returns the indices of slots that contain real keys, hiding the
+    sentinel value.  The caller sees only "which slots have real keys"
+    without knowing how emptiness is encoded.
+
+    Barrier: output count is dynamic (depends on how many keys were inserted).
+    """
+
+    key_arr: Node  # (S,) i64 -- hash map key array
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        # Returns (D,) i64 -- indices of occupied slots (dynamic count).
+        return Type(Shape(Dynamic()), ScalarType.I64)
+
+    def __repr__(self) -> str:
+        return f"HashMapOccupied({self.key_arr})"
+
+
+@dataclass(frozen=True)
 class ScatterReduceNode(Node):
     """Scatter values into buckets by key with a reduce verb.
 
@@ -1309,7 +1330,6 @@ class DilateLeafMasksNode(Node):
     leaf_coords: Node      # (L, 3) i32 -- leaf coords in leaf space
     offsets: Node          # (K, 3) i32 -- voxel-space kernel offsets
     hash_map_keys: Node    # (S,) i64 -- pre-built hash map key array
-    storage_size: Node     # scalar i64 -- hash map storage size
 
     def infer_type(self, env: Env, inputs: InputDecls) -> Type:
         # Returns (S, 8) i64 -- accumulated output masks in hash map order.
@@ -1318,7 +1338,7 @@ class DilateLeafMasksNode(Node):
     def __repr__(self) -> str:
         return (
             f"DilateLeafMasks({self.leaf_masks}, {self.leaf_coords}, "
-            f"{self.offsets}, {self.hash_map_keys}, {self.storage_size})"
+            f"{self.offsets}, {self.hash_map_keys})"
         )
 
 

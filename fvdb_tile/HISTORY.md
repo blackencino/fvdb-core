@@ -540,3 +540,72 @@ Backend preference order: cuTile > torch GPU > CUDA/NVRTC.
 - `cig.py`: out-of-DSL (construction is imperative torch -- unchanged)
 - `hashmap_cuda.py`: out-of-DSL (hand-written CUDA -- unchanged, but
   now invoked through DSL hooks rather than bypassing the pipeline)
+
+---
+
+## Unified DSL Programs and Adverb Composition: Feb 18 2026
+
+Moved all consumer code from manual AST construction to DSL program
+strings, unified conv_grid_leafwise as a single DSL program, and
+replaced the `ExpandOffsets` special-case primitive with adverb
+composition from existing DSL pieces.
+
+### Phase 1: DSL strings over manual AST
+
+All places outside the DSL infrastructure that manually constructed
+`Program` objects in Python now use DSL program strings instead.
+`DilateLeafMasks` added to the parser so the conv_grid_leafwise
+pipeline can be expressed as a string. Stale AST node imports
+cleaned up in test_pipeline.py.
+
+### Phase 2: Unified conv_grid_leafwise DSL program
+
+conv_grid_leafwise rewritten from three imperative torch phases
+(Phase A: hash map build, Phase B: DilateLeafMasks, Phase C: coord
+extraction) to a single 13-binding DSL program with 4 inputs. Zero
+imperative torch in the pipeline path.
+
+New primitives:
+
+- `HashMapOccupied(key_arr)`: returns indices of occupied slots in a
+  hash map. Hides the sentinel value (`HASH_MAP_EMPTY_KEY` is an
+  implementation detail, not part of the algorithm). Classified as a
+  barrier (dynamic output size). Composes with `Gather` for extracting
+  active entries.
+- `DilateLeafMasks` simplified from 5 arguments to 4 (storage_size
+  dropped -- always derivable from `hash_map_keys.shape[0]`).
+
+### Phase 3: ExpandOffsets replaced by adverb composition
+
+`ExpandOffsets` was a special-case primitive for broadcast-add +
+flatten. Its docstring already said it was equivalent to
+`fuse(EachLeft(EachRight(EachBoth(Add)), coords, offsets))`. Replaced
+it with the real composition:
+
+```
+reshape(fuse(EachLeft(EachRight(EachBoth(Add)), coords, offsets)), Const([-1]))
+```
+
+This required extending the pipeline's barrier detection to recognise
+`ApplyNode(AdverbApplyNode("EachLeft"|"EachRight"), data_args)` as
+barriers -- they create new iteration dimensions, same as `Where` or
+`Unique`. The evaluator already handled the adverb composition
+correctly; only the pipeline planner needed the fix.
+
+`ExpandOffsets` removed from the parser. AST node and evaluator left
+as dead code (documents the semantic equivalence).
+
+### Phase 4: cuTile fallback
+
+Added graceful fallback in the pipeline executor: when a cutile
+segment fails compilation on GPU, the evaluator handles it instead.
+The evaluator's torch ops are device-agnostic and correct on CUDA.
+cuTile compilation is an optimisation, not a correctness requirement.
+
+### Current status
+
+- `conv_grid.py`: **fully DSL-driven** (adverb composition)
+- `conv_grid_leafwise.py`: **fully DSL-driven** (unified 13-binding
+  program, was three imperative phases)
+- `cig.py`: out-of-DSL (unchanged)
+- `hashmap_cuda.py`: out-of-DSL (unchanged, invoked through hooks)

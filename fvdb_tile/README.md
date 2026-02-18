@@ -1248,8 +1248,8 @@ File inventory:
 | `prototype/dsl_to_cutile.py` | core | DSL AST -> cuTile Python source emitter (preference #1) |
 | `prototype/dsl_to_cuda.py` | core | DSL AST -> CUDA C++ emitter, last-resort backend (preference #3) |
 | `prototype/dsl_lower.py` | core | Dialect lowering pass: rewrite dialect nodes to core AST |
-| `prototype/conv_grid.py` | **fully DSL-driven** | conv_grid topology expansion via pipeline (ExpandOffsets + Sort + Unique) |
-| `prototype/conv_grid_leafwise.py` | **DSL-driven** | Leafwise conv_grid via DilateLeafMasks pipeline (fused CUDA kernel as backend) |
+| `prototype/conv_grid.py` | **fully DSL-driven** | conv_grid topology expansion via DSL pipeline (adverb composition + Sort + Unique) |
+| `prototype/conv_grid_leafwise.py` | **fully DSL-driven** | Leafwise conv_grid as unified 13-binding DSL program (DilateLeafMasks + HashMapOccupied + adverb composition) |
 | `prototype/cig.py` | **out-of-DSL** | CompressedCIG3 builder (imperative torch), root lookup, reference query |
 | `prototype/hashmap_cuda.py` | **out-of-DSL** | GPU hash map build/lookup/scatter_reduce + fused conv_grid_dilate kernel (NVRTC JIT) |
 | `prototype/cuda_launch.py` | infra | Generic NVRTC compile-and-launch utility |
@@ -1382,10 +1382,10 @@ Key semantic rules (see Leading Shape Theory section for full details):
 32. Barrier-based pipeline: AST partitioned into cutile + collective
     segments, dispatched to GPU kernel compilation and torch ops
     respectively. Hooks mechanism for pluggable backends.
-33. conv_grid as fully DSL-driven pipeline: ExpandOffsets +
-    HierarchicalKey + Sort + Unique + HierarchicalKeyDecode expressed
-    as DSL string, executed through barrier-aware pipeline. Cutile
-    segments compile to GPU kernels, collectives to torch GPU ops.
+33. conv_grid as fully DSL-driven pipeline: adverb composition
+    (EachLeft/EachRight/EachBoth) + HierarchicalKey + Sort + Unique +
+    HierarchicalKeyDecode expressed as DSL string, executed through
+    barrier-aware pipeline.
 34. GPU hash map: build (atomicCAS), lookup (probe), scatter_reduce
     (atomicOr/Add) via NVRTC JIT. Dialect mechanism wraps as DSL nodes.
 35. conv_grid_leafwise: O(L*K) bitmask dilation replaces O(N*K) dense
@@ -1408,12 +1408,30 @@ Key semantic rules (see Leading Shape Theory section for full details):
 41. `DilateLeafMasksNode`: typed 8x8x8 leaf primitive for fused mask
     dilation. GPU dispatches to `conv_grid_dilate_kernel` via hook.
     CPU evaluates via sequential shift + scatter-OR reference.
-42. conv_grid_leafwise fully DSL-driven: three-phase pipeline (torch
-    collectives + DilateLeafMasks CUDA + torch collectives). All 14
-    tests pass (11 CPU + 3 GPU).
+42. conv_grid_leafwise fully DSL-driven: unified 13-binding DSL
+    program with automatic pipeline segmentation. All 14 tests pass
+    (11 CPU + 3 GPU).
 43. Leafwise conv_grid beats fVDB conv_grid by 1.5-1.7x at 100K+
     voxels with k=5. The O(L*K) bitmask dilation avoids O(N*K) dense
     expansion. DSL-driven pipeline, not hand-wired.
+44. `HashMapOccupied(key_arr)`: returns indices of occupied slots,
+    hiding the sentinel value. Composes with `Gather` for extracting
+    active entries without leaking implementation details.
+45. `DilateLeafMasks` simplified to 4 args (storage_size derived from
+    key array shape internally).
+46. conv_grid_leafwise unified as a single 13-binding DSL program
+    (was three imperative phases). Zero imperative torch in the
+    pipeline path; all operations expressed as DSL primitives.
+47. `ExpandOffsets` removed from parser. Replaced by adverb
+    composition: `reshape(fuse(EachLeft(EachRight(EachBoth(Add)),
+    coords, offsets)), [-1])`. The DSL composes from existing
+    primitives rather than special-casing.
+48. Pipeline barrier detection extended: `ApplyNode` wrapping
+    `EachLeft`/`EachRight` adverbs with data arguments classified as
+    barriers (they create new iteration dimensions).
+49. cuTile fallback: cutile segments that fail compilation gracefully
+    fall back to the evaluator. cuTile is an optimisation; the
+    evaluator's torch ops are device-agnostic and correct on CUDA.
 
 ### Completed milestones (previously "next steps")
 
@@ -1459,13 +1477,11 @@ inter-segment references to kernel inputs automatically.  The hooks
 mechanism on `EvalEnv` makes the dispatch pluggable.
 
 **conv_grid (fully DSL-driven).**  First multi-step pipeline
-application.  Algorithm expressed as a DSL program string
-(ExpandOffsets + HierarchicalKey + Sort + Unique +
-HierarchicalKeyDecode), parsed, planned, and executed through the
-pipeline executor.  Correctness verified against fVDB reference at
-multiple scales.  `pipeline.run(device=...)` passes through so cutile
-segments compile to GPU kernels and collectives dispatch to torch GPU
-ops.
+application.  Algorithm expressed as a DSL program string using adverb
+composition for coordinate expansion (EachLeft/EachRight/EachBoth) +
+HierarchicalKey + Sort + Unique + HierarchicalKeyDecode.  Parsed,
+planned, and executed through the pipeline executor.  Correctness
+verified against fVDB reference at multiple scales.
 
 **GPU hash map.**  Hand-written CUDA kernels for hash map build
 (atomicCAS), lookup (probe loop), and scatter-reduce (atomicOr/Add).

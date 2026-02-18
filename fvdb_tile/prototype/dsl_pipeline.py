@@ -43,10 +43,10 @@ from .dsl_ast import (
     DilateLeafMasksNode,
     EachNode,
     EqNode,
-    ExpandOffsetsNode,
     FloorDivNode,
     HashMapBuildNode,
     HashMapLookupNode,
+    HashMapOccupiedNode,
     InputNode,
     MapNode,
     MaskToCoordsNode,
@@ -65,7 +65,7 @@ from .dsl_ast import (
 )
 from .dsl_eval import EvalEnv, eval_node
 from .dsl_parse import parse
-from .ops import Value, hash_map_build, hash_map_lookup
+from .ops import HASH_MAP_EMPTY_KEY, Value, hash_map_build, hash_map_lookup
 from .types import Dynamic, ScalarType, Shape, Static, Type, coord_type
 
 
@@ -121,7 +121,13 @@ class PipelineExecutable:
 
         for segment in self.plan.segments:
             if segment.kind == "cutile" and device == "cuda":
-                _run_cutile_segment(segment, env, input_types, all_types, device)
+                try:
+                    _run_cutile_segment(segment, env, input_types, all_types, device)
+                except Exception:
+                    # cuTile compilation is an optimisation; fall back to the
+                    # evaluator (torch ops are device-agnostic and work on CUDA).
+                    for binding in segment.bindings:
+                        env.bindings[binding.name] = eval_node(binding.node, env)
             elif segment.kind == "cuda" and device == "cuda":
                 _run_cuda_segment(segment, env, input_types, all_types, device)
             else:
@@ -277,7 +283,6 @@ def _node_to_source(node: Node) -> str:
         EachLeftNode,
         EachRightNode,
         EqNode,
-        ExpandOffsetsNode,
         FieldNode,
         FindNode,
         FlattenNode,
@@ -381,8 +386,6 @@ def _node_to_source(node: Node) -> str:
         return f"FloorDiv({_node_to_source(node.a)}, {_node_to_source(node.b)})"
     if isinstance(node, AllNode):
         return f"All({_node_to_source(node.input)})"
-    if isinstance(node, ExpandOffsetsNode):
-        return f"ExpandOffsets({_node_to_source(node.coords)}, {_node_to_source(node.offsets)})"
     if isinstance(node, ShiftLeftNode):
         return f"ShiftLeft({_node_to_source(node.a)}, {_node_to_source(node.b)})"
     if isinstance(node, ShiftRightNode):
@@ -393,11 +396,13 @@ def _node_to_source(node: Node) -> str:
         return f"HashMapBuild({_node_to_source(node.keys)})"
     if isinstance(node, HashMapLookupNode):
         return f"HashMapLookup({_node_to_source(node.key_arr)}, {_node_to_source(node.queries)})"
+    if isinstance(node, HashMapOccupiedNode):
+        return f"HashMapOccupied({_node_to_source(node.key_arr)})"
     if isinstance(node, DilateLeafMasksNode):
         return (
             f"DilateLeafMasks({_node_to_source(node.leaf_masks)}, "
             f"{_node_to_source(node.leaf_coords)}, {_node_to_source(node.offsets)}, "
-            f"{_node_to_source(node.hash_map_keys)}, {_node_to_source(node.storage_size)})"
+            f"{_node_to_source(node.hash_map_keys)})"
         )
     raise TypeError(f"Cannot serialize {type(node).__name__} to DSL source")
 
@@ -783,9 +788,8 @@ def _make_collective_hooks(device: str) -> dict:
         leaf_coords_val = eval_node(node.leaf_coords, EvalEnv(env.inputs, env.bindings))
         offsets_val = eval_node(node.offsets, EvalEnv(env.inputs, env.bindings))
         hash_map_keys_val = eval_node(node.hash_map_keys, EvalEnv(env.inputs, env.bindings))
-        storage_size_val = eval_node(node.storage_size, EvalEnv(env.inputs, env.bindings))
-        ss_data = storage_size_val.data
-        ss = int(ss_data.item()) if isinstance(ss_data, torch.Tensor) else int(ss_data)
+        ka = hash_map_keys_val.data
+        ss = ka.shape[0]
         result_type = Type(Shape(Dynamic()), Type(Shape(Static(8)), ScalarType.I64))
         if torch_device.type != "cpu":
             from .hashmap_cuda import gpu_conv_grid_dilate
@@ -793,11 +797,20 @@ def _make_collective_hooks(device: str) -> dict:
             lm = leaf_masks_val.data.to(torch_device)
             lc = leaf_coords_val.data.to(torch_device)
             offs = offsets_val.data.to(device=torch_device, dtype=torch.int32)
-            ka = hash_map_keys_val.data.to(torch_device)
+            ka = ka.to(torch_device)
             output_masks = gpu_conv_grid_dilate(lm, lc, offs, ka, ss)
             return Value(result_type, output_masks)
         else:
             return eval_node(node, EvalEnv(env.inputs, env.bindings))
+
+    def hashmap_occupied_hook(node, env):
+        key_arr_val = eval_node(node.key_arr, EvalEnv(env.inputs, env.bindings))
+        ka = key_arr_val.data
+        if not isinstance(ka, torch.Tensor):
+            raise TypeError(f"HashMapOccupied requires tensor data, got {type(ka)}")
+        ka = ka.to(torch_device)
+        occupied = torch.nonzero(ka != HASH_MAP_EMPTY_KEY, as_tuple=False).squeeze(1)
+        return Value(Type(Shape(Dynamic()), ScalarType.I64), occupied.to(torch.int64))
 
     return {
         WhereNode: where_hook,
@@ -807,6 +820,7 @@ def _make_collective_hooks(device: str) -> dict:
         DilateLeafMasksNode: dilate_leaf_masks_hook,
         HashMapBuildNode: hashmap_build_hook,
         HashMapLookupNode: hashmap_lookup_hook,
+        HashMapOccupiedNode: hashmap_occupied_hook,
     }
 
 
@@ -817,7 +831,7 @@ def _make_collective_hooks(device: str) -> dict:
 
 _BARRIER_NODE_TYPES = (
     WhereNode, SortNode, UniqueNode, OverNode,
-    HashMapBuildNode, HashMapLookupNode,
+    HashMapBuildNode, HashMapLookupNode, HashMapOccupiedNode,
     DilateLeafMasksNode,
     ShiftLeafMaskNode, MaskToCoordsNode,
 )
@@ -837,6 +851,16 @@ def _check_barriers(node: Node, in_map_body: bool) -> bool:
             pass  # safe for cuTile: tile-level reduction inside per-element body
         else:
             return True
+    # Adverb data applications (EachLeft/EachRight with data args) create new
+    # iteration dimensions, so they are barriers -- same as Where or Unique.
+    if (
+        isinstance(node, ApplyNode)
+        and isinstance(node.fn, AdverbApplyNode)
+        and node.fn.adverb in ("EachLeft", "EachRight")
+        and len(node.args) > 0
+        and not in_map_body
+    ):
+        return True
     for name, child in vars(node).items():
         child_in_body = in_map_body or (isinstance(node, (MapNode, EachNode)) and name == "body")
         if isinstance(child, Node):
@@ -862,12 +886,20 @@ def _barrier_reason(node: Node) -> str:
         return "hashmap_build_collective"
     if isinstance(node, HashMapLookupNode):
         return "hashmap_lookup_collective"
+    if isinstance(node, HashMapOccupiedNode):
+        return "hashmap_occupied_collective"
     if isinstance(node, DilateLeafMasksNode):
         return "dilate_leaf_masks_cuda"
     if isinstance(node, ShiftLeafMaskNode):
         return "shift_leaf_mask_collective"
     if isinstance(node, MaskToCoordsNode):
         return "mask_to_coords_collective"
+    if (
+        isinstance(node, ApplyNode)
+        and isinstance(node.fn, AdverbApplyNode)
+        and node.fn.adverb in ("EachLeft", "EachRight")
+    ):
+        return "adverb_data_application"
     return "contains_barrier_subgraph"
 
 

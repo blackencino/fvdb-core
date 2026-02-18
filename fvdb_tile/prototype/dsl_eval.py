@@ -41,6 +41,7 @@ from .dsl_ast import (
     DilateLeafMasksNode,
     HashMapBuildNode,
     HashMapLookupNode,
+    HashMapOccupiedNode,
     HierarchicalKeyDecodeNode,
     MaskToCoordsNode,
     ScatterReduceNode,
@@ -75,6 +76,7 @@ from .dsl_ast import (
 from .dsl_parse import parse
 from .layouts import MaskedElement
 from .ops import (
+    HASH_MAP_EMPTY_KEY,
     VERBS,
     FnValue,
     StructValue,
@@ -714,6 +716,12 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
         result_type = node.infer_type(type_env, input_types)
         return Value(result_type, slots)
 
+    if isinstance(node, HashMapOccupiedNode):
+        key_arr_val = eval_node(node.key_arr, env)
+        ka = key_arr_val.data
+        occupied = torch.nonzero(ka != HASH_MAP_EMPTY_KEY, as_tuple=False).squeeze(1)
+        return Value(Type(Shape(Dynamic()), ScalarType.I64), occupied.to(torch.int64))
+
     if isinstance(node, ScatterReduceNode):
         keys_val = eval_node(node.keys, env)
         values_val = eval_node(node.values, env)
@@ -753,13 +761,11 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
         leaf_coords_val = eval_node(node.leaf_coords, env)
         offsets_val = eval_node(node.offsets, env)
         hash_map_keys_val = eval_node(node.hash_map_keys, env)
-        storage_size_val = eval_node(node.storage_size, env)
         lm = leaf_masks_val.data
         lc = leaf_coords_val.data
         offs = offsets_val.data
         ka = hash_map_keys_val.data
-        ss_data = storage_size_val.data
-        ss = int(ss_data.item()) if isinstance(ss_data, torch.Tensor) else int(ss_data)
+        ss = ka.shape[0]
         output_masks = torch.zeros(ss, 8, dtype=torch.int64, device=lm.device)
         # CPU reference: loop over offsets, shift masks, scatter-reduce with OR.
         # This is the CPU-only reference path; GPU dispatches via hook to the

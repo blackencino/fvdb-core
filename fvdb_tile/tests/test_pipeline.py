@@ -378,7 +378,6 @@ def test_cuda_segment_through_pipeline():
         PipelineSegment,
         PlannedBinding,
     )
-    from fvdb_tile.prototype.dsl_ast import AddNode, InputNode, MapNode, ConstNode
     from fvdb_tile.prototype.dsl_parse import parse
 
     source = """
