@@ -94,6 +94,7 @@ set(FVDB_CU_FILES
     fvdb/detail/ops/convolution/CutlassGroupedGemm.cu
     fvdb/detail/ops/convolution/GatherScatterDefault.cu
     fvdb/detail/ops/convolution/ImplicitGemmConv.cu
+    fvdb/detail/ops/convolution/LeafIGemmAltConv.cu
     fvdb/detail/ops/convolution/LeafIGemmConv.cu
     fvdb/detail/ops/CoordsInGrid.cu
     fvdb/detail/ops/CubesInGrid.cu

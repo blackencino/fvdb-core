@@ -158,6 +158,7 @@ ConfigureTest(GaussianMCMCAddNoiseTest "GaussianMCMCAddNoiseTest.cpp")
 ConfigureTest(GaussianMCMCRelocationTest "GaussianMCMCRelocationTest.cpp")
 ConfigureTest(GatherScatterDefaultConvTest "GatherScatterDefaultConvTest.cu")
 ConfigureTest(ImplicitGemmConvTest "ImplicitGemmConvTest.cu")
+ConfigureTest(LeafIGemmAltConvTest "LeafIGemmAltConvTest.cu")
 ConfigureTest(LeafIGemmConvTest "LeafIGemmConvTest.cu")
 
 if(NOT NANOVDB_EDITOR_SKIP)
