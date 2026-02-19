@@ -16,16 +16,23 @@
 
 #include <fvdb/detail/ops/convolution/CutlassGroupedGemm.h>
 
-#include "cutlass/cutlass.h"
-#include "cutlass/epilogue/thread/linear_combination.h"
-#include "cutlass/gemm/device/gemm_grouped.h"
-#include "cutlass/gemm/gemm.h"
-#include "cutlass/gemm/kernel/default_gemm_grouped.h"
-
+// NOTE: torch / ATen / c10 headers MUST precede CUTLASS headers.
+// nvcc 13.1 causes CUTLASS 4.x to use <cccl/cuda/std/...> from the local
+// CUDA toolkit, but those headers resolve internal <cuda/std/...> includes
+// against the conda CUDA 12.9 copies (via -isystem), which lack the
+// _LIBCUDACXX_HAS_SPACESHIP_OPERATOR macro.  Including torch first loads
+// the 12.9 <cuda/std/utility> and sets its include guard, preventing the
+// mismatched 13.1 cccl/ variant from ever being processed.
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/torch.h>
+
+#include <cutlass/cutlass.h>
+#include <cutlass/epilogue/thread/linear_combination.h>
+#include <cutlass/gemm/device/gemm_grouped.h>
+#include <cutlass/gemm/gemm.h>
+#include <cutlass/gemm/kernel/default_gemm_grouped.h>
 
 #include <algorithm>
 #include <cmath>
@@ -77,7 +84,7 @@ using CutlassGemmKernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<
     cutlass::gemm::GemmShape<16, 8, 16>,    // MMA instruction
     CutlassEpilogueOp,
     cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle,
-    4 // pipeline stages
+    4                                       // pipeline stages
     >::GemmKernel;
 
 using CutlassGemmGrouped = cutlass::gemm::device::GemmGrouped<CutlassGemmKernel>;
@@ -102,7 +109,7 @@ using CutlassGemmKernelNarrow = typename cutlass::gemm::kernel::DefaultGemmGroup
     cutlass::gemm::GemmShape<16, 8, 16>,   // MMA instruction
     CutlassEpilogueOp,
     cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle,
-    4 // pipeline stages
+    4                                      // pipeline stages
     >::GemmKernel;
 
 using CutlassGemmGroupedNarrow = cutlass::gemm::device::GemmGrouped<CutlassGemmKernelNarrow>;
@@ -155,7 +162,7 @@ scatterAddF32Kernel(float const *__restrict__ src,       // [TP, C]
                     int32_t const *__restrict__ indices, // [TP]
                     int64_t TP,
                     int64_t C,
-                    float *__restrict__ dst) // [NB, C]
+                    float *__restrict__ dst)             // [NB, C]
 {
     int64_t const total = TP * C;
     for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; idx < total;
@@ -329,10 +336,10 @@ cutlassGroupedGemmConv(torch::Tensor features,
                 static_cast<int64_t>(base_C + static_cast<uintptr_t>(start * Cout * sizeof(float)));
             pk[3][g] = pk[2][g]; // D = C (beta=0, in-place)
 
-            pk[4][g] = Cin;  // ldA: A [Mk, Cin]
-            pk[5][g] = Cout; // ldB: B [Cin, Cout]
-            pk[6][g] = Cout; // ldC: C [Mk, Cout]
-            pk[7][g] = Cout; // ldD: D [Mk, Cout]
+            pk[4][g] = Cin;      // ldA: A [Mk, Cin]
+            pk[5][g] = Cout;     // ldB: B [Cin, Cout]
+            pk[6][g] = Cout;     // ldC: C [Mk, Cout]
+            pk[7][g] = Cout;     // ldD: D [Mk, Cout]
             ++g;
         }
 

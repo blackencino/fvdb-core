@@ -131,8 +131,9 @@ igParamName(::testing::TestParamInfo<ImplicitGemmParam> const &info) {
 // =============================================================================
 
 class ImplicitGemmConvTest : public ::testing::TestWithParam<ImplicitGemmParam> {
-protected:
-    void SetUp() override {
+  protected:
+    void
+    SetUp() override {
         if (!cudaIsAvailable()) {
             GTEST_SKIP() << "CUDA not available";
         }
@@ -148,8 +149,8 @@ protected:
 
 TEST_P(ImplicitGemmConvTest, DenseGridMatchesReference) {
     auto [dtype, C, K] = GetParam();
-    auto device = makeDevice();
-    int dim     = 8;
+    auto device        = makeDevice();
+    int dim            = 8;
 
     auto grid = makeDenseTestGrid(dim, device);
     int64_t N = grid->totalVoxels();
@@ -185,7 +186,7 @@ TEST_P(ImplicitGemmConvTest, DenseGridMatchesReference) {
 
 TEST_P(ImplicitGemmConvTest, SparseGridMatchesReference) {
     auto [dtype, C, K] = GetParam();
-    auto device = makeDevice();
+    auto device        = makeDevice();
 
     auto grid = makeSparseTestGrid(32, 10, device);
     int64_t N = grid->totalVoxels();
@@ -220,8 +221,8 @@ TEST_P(ImplicitGemmConvTest, SparseGridMatchesReference) {
 
 TEST_P(ImplicitGemmConvTest, AsymmetricChannels) {
     auto [dtype, C, K] = GetParam();
-    auto device = makeDevice();
-    int dim     = 8;
+    auto device        = makeDevice();
+    int dim            = 8;
 
     int64_t C_in  = C;
     int64_t C_out = C * 2;
@@ -320,17 +321,16 @@ TEST(ImplicitGemmConvEdge, SingleVoxel) {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-but-set-variable"
 
-INSTANTIATE_TEST_SUITE_P(
-    ImplicitGemm,
-    ImplicitGemmConvTest,
-    ::testing::Values(
-        // fp16 configs (alignment: C must be multiple of 8)
-        ImplicitGemmParam{torch::kFloat16, 32, 3},
-        ImplicitGemmParam{torch::kFloat16, 64, 3},
-        ImplicitGemmParam{torch::kFloat16, 32, 5},
-        // fp32 configs (alignment: C must be multiple of 4)
-        ImplicitGemmParam{torch::kFloat32, 32, 3},
-        ImplicitGemmParam{torch::kFloat32, 64, 3}),
-    igParamName);
+INSTANTIATE_TEST_SUITE_P(ImplicitGemm,
+                         ImplicitGemmConvTest,
+                         ::testing::Values(
+                             // fp16 configs (alignment: C must be multiple of 8)
+                             ImplicitGemmParam{torch::kFloat16, 32, 3},
+                             ImplicitGemmParam{torch::kFloat16, 64, 3},
+                             ImplicitGemmParam{torch::kFloat16, 32, 5},
+                             // fp32 configs (alignment: C must be multiple of 4)
+                             ImplicitGemmParam{torch::kFloat32, 32, 3},
+                             ImplicitGemmParam{torch::kFloat32, 64, 3}),
+                         igParamName);
 
 #pragma GCC diagnostic pop

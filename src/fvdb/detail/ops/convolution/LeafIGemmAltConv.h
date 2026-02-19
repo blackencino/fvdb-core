@@ -34,11 +34,10 @@ namespace ops {
 /// @param input_grid   Input sparse grid (features are indexed into this).
 /// @param output_grid  Output sparse grid (output voxels are defined by this).
 /// @return             Output features, shape [total_output_voxels, C_out].
-torch::Tensor
-leafIGemmAltConv(torch::Tensor features,
-                 torch::Tensor weights,
-                 GridBatchImpl const &input_grid,
-                 GridBatchImpl const &output_grid);
+torch::Tensor leafIGemmAltConv(torch::Tensor features,
+                               torch::Tensor weights,
+                               GridBatchImpl const &input_grid,
+                               GridBatchImpl const &output_grid);
 
 } // namespace ops
 } // namespace detail

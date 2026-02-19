@@ -17,11 +17,14 @@
 //
 // Target architecture: SM80 (Ampere) and newer.
 
-#include "LeafIGemmConv.h"
-
 #include <fvdb/detail/GridBatchImpl.h>
+#include <fvdb/detail/ops/convolution/LeafIGemmConv.h>
+
 #include <nanovdb/NanoVDB.h>
 
+// NOTE: torch / ATen / c10 headers MUST precede CuTe / CUTLASS headers.
+// See CutlassGroupedGemm.cu for the full explanation (CCCL version mismatch
+// between local nvcc 13.1 and conda CUDA 12.9 toolkit headers).
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
@@ -89,40 +92,64 @@ toVec3i(nanovdb::Coord c) {
 // in array sizes, static_asserts, and template arguments. Vec3i accessors
 // provided for runtime (device) arithmetic.
 
-template <int K0_ = 3, int K1_ = 3, int K2_ = 3,
-          int S0_ = 1, int S1_ = 1, int S2_ = 1,
-          int D0_ = 1, int D1_ = 1, int D2_ = 1,
+template <int K0_   = 3,
+          int K1_   = 3,
+          int K2_   = 3,
+          int S0_   = 1,
+          int S1_   = 1,
+          int S2_   = 1,
+          int D0_   = 1,
+          int D1_   = 1,
+          int D2_   = 1,
           int LEAF_ = 8>
 struct ConvGeometry {
-    static constexpr int K0 = K0_;
-    static constexpr int K1 = K1_;
-    static constexpr int K2 = K2_;
-    static constexpr int S0 = S0_;
-    static constexpr int S1 = S1_;
-    static constexpr int S2 = S2_;
-    static constexpr int D0 = D0_;
-    static constexpr int D1 = D1_;
-    static constexpr int D2 = D2_;
+    static constexpr int K0        = K0_;
+    static constexpr int K1        = K1_;
+    static constexpr int K2        = K2_;
+    static constexpr int S0        = S0_;
+    static constexpr int S1        = S1_;
+    static constexpr int S2        = S2_;
+    static constexpr int D0        = D0_;
+    static constexpr int D1        = D1_;
+    static constexpr int D2        = D2_;
     static constexpr int leaf_side = LEAF_;
 
     static constexpr int kern_vol = K0 * K1 * K2;
     static constexpr int leaf_vol = LEAF_ * LEAF_ * LEAF_;
 
-    static constexpr int halo0 = (LEAF_ - 1) * S0_ + (K0_ - 1) * D0_ + 1;
-    static constexpr int halo1 = (LEAF_ - 1) * S1_ + (K1_ - 1) * D1_ + 1;
-    static constexpr int halo2 = (LEAF_ - 1) * S2_ + (K2_ - 1) * D2_ + 1;
+    static constexpr int halo0    = (LEAF_ - 1) * S0_ + (K0_ - 1) * D0_ + 1;
+    static constexpr int halo1    = (LEAF_ - 1) * S1_ + (K1_ - 1) * D1_ + 1;
+    static constexpr int halo2    = (LEAF_ - 1) * S2_ + (K2_ - 1) * D2_ + 1;
     static constexpr int halo_vol = halo0 * halo1 * halo2;
 
     static constexpr int off0 = -((K0_ - 1) * D0_) / 2;
     static constexpr int off1 = -((K1_ - 1) * D1_) / 2;
     static constexpr int off2 = -((K2_ - 1) * D2_) / 2;
 
-    static __host__ __device__ nanovdb::Vec3i K() { return {K0, K1, K2}; }
-    static __host__ __device__ nanovdb::Vec3i S() { return {S0, S1, S2}; }
-    static __host__ __device__ nanovdb::Vec3i D() { return {D0, D1, D2}; }
-    static __host__ __device__ nanovdb::Vec3i halo() { return {halo0, halo1, halo2}; }
-    static __host__ __device__ nanovdb::Vec3i leaf3() { return {leaf_side, leaf_side, leaf_side}; }
-    static __host__ __device__ nanovdb::Vec3i offset() { return {off0, off1, off2}; }
+    static __host__ __device__ nanovdb::Vec3i
+    K() {
+        return {K0, K1, K2};
+    }
+    static __host__ __device__ nanovdb::Vec3i
+    S() {
+        return {S0, S1, S2};
+    }
+    static __host__ __device__ nanovdb::Vec3i
+    D() {
+        return {D0, D1, D2};
+    }
+    static __host__ __device__ nanovdb::Vec3i
+    halo() {
+        return {halo0, halo1, halo2};
+    }
+    static __host__ __device__ nanovdb::Vec3i
+    leaf3() {
+        return {leaf_side, leaf_side, leaf_side};
+    }
+    static __host__ __device__ nanovdb::Vec3i
+    offset() {
+        return {off0, off1, off2};
+    }
 
     static_assert(K0_ > 0 && K1_ > 0 && K2_ > 0, "Kernel size must be positive on all axes");
     static_assert(S0_ > 0 && S1_ > 0 && S2_ > 0, "Stride must be positive on all axes");
@@ -141,30 +168,26 @@ using Geom5x5x5_S1 = ConvGeometry<5, 5, 5>;
 // MMA atom selection -- maps (ElemWt, ElemFeat, ElemAcc) to SM80 MMA op
 // ============================================================================
 
-template <typename ElemWt, typename ElemFeat, typename ElemAcc>
-struct mma_atom_selector {
+template <typename ElemWt, typename ElemFeat, typename ElemAcc> struct mma_atom_selector {
     static_assert(sizeof(ElemWt) == 0,
                   "C6 violated: no SM80 MMA atom for this (ElemWt, ElemFeat, ElemAcc) triple.");
 };
 
-template <>
-struct mma_atom_selector<float, float, float> {
-    using mma_op     = SM80_16x8x8_F32TF32TF32F32_TN;
-    using mma_traits = MMA_Traits<mma_op>;
+template <> struct mma_atom_selector<float, float, float> {
+    using mma_op               = SM80_16x8x8_F32TF32TF32F32_TN;
+    using mma_traits           = MMA_Traits<mma_op>;
     static constexpr int mma_k = 8;
 };
 
-template <>
-struct mma_atom_selector<cutlass::half_t, cutlass::half_t, float> {
-    using mma_op     = SM80_16x8x16_F32F16F16F32_TN;
-    using mma_traits = MMA_Traits<mma_op>;
+template <> struct mma_atom_selector<cutlass::half_t, cutlass::half_t, float> {
+    using mma_op               = SM80_16x8x16_F32F16F16F32_TN;
+    using mma_traits           = MMA_Traits<mma_op>;
     static constexpr int mma_k = 16;
 };
 
-template <>
-struct mma_atom_selector<cutlass::bfloat16_t, cutlass::bfloat16_t, float> {
-    using mma_op     = SM80_16x8x16_F32BF16BF16F32_TN;
-    using mma_traits = MMA_Traits<mma_op>;
+template <> struct mma_atom_selector<cutlass::bfloat16_t, cutlass::bfloat16_t, float> {
+    using mma_op               = SM80_16x8x16_F32BF16BF16F32_TN;
+    using mma_traits           = MMA_Traits<mma_op>;
     static constexpr int mma_k = 16;
 };
 
@@ -172,7 +195,11 @@ struct mma_atom_selector<cutlass::bfloat16_t, cutlass::bfloat16_t, float> {
 // ConvTypes -- scalar type parameter bundle
 // ============================================================================
 
-template <typename ElemWt_, typename ElemFeat_, typename ElemAcc_, typename ElemOut_, typename ElemIdx_>
+template <typename ElemWt_,
+          typename ElemFeat_,
+          typename ElemAcc_,
+          typename ElemOut_,
+          typename ElemIdx_>
 struct ConvTypes {
     using ElemWt   = ElemWt_;
     using ElemFeat = ElemFeat_;
@@ -188,9 +215,10 @@ struct ConvTypes {
                   "C7: ElemOut must not be wider than ElemAcc");
 };
 
-using types_f32  = ConvTypes<float, float, float, float, uint32_t>;
-using types_f16  = ConvTypes<cutlass::half_t, cutlass::half_t, float, cutlass::half_t, uint32_t>;
-using types_bf16 = ConvTypes<cutlass::bfloat16_t, cutlass::bfloat16_t, float, cutlass::bfloat16_t, uint32_t>;
+using types_f32 = ConvTypes<float, float, float, float, uint32_t>;
+using types_f16 = ConvTypes<cutlass::half_t, cutlass::half_t, float, cutlass::half_t, uint32_t>;
+using types_bf16 =
+    ConvTypes<cutlass::bfloat16_t, cutlass::bfloat16_t, float, cutlass::bfloat16_t, uint32_t>;
 
 // ============================================================================
 // ConvTiling -- block/cluster decomposition, GEMM tile sizes, smem budget
@@ -199,10 +227,17 @@ using types_bf16 = ConvTypes<cutlass::bfloat16_t, cutlass::bfloat16_t, float, cu
 static constexpr size_t SMEM_BASELINE_BYTES = 48 * 1024;
 static constexpr size_t SMEM_MAX_BYTES      = 164 * 1024;
 
-template <int B0_ = 4, int B1_ = 2, int B2_ = 2,
-          int CL0_ = 1, int CL1_ = 1, int CL2_ = 1,
-          int TileM_ = 32, int TileCK_ = 8, int Stages_ = 3,
-          typename Geom_ = Geom3x3x3_S1, typename Types_ = types_f32>
+template <int B0_         = 4,
+          int B1_         = 2,
+          int B2_         = 2,
+          int CL0_        = 1,
+          int CL1_        = 1,
+          int CL2_        = 1,
+          int TileM_      = 32,
+          int TileCK_     = 8,
+          int Stages_     = 3,
+          typename Geom_  = Geom3x3x3_S1,
+          typename Types_ = types_f32>
 struct ConvTiling {
     using Geom  = Geom_;
     using Types = Types_;
@@ -213,14 +248,14 @@ struct ConvTiling {
 
     static constexpr int blk_vol = B0_ * B1_ * B2_;
 
-    static constexpr int nblk0 = Geom_::leaf_side / B0_;
-    static constexpr int nblk1 = Geom_::leaf_side / B1_;
-    static constexpr int nblk2 = Geom_::leaf_side / B2_;
+    static constexpr int nblk0    = Geom_::leaf_side / B0_;
+    static constexpr int nblk1    = Geom_::leaf_side / B1_;
+    static constexpr int nblk2    = Geom_::leaf_side / B2_;
     static constexpr int nblk_tot = nblk0 * nblk1 * nblk2;
 
-    static constexpr int ncl0 = nblk0 / CL0_;
-    static constexpr int ncl1 = nblk1 / CL1_;
-    static constexpr int ncl2 = nblk2 / CL2_;
+    static constexpr int ncl0    = nblk0 / CL0_;
+    static constexpr int ncl1    = nblk1 / CL1_;
+    static constexpr int ncl2    = nblk2 / CL2_;
     static constexpr int ncl_tot = ncl0 * ncl1 * ncl2;
 
     static constexpr int cl_ext0 = CL0_ * B0_;
@@ -228,19 +263,37 @@ struct ConvTiling {
     static constexpr int cl_ext2 = CL2_ * B2_;
     static constexpr int cl_vol  = cl_ext0 * cl_ext1 * cl_ext2;
 
-    static constexpr int cl_halo0   = (cl_ext0 - 1) * Geom_::S0 + (Geom_::K0 - 1) * Geom_::D0 + 1;
-    static constexpr int cl_halo1   = (cl_ext1 - 1) * Geom_::S1 + (Geom_::K1 - 1) * Geom_::D1 + 1;
-    static constexpr int cl_halo2   = (cl_ext2 - 1) * Geom_::S2 + (Geom_::K2 - 1) * Geom_::D2 + 1;
+    static constexpr int cl_halo0    = (cl_ext0 - 1) * Geom_::S0 + (Geom_::K0 - 1) * Geom_::D0 + 1;
+    static constexpr int cl_halo1    = (cl_ext1 - 1) * Geom_::S1 + (Geom_::K1 - 1) * Geom_::D1 + 1;
+    static constexpr int cl_halo2    = (cl_ext2 - 1) * Geom_::S2 + (Geom_::K2 - 1) * Geom_::D2 + 1;
     static constexpr int cl_halo_vol = cl_halo0 * cl_halo1 * cl_halo2;
 
     static constexpr int blocks_per_cl = CL0_ * CL1_ * CL2_;
 
-    static __host__ __device__ nanovdb::Vec3i B() { return {B0_, B1_, B2_}; }
-    static __host__ __device__ nanovdb::Vec3i CL() { return {CL0_, CL1_, CL2_}; }
-    static __host__ __device__ nanovdb::Vec3i nblk() { return {nblk0, nblk1, nblk2}; }
-    static __host__ __device__ nanovdb::Vec3i ncl() { return {ncl0, ncl1, ncl2}; }
-    static __host__ __device__ nanovdb::Vec3i cl_extent() { return {cl_ext0, cl_ext1, cl_ext2}; }
-    static __host__ __device__ nanovdb::Vec3i cl_halo() { return {cl_halo0, cl_halo1, cl_halo2}; }
+    static __host__ __device__ nanovdb::Vec3i
+    B() {
+        return {B0_, B1_, B2_};
+    }
+    static __host__ __device__ nanovdb::Vec3i
+    CL() {
+        return {CL0_, CL1_, CL2_};
+    }
+    static __host__ __device__ nanovdb::Vec3i
+    nblk() {
+        return {nblk0, nblk1, nblk2};
+    }
+    static __host__ __device__ nanovdb::Vec3i
+    ncl() {
+        return {ncl0, ncl1, ncl2};
+    }
+    static __host__ __device__ nanovdb::Vec3i
+    cl_extent() {
+        return {cl_ext0, cl_ext1, cl_ext2};
+    }
+    static __host__ __device__ nanovdb::Vec3i
+    cl_halo() {
+        return {cl_halo0, cl_halo1, cl_halo2};
+    }
 
     // Shared memory budget (C3)
     static constexpr size_t smem_index_maps =
@@ -250,7 +303,8 @@ struct ConvTiling {
     static constexpr size_t smem_gemm_b =
         static_cast<size_t>(blk_vol) * TileCK_ * sizeof(typename Types_::ElemFeat) * Stages_;
     static constexpr size_t smem_predicates = static_cast<size_t>(cl_halo_vol + cl_vol);
-    static constexpr size_t smem_total = smem_index_maps + smem_gemm_a + smem_gemm_b + smem_predicates;
+    static constexpr size_t smem_total =
+        smem_index_maps + smem_gemm_a + smem_gemm_b + smem_predicates;
 
     // C1: blocks tile the leaf exactly.
     static_assert(Geom_::leaf_side % B0_ == 0 && Geom_::leaf_side % B1_ == 0 &&
@@ -276,29 +330,24 @@ using DefaultTiling = ConvTiling<4, 2, 2, 1, 2, 2, 32, 8, 3, Geom, Types>;
 
 enum class conv_variant { forward, input_grad, weight_grad, transposed_conv };
 
-template <conv_variant V>
-struct variant_traits;
+template <conv_variant V> struct variant_traits;
 
-template <>
-struct variant_traits<conv_variant::forward> {
+template <> struct variant_traits<conv_variant::forward> {
     static constexpr bool flip         = false;
     static constexpr bool atomic_accum = false;
 };
 
-template <>
-struct variant_traits<conv_variant::input_grad> {
+template <> struct variant_traits<conv_variant::input_grad> {
     static constexpr bool flip         = true;
     static constexpr bool atomic_accum = false;
 };
 
-template <>
-struct variant_traits<conv_variant::weight_grad> {
+template <> struct variant_traits<conv_variant::weight_grad> {
     static constexpr bool flip         = false;
     static constexpr bool atomic_accum = true;
 };
 
-template <>
-struct variant_traits<conv_variant::transposed_conv> {
+template <> struct variant_traits<conv_variant::transposed_conv> {
     static constexpr bool flip         = true;
     static constexpr bool atomic_accum = false;
 };
@@ -314,8 +363,7 @@ struct variant_traits<conv_variant::transposed_conv> {
 //   leaf_value(leaf_id, p) -> ElemIdx   (0 = inactive)
 //   coord_to_idx(coord)    -> ElemIdx   (0 = inactive)
 
-template <typename ElemIdx>
-struct nanovdb_sparse_grid {
+template <typename ElemIdx> struct nanovdb_sparse_grid {
     using grid_type = nanovdb::OnIndexGrid;
     using tree_type = typename grid_type::TreeType;
     using acc_type  = nanovdb::ReadAccessor<nanovdb::ValueOnIndex>;
@@ -368,14 +416,12 @@ make_sparse_grid(GridBatchImpl::Accessor const &acc, int64_t batch_idx) {
 // physical feature-memory address via the shared-memory gather_map.
 // This is the heart of the implicit GEMM.
 
-template <typename ElemIdx>
-struct im2col_result {
+template <typename ElemIdx> struct im2col_result {
     ElemIdx voxel_idx;
     int channel;
 };
 
-template <typename Geom, typename Tiling, conv_variant Variant>
-struct im2col_map {
+template <typename Geom, typename Tiling, conv_variant Variant> struct im2col_map {
     static constexpr bool flip = variant_traits<Variant>::flip;
 
     template <typename ElemIdx>
@@ -478,8 +524,8 @@ build_cluster_predicates(ElemIdx const *gather_map,
                          bool *scatter_pred) {
     constexpr int CL_HALO_VOL = Tiling::cl_halo_vol;
     constexpr int CL_VOL      = Tiling::cl_vol;
-    int const tid              = threadIdx.x;
-    int const nthreads         = blockDim.x;
+    int const tid             = threadIdx.x;
+    int const nthreads        = blockDim.x;
 
     nanovdb::Vec3i const Sv         = Geom::S();
     nanovdb::Vec3i const cl_halo_d  = Tiling::cl_halo();
@@ -510,8 +556,7 @@ build_cluster_predicates(ElemIdx const *gather_map,
 // the GEMM template: the GEMM sees a standard tensor whose "stride"
 // happens to perform an indirect lookup.
 
-template <typename Index>
-struct IndexedGather {
+template <typename Index> struct IndexedGather {
     CUTE_HOST_DEVICE constexpr IndexedGather(Index const *indices = {}) : indices_(indices) {}
 
     template <typename I>
@@ -528,8 +573,7 @@ struct IndexedGather {
     Index const *indices_;
 };
 
-template <typename Func, typename Stride>
-struct CustomStride {
+template <typename Func, typename Stride> struct CustomStride {
     CUTE_HOST_DEVICE constexpr CustomStride(Func const &func, Stride const &stride)
         : func_(func), stride_(stride) {}
 
@@ -574,7 +618,7 @@ struct CustomStride {
 template <typename Stride, typename Func>
 CUTLASS_HOST_DEVICE auto
 make_custom_stride_layout(Stride const &stride, Func &&func) {
-    auto idx = find_if(stride, [](auto x) { return not is_constant<1, decltype(x)>{}; });
+    auto idx        = find_if(stride, [](auto x) { return not is_constant<1, decltype(x)>{}; });
     constexpr int I = decltype(idx)::value;
     return make_layout(
         repeat_like(stride, _1{}),
@@ -585,8 +629,8 @@ template <typename Iterator, typename Shape, typename Stride, typename Func>
 CUTLASS_HOST_DEVICE auto
 make_gather_tensor(Iterator iter, Shape const &shape, Stride const &stride, Func &&func) {
     Layout<Shape, Stride> matrix_layout = make_identity_layout(shape);
-    auto offset         = as_arithmetic_tuple(repeat_like(shape, _0{}));
-    auto gather_layout  = make_custom_stride_layout(stride, static_cast<Func &&>(func));
+    auto offset                         = as_arithmetic_tuple(repeat_like(shape, _0{}));
+    auto gather_layout = make_custom_stride_layout(stride, static_cast<Func &&>(func));
     return make_tensor(iter, ComposedLayout{gather_layout, offset, matrix_layout});
 }
 
@@ -607,7 +651,6 @@ scatter_write(ElemAcc const *accum_buf,
               int C_out,
               int m_offset,
               bool const *scatter_pred) {
-
     int const tid      = threadIdx.x;
     int const nthreads = blockDim.x;
     int const total    = tile_m * blk_vol;
@@ -620,10 +663,10 @@ scatter_write(ElemAcc const *accum_buf,
             continue;
         }
 
-        nanovdb::Vec3i const v          = decode3(n, block_shape);
-        nanovdb::Vec3i const out_pos    = block_orig + v;
-        int const out_lin               = encode3(out_pos, leaf3);
-        ElemIdx const global_idx        = scatter_map[out_lin];
+        nanovdb::Vec3i const v       = decode3(n, block_shape);
+        nanovdb::Vec3i const out_pos = block_orig + v;
+        int const out_lin            = encode3(out_pos, leaf3);
+        ElemIdx const global_idx     = scatter_map[out_lin];
 
         if (global_idx == static_cast<ElemIdx>(0)) {
             continue;
@@ -644,8 +687,7 @@ scatter_write(ElemAcc const *accum_buf,
 // Predicated mainloop dispatch policy
 // ============================================================================
 
-template <int Stages_>
-struct MainloopSm80Predicated {
+template <int Stages_> struct MainloopSm80Predicated {
     static constexpr int Stages = Stages_;
     using ArchTag               = cutlass::arch::Sm80;
     using Schedule              = cutlass::gemm::KernelMultistage;
@@ -656,8 +698,7 @@ struct MainloopSm80Predicated {
 // Kernel parameters and shared storage
 // ============================================================================
 
-template <typename Types>
-struct KernelParams {
+template <typename Types> struct KernelParams {
     using ElemWt   = typename Types::ElemWt;
     using ElemFeat = typename Types::ElemFeat;
     using ElemOut  = typename Types::ElemOut;
@@ -676,8 +717,7 @@ struct KernelParams {
     int C_out;
 };
 
-template <typename Geom, typename Tiling, typename Types>
-struct SharedStorage {
+template <typename Geom, typename Tiling, typename Types> struct SharedStorage {
     using ElemIdx = typename Types::ElemIdx;
 
     ElemIdx gather_map[Geom::halo_vol];
@@ -693,7 +733,7 @@ struct SharedStorage {
 
 template <typename Geom, typename Types, typename Tiling, conv_variant Variant>
 __global__ void __launch_bounds__(256)
-    leaf_igemm_kernel(KernelParams<Types> params) {
+leaf_igemm_kernel(KernelParams<Types> params) {
     using ElemIdx  = typename Types::ElemIdx;
     using ElemFeat = typename Types::ElemFeat;
     using ElemWt   = typename Types::ElemWt;
@@ -710,8 +750,8 @@ __global__ void __launch_bounds__(256)
 
     // ==== PHASE 1: Build index maps ====
 
-    build_index_maps<Geom, Variant>(iter_grid, gather_grid, leaf_id,
-                                    smem.scatter_map, smem.gather_map);
+    build_index_maps<Geom, Variant>(
+        iter_grid, gather_grid, leaf_id, smem.scatter_map, smem.gather_map);
     __syncthreads();
 
     // ==== PHASE 2-3: Tiled GEMM with predicated gather/scatter ====
@@ -730,14 +770,12 @@ __global__ void __launch_bounds__(256)
     nanovdb::Vec3i const leaf3_dims = Geom::leaf3();
 
     for (int m_tile = 0; m_tile < M_total; m_tile += TILE_M) {
-
         for (int cl_id = 0; cl_id < Tiling::ncl_tot; ++cl_id) {
-
             nanovdb::Vec3i const cl_coord = decode3(cl_id, Tiling::ncl());
             nanovdb::Vec3i const cl_orig  = cl_coord * Tiling::cl_extent();
 
-            build_cluster_predicates<Geom, Tiling>(smem.gather_map, smem.scatter_map, cl_orig,
-                                                   smem.gather_pred, smem.scatter_pred);
+            build_cluster_predicates<Geom, Tiling>(
+                smem.gather_map, smem.scatter_map, cl_orig, smem.gather_pred, smem.scatter_pred);
             __syncthreads();
 
             for (int local_blk = 0; local_blk < Tiling::blocks_per_cl; ++local_blk) {
@@ -768,9 +806,8 @@ __global__ void __launch_bounds__(256)
                              ++ck_local) {
                             int const ck = ck_tile + ck_local;
 
-                            auto [voxel_idx, c] =
-                                im2col_map<Geom, Tiling, Variant>::apply(
-                                    ck, n, block_orig, smem.gather_map);
+                            auto [voxel_idx, c] = im2col_map<Geom, Tiling, Variant>::apply(
+                                ck, n, block_orig, smem.gather_map);
 
                             ElemFeat b_val = ElemFeat(0);
                             if (voxel_idx != ElemIdx(0)) {
@@ -800,8 +837,16 @@ __global__ void __launch_bounds__(256)
                     block_scatter_pred[n]        = (smem.scatter_map[out_lin] != ElemIdx(0));
                 }
 
-                scatter_write<Variant>(accum, TILE_M, BLK_VOL, smem.scatter_map, block_orig,
-                                       B_shape, leaf3_dims, params.output, C_out, m_tile,
+                scatter_write<Variant>(accum,
+                                       TILE_M,
+                                       BLK_VOL,
+                                       smem.scatter_map,
+                                       block_orig,
+                                       B_shape,
+                                       leaf3_dims,
+                                       params.output,
+                                       C_out,
+                                       m_tile,
                                        block_scatter_pred);
                 __syncthreads();
             }
@@ -829,8 +874,7 @@ launch_leaf_igemm(KernelParams<Types> const &params, int num_leaves, cudaStream_
                              static_cast<int>(SMEM));
     }
 
-    leaf_igemm_kernel<Geom, Types, Tiling, Variant>
-        <<<num_leaves, THREADS, SMEM, stream>>>(params);
+    leaf_igemm_kernel<Geom, Types, Tiling, Variant><<<num_leaves, THREADS, SMEM, stream>>>(params);
 }
 
 } // namespace leaf_igemm
@@ -855,33 +899,54 @@ namespace cutlass::gemm::collective {
 
 using namespace cute;
 
-template <int Stages, class TileShape_, class ElementA_, class StrideA_, class ElementB_,
-          class StrideB_, class TiledMma_, class GmemTiledCopyA_, class SmemLayoutAtomA_,
-          class SmemCopyAtomA_, class TransformA_, class GmemTiledCopyB_, class SmemLayoutAtomB_,
-          class SmemCopyAtomB_, class TransformB_>
-struct CollectiveMma<fvdb::detail::leaf_igemm::MainloopSm80Predicated<Stages>, TileShape_,
-                     ElementA_, StrideA_, ElementB_, StrideB_, TiledMma_, GmemTiledCopyA_,
-                     SmemLayoutAtomA_, SmemCopyAtomA_, TransformA_, GmemTiledCopyB_,
-                     SmemLayoutAtomB_, SmemCopyAtomB_, TransformB_> {
-
-    using DispatchPolicy      = MainloopSm80CpAsyncUnpredicated<Stages>;
-    using TileShape           = TileShape_;
-    using ElementA            = ElementA_;
-    using StrideA             = StrideA_;
-    using ElementB            = ElementB_;
-    using StrideB             = StrideB_;
-    using TiledMma            = TiledMma_;
-    using ElementAccumulator  = typename TiledMma::ValTypeC;
-    using GmemTiledCopyA      = GmemTiledCopyA_;
-    using GmemTiledCopyB      = GmemTiledCopyB_;
-    using SmemLayoutAtomA     = SmemLayoutAtomA_;
-    using SmemLayoutAtomB     = SmemLayoutAtomB_;
-    using SmemCopyAtomA       = SmemCopyAtomA_;
-    using SmemCopyAtomB       = SmemCopyAtomB_;
-    using TransformA          = TransformA_;
-    using TransformB          = TransformB_;
-    using ArchTag             = typename DispatchPolicy::ArchTag;
-    using CtaShape_MNK        = TileShape;
+template <int Stages,
+          class TileShape_,
+          class ElementA_,
+          class StrideA_,
+          class ElementB_,
+          class StrideB_,
+          class TiledMma_,
+          class GmemTiledCopyA_,
+          class SmemLayoutAtomA_,
+          class SmemCopyAtomA_,
+          class TransformA_,
+          class GmemTiledCopyB_,
+          class SmemLayoutAtomB_,
+          class SmemCopyAtomB_,
+          class TransformB_>
+struct CollectiveMma<fvdb::detail::leaf_igemm::MainloopSm80Predicated<Stages>,
+                     TileShape_,
+                     ElementA_,
+                     StrideA_,
+                     ElementB_,
+                     StrideB_,
+                     TiledMma_,
+                     GmemTiledCopyA_,
+                     SmemLayoutAtomA_,
+                     SmemCopyAtomA_,
+                     TransformA_,
+                     GmemTiledCopyB_,
+                     SmemLayoutAtomB_,
+                     SmemCopyAtomB_,
+                     TransformB_> {
+    using DispatchPolicy     = MainloopSm80CpAsyncUnpredicated<Stages>;
+    using TileShape          = TileShape_;
+    using ElementA           = ElementA_;
+    using StrideA            = StrideA_;
+    using ElementB           = ElementB_;
+    using StrideB            = StrideB_;
+    using TiledMma           = TiledMma_;
+    using ElementAccumulator = typename TiledMma::ValTypeC;
+    using GmemTiledCopyA     = GmemTiledCopyA_;
+    using GmemTiledCopyB     = GmemTiledCopyB_;
+    using SmemLayoutAtomA    = SmemLayoutAtomA_;
+    using SmemLayoutAtomB    = SmemLayoutAtomB_;
+    using SmemCopyAtomA      = SmemCopyAtomA_;
+    using SmemCopyAtomB      = SmemCopyAtomB_;
+    using TransformA         = TransformA_;
+    using TransformB         = TransformB_;
+    using ArchTag            = typename DispatchPolicy::ArchTag;
+    using CtaShape_MNK       = TileShape;
 
     static_assert(rank(SmemLayoutAtomA{}) == 2, "SmemLayoutAtom must be rank 2 (M/N, K)");
     static_assert((size<0>(TileShape{}) % size<0>(SmemLayoutAtomA{})) == 0,
@@ -930,13 +995,24 @@ struct CollectiveMma<fvdb::detail::leaf_igemm::MainloopSm80Predicated<Stages>, T
     // Pipelined mainloop with predicated B-loads.
     //   A-loads: unpredicated copy (filter weights always present)
     //   B-loads: copy_if (zero-fill for inactive input voxels)
-    template <class FrgTensorD, class TensorA, class TensorB, class TensorP, class FrgTensorC,
-              class KTileIterator, class ResidueMNK>
+    template <class FrgTensorD,
+              class TensorA,
+              class TensorB,
+              class TensorP,
+              class FrgTensorC,
+              class KTileIterator,
+              class ResidueMNK>
     CUTLASS_DEVICE void
-    operator()(FrgTensorD &accum, TensorA gA, TensorB gB, TensorP sP, FrgTensorC const &src_accum,
-               KTileIterator k_tile_iter, int k_tile_count, ResidueMNK residue_mnk, int thread_idx,
+    operator()(FrgTensorD &accum,
+               TensorA gA,
+               TensorB gB,
+               TensorP sP,
+               FrgTensorC const &src_accum,
+               KTileIterator k_tile_iter,
+               int k_tile_count,
+               ResidueMNK residue_mnk,
+               int thread_idx,
                char *smem_buf) {
-
         static_assert(is_rmem<FrgTensorD>::value, "D tensor must be rmem resident.");
         static_assert(is_gmem<TensorA>::value, "A tensor must be gmem resident.");
         static_assert(is_gmem<TensorB>::value, "B tensor must be gmem resident.");
@@ -944,8 +1020,8 @@ struct CollectiveMma<fvdb::detail::leaf_igemm::MainloopSm80Predicated<Stages>, T
         static_assert(is_rmem<FrgTensorC>::value, "C tensor must be rmem resident.");
 
         SharedStorage &storage = *reinterpret_cast<SharedStorage *>(smem_buf);
-        Tensor sA = make_tensor(make_smem_ptr(storage.smem_a.data()), SmemLayoutA{});
-        Tensor sB = make_tensor(make_smem_ptr(storage.smem_b.data()), SmemLayoutB{});
+        Tensor sA              = make_tensor(make_smem_ptr(storage.smem_a.data()), SmemLayoutA{});
+        Tensor sB              = make_tensor(make_smem_ptr(storage.smem_b.data()), SmemLayoutB{});
 
         GmemTiledCopyA gmem_tiled_copy_A;
         GmemTiledCopyB gmem_tiled_copy_B;
@@ -964,7 +1040,9 @@ struct CollectiveMma<fvdb::detail::leaf_igemm::MainloopSm80Predicated<Stages>, T
         CUTLASS_PRAGMA_UNROLL
         for (int k_pipe = 0; k_pipe < Stages - 1; ++k_pipe) {
             copy(gmem_tiled_copy_A, tAgA(_, _, _, *k_tile_iter), tAsA(_, _, _, k_pipe));
-            copy_if(gmem_tiled_copy_B, tBsP(_, _, _, *k_tile_iter), tBgB(_, _, _, *k_tile_iter),
+            copy_if(gmem_tiled_copy_B,
+                    tBsP(_, _, _, *k_tile_iter),
+                    tBgB(_, _, _, *k_tile_iter),
                     tBsB(_, _, _, k_pipe));
             cp_async_fence();
             --k_tile_count;
@@ -1016,16 +1094,21 @@ struct CollectiveMma<fvdb::detail::leaf_igemm::MainloopSm80Predicated<Stages>, T
                 }
 
                 auto k_block_next = (k_block + Int<1>{}) % K_BLOCK_MAX;
-                copy(smem_tiled_copy_A, tCsA_p(_, _, k_block_next),
+                copy(smem_tiled_copy_A,
+                     tCsA_p(_, _, k_block_next),
                      tCrA_copy_view(_, _, k_block_next));
-                copy(smem_tiled_copy_B, tCsB_p(_, _, k_block_next),
+                copy(smem_tiled_copy_B,
+                     tCsB_p(_, _, k_block_next),
                      tCrB_copy_view(_, _, k_block_next));
 
                 if (k_block == 0) {
-                    copy(gmem_tiled_copy_A, tAgA(_, _, _, *k_tile_iter),
+                    copy(gmem_tiled_copy_A,
+                         tAgA(_, _, _, *k_tile_iter),
                          tAsA(_, _, _, smem_pipe_write));
-                    copy_if(gmem_tiled_copy_B, tBsP(_, _, _, *k_tile_iter),
-                            tBgB(_, _, _, *k_tile_iter), tBsB(_, _, _, smem_pipe_write));
+                    copy_if(gmem_tiled_copy_B,
+                            tBsP(_, _, _, *k_tile_iter),
+                            tBgB(_, _, _, *k_tile_iter),
+                            tBsB(_, _, _, smem_pipe_write));
                     cp_async_fence();
 
                     --k_tile_count;
@@ -1130,15 +1213,13 @@ leafIGemmConv(torch::Tensor features,
               GridBatchImpl const &input_grid,
               GridBatchImpl const &output_grid) {
     TORCH_CHECK(features.is_cuda(), "leafIGemmConv: features must be on CUDA");
-    TORCH_CHECK(
-        deviceSupportsSm80(features.device()),
-        "leafIGemmConv: requires SM80+ (Ampere or newer)");
+    TORCH_CHECK(deviceSupportsSm80(features.device()),
+                "leafIGemmConv: requires SM80+ (Ampere or newer)");
 
     TORCH_CHECK(features.dim() == 2, "leafIGemmConv: features must be 2D [N, C_in]");
     TORCH_CHECK(features.is_contiguous(), "leafIGemmConv: features must be contiguous");
 
-    TORCH_CHECK(weights.dim() == 5,
-                "leafIGemmConv: weights must be 5D [C_out, C_in, k0, k1, k2]");
+    TORCH_CHECK(weights.dim() == 5, "leafIGemmConv: weights must be 5D [C_out, C_in, k0, k1, k2]");
     TORCH_CHECK(features.size(1) == weights.size(1),
                 "leafIGemmConv: C_in mismatch between features and weights");
     TORCH_CHECK(weights.size(2) == 3 && weights.size(3) == 3 && weights.size(4) == 3,
@@ -1156,7 +1237,8 @@ leafIGemmConv(torch::Tensor features,
             features, weights, input_grid, output_grid, torch::kFloat16);
     } else {
         TORCH_CHECK(false,
-                    "leafIGemmConv: unsupported dtype ", features.scalar_type(),
+                    "leafIGemmConv: unsupported dtype ",
+                    features.scalar_type(),
                     ". Supported: fp32, fp16.");
     }
 }

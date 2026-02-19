@@ -110,10 +110,9 @@ assertNoNanInf(torch::Tensor t, char const *label) {
 }
 
 static torch::Tensor
-referenceConv(torch::Tensor features,
-              torch::Tensor weights,
-              GridBatchImpl const &grid) {
-    nanovdb::Coord ks(3, 3, 3);
+referenceConv(torch::Tensor features, torch::Tensor weights, GridBatchImpl const &grid) {
+    int K = static_cast<int>(weights.size(2));
+    nanovdb::Coord ks(K, K, K);
     nanovdb::Coord stride(1, 1, 1);
     auto topo = ops::gatherScatterDefaultSparseConvTopology(grid, grid, ks, stride);
     return ops::gatherScatterDefaultSparseConv(features, weights, topo);
@@ -155,16 +154,17 @@ TEST(LeafIGemmAltUnit, WeightLayoutConsistency) {
             for (int t = 0; t < 3; ++t)
                 for (int r = 0; r < 3; ++r)
                     for (int s = 0; s < 3; ++s) {
-                        int k_lin          = t * 9 + r * 3 + s;
-                        float expected     = static_cast<float>(o * 10000 + c * 1000 + t * 100 + r * 10 + s);
-                        float ours_val     = ours_acc[o][c * 27 + k_lin];
-                        float ref_val      = ref_acc[k_lin][c][o];
+                        int k_lin = t * 9 + r * 3 + s;
+                        float expected =
+                            static_cast<float>(o * 10000 + c * 1000 + t * 100 + r * 10 + s);
+                        float ours_val = ours_acc[o][c * 27 + k_lin];
+                        float ref_val  = ref_acc[k_lin][c][o];
                         EXPECT_FLOAT_EQ(ours_val, expected)
-                            << "Our indexing wrong at o=" << o << " c=" << c
-                            << " t=" << t << " r=" << r << " s=" << s;
+                            << "Our indexing wrong at o=" << o << " c=" << c << " t=" << t
+                            << " r=" << r << " s=" << s;
                         EXPECT_FLOAT_EQ(ref_val, expected)
-                            << "Ref indexing wrong at o=" << o << " c=" << c
-                            << " t=" << t << " r=" << r << " s=" << s;
+                            << "Ref indexing wrong at o=" << o << " c=" << c << " t=" << t
+                            << " r=" << r << " s=" << s;
                     }
 }
 
@@ -185,7 +185,7 @@ TEST(LeafIGemmAltUnit, WeightLayoutConsistency) {
 
 TEST(LeafIGemmAltUnit, GemmContractionEquivalence) {
     int C_in = 2, C_out = 2;
-    int K_vol = 27;
+    int K_vol    = 27;
     int contract = C_in * K_vol;
 
     torch::manual_seed(42);
@@ -217,8 +217,7 @@ TEST(LeafIGemmAltUnit, GemmContractionEquivalence) {
                 out_ref[out] += f_acc[c] * ref_acc[k][c][out];
 
     for (int out = 0; out < C_out; ++out) {
-        EXPECT_NEAR(out_ours[out], out_ref[out], 1e-4)
-            << "Output channel " << out << " disagrees";
+        EXPECT_NEAR(out_ours[out], out_ref[out], 1e-4) << "Output channel " << out << " disagrees";
     }
 }
 
@@ -267,10 +266,9 @@ TEST(LeafIGemmAltUnit, SingleVoxelIdentity) {
     // At least one nonzero row
     EXPECT_GT(ref_sum.max().item<float>(), 0.0f) << "Reference has no active output";
 
-    auto diff     = (test_cpu - ref_cpu).abs();
-    double maxd   = diff.max().item<double>();
-    EXPECT_LT(maxd, 1e-5)
-        << "SingleVoxelIdentity: max diff=" << maxd;
+    auto diff   = (test_cpu - ref_cpu).abs();
+    double maxd = diff.max().item<double>();
+    EXPECT_LT(maxd, 1e-5) << "SingleVoxelIdentity: max diff=" << maxd;
 }
 
 // =============================================================================
@@ -303,7 +301,7 @@ TEST(LeafIGemmAltUnit, Dense8x8x8_Diagnostics) {
     auto test_cpu = test.cpu().to(torch::kFloat64);
     auto diff     = (test_cpu - ref_cpu).abs();
 
-    double maxd = diff.max().item<double>();
+    double maxd  = diff.max().item<double>();
     double meand = diff.mean().item<double>();
 
     // Print first few mismatches for diagnostics
@@ -315,18 +313,15 @@ TEST(LeafIGemmAltUnit, Dense8x8x8_Diagnostics) {
         for (int64_t i = 0; i < diff.size(0) && printed < 10; ++i) {
             for (int64_t j = 0; j < diff.size(1) && printed < 10; ++j) {
                 if (diff_acc[i][j] > 0.1) {
-                    std::cout << "  row=" << i << " col=" << j
-                              << " ref=" << ref_acc[i][j]
-                              << " test=" << test_acc[i][j]
-                              << " diff=" << diff_acc[i][j] << "\n";
+                    std::cout << "  row=" << i << " col=" << j << " ref=" << ref_acc[i][j]
+                              << " test=" << test_acc[i][j] << " diff=" << diff_acc[i][j] << "\n";
                     ++printed;
                 }
             }
         }
     }
 
-    EXPECT_LT(maxd, 0.5)
-        << "Dense8x8x8_Diagnostics: max diff=" << maxd << " mean diff=" << meand;
+    EXPECT_LT(maxd, 0.5) << "Dense8x8x8_Diagnostics: max diff=" << maxd << " mean diff=" << meand;
 }
 
 // =============================================================================
@@ -339,8 +334,8 @@ TEST(LeafIGemmAltUnit, OutputShapeAndFiniteness) {
     }
     auto device = makeDevice();
 
-    for (int C_in : {32, 64}) {
-        for (int C_out : {32, 64}) {
+    for (int C_in: {32, 64}) {
+        for (int C_out: {32, 64}) {
             auto grid = makeDenseTestGrid(8, device);
             int64_t N = grid->totalVoxels();
 
@@ -382,11 +377,10 @@ TEST(LeafIGemmAltUnit, Dense8x8x8_Cin32_Cout32) {
     auto ref  = referenceConv(features, weights, *grid);
     auto test = ops::leafIGemmAltConv(features, weights, *grid, *grid);
 
-    auto diff = (test.cpu().to(torch::kFloat64) - ref.cpu().to(torch::kFloat64)).abs();
+    auto diff   = (test.cpu().to(torch::kFloat64) - ref.cpu().to(torch::kFloat64)).abs();
     double maxd = diff.max().item<double>();
-    EXPECT_LT(maxd, 0.5)
-        << "Cin32_Cout32: max diff=" << maxd
-        << " mean diff=" << diff.mean().item<double>();
+    EXPECT_LT(maxd, 0.5) << "Cin32_Cout32: max diff=" << maxd
+                         << " mean diff=" << diff.mean().item<double>();
 }
 
 TEST(LeafIGemmAltUnit, Dense8x8x8_Cin64_Cout128) {
@@ -406,11 +400,10 @@ TEST(LeafIGemmAltUnit, Dense8x8x8_Cin64_Cout128) {
     auto ref  = referenceConv(features, weights, *grid);
     auto test = ops::leafIGemmAltConv(features, weights, *grid, *grid);
 
-    auto diff = (test.cpu().to(torch::kFloat64) - ref.cpu().to(torch::kFloat64)).abs();
+    auto diff   = (test.cpu().to(torch::kFloat64) - ref.cpu().to(torch::kFloat64)).abs();
     double maxd = diff.max().item<double>();
-    EXPECT_LT(maxd, 0.5)
-        << "Cin64_Cout128: max diff=" << maxd
-        << " mean diff=" << diff.mean().item<double>();
+    EXPECT_LT(maxd, 0.5) << "Cin64_Cout128: max diff=" << maxd
+                         << " mean diff=" << diff.mean().item<double>();
 }
 
 TEST(LeafIGemmAltUnit, MultiLeaf16x16x16_Cin32_Cout32) {
@@ -431,11 +424,10 @@ TEST(LeafIGemmAltUnit, MultiLeaf16x16x16_Cin32_Cout32) {
     auto ref  = referenceConv(features, weights, *grid);
     auto test = ops::leafIGemmAltConv(features, weights, *grid, *grid);
 
-    auto diff = (test.cpu().to(torch::kFloat64) - ref.cpu().to(torch::kFloat64)).abs();
+    auto diff   = (test.cpu().to(torch::kFloat64) - ref.cpu().to(torch::kFloat64)).abs();
     double maxd = diff.max().item<double>();
-    EXPECT_LT(maxd, 0.5)
-        << "MultiLeaf Cin32_Cout32: max diff=" << maxd
-        << " mean diff=" << diff.mean().item<double>();
+    EXPECT_LT(maxd, 0.5) << "MultiLeaf Cin32_Cout32: max diff=" << maxd
+                         << " mean diff=" << diff.mean().item<double>();
 }
 
 // =============================================================================
@@ -458,47 +450,48 @@ TEST(LeafIGemmAltUnit, HaloIndexArithmetic) {
     int mismatches = 0;
 
     for (int bx = 0; bx < nblk0 && mismatches < 5; ++bx)
-    for (int by = 0; by < nblk1 && mismatches < 5; ++by)
-    for (int bz = 0; bz < nblk2 && mismatches < 5; ++bz)
-    for (int z = 0; z < B0 && mismatches < 5; ++z)
-    for (int p = 0; p < B1 && mismatches < 5; ++p)
-    for (int q = 0; q < B2 && mismatches < 5; ++q)
-    for (int t = 0; t < 3 && mismatches < 5; ++t)
-    for (int r = 0; r < 3 && mismatches < 5; ++r)
-    for (int s = 0; s < 3 && mismatches < 5; ++s) {
-        int block_orig_x = bx * B0;
-        int block_orig_y = by * B1;
-        int block_orig_z = bz * B2;
+        for (int by = 0; by < nblk1 && mismatches < 5; ++by)
+            for (int bz = 0; bz < nblk2 && mismatches < 5; ++bz)
+                for (int z = 0; z < B0 && mismatches < 5; ++z)
+                    for (int p = 0; p < B1 && mismatches < 5; ++p)
+                        for (int q = 0; q < B2 && mismatches < 5; ++q)
+                            for (int t = 0; t < 3 && mismatches < 5; ++t)
+                                for (int r = 0; r < 3 && mismatches < 5; ++r)
+                                    for (int s = 0; s < 3 && mismatches < 5; ++s) {
+                                        int block_orig_x = bx * B0;
+                                        int block_orig_y = by * B1;
+                                        int block_orig_z = bz * B2;
 
-        int halo_x = block_orig_x + z + t;
-        int halo_y = block_orig_y + p + r;
-        int halo_z = block_orig_z + q + s;
-        int expected_halo = halo_x * Hy * Hz + halo_y * Hz + halo_z;
+                                        int halo_x        = block_orig_x + z + t;
+                                        int halo_y        = block_orig_y + p + r;
+                                        int halo_z        = block_orig_z + q + s;
+                                        int expected_halo = halo_x * Hy * Hz + halo_y * Hz + halo_z;
 
-        int n = z * B1 * B2 + p * B2 + q;
-        int k_lin = t * 9 + r * 3 + s;
+                                        int n     = z * B1 * B2 + p * B2 + q;
+                                        int k_lin = t * 9 + r * 3 + s;
 
-        int block_orig_flat_x = block_orig_x;
-        int block_orig_flat_y = block_orig_y;
-        int block_orig_flat_z = block_orig_z;
-        int v_x = n / (B1 * B2);
-        int v_y = (n / B2) % B1;
-        int v_z = n % B2;
-        int delta_x = k_lin / 9;
-        int delta_y = (k_lin / 3) % 3;
-        int delta_z = k_lin % 3;
-        int im2col_halo = (block_orig_flat_x + v_x + delta_x) * Hy * Hz
-                        + (block_orig_flat_y + v_y + delta_y) * Hz
-                        + (block_orig_flat_z + v_z + delta_z);
+                                        int block_orig_flat_x = block_orig_x;
+                                        int block_orig_flat_y = block_orig_y;
+                                        int block_orig_flat_z = block_orig_z;
+                                        int v_x               = n / (B1 * B2);
+                                        int v_y               = (n / B2) % B1;
+                                        int v_z               = n % B2;
+                                        int delta_x           = k_lin / 9;
+                                        int delta_y           = (k_lin / 3) % 3;
+                                        int delta_z           = k_lin % 3;
+                                        int im2col_halo =
+                                            (block_orig_flat_x + v_x + delta_x) * Hy * Hz +
+                                            (block_orig_flat_y + v_y + delta_y) * Hz +
+                                            (block_orig_flat_z + v_z + delta_z);
 
-        EXPECT_EQ(im2col_halo, expected_halo)
-            << "im2col_map disagrees at bx=" << bx << " by=" << by << " bz=" << bz
-            << " z=" << z << " p=" << p << " q=" << q
-            << " t=" << t << " r=" << r << " s=" << s;
+                                        EXPECT_EQ(im2col_halo, expected_halo)
+                                            << "im2col_map disagrees at bx=" << bx << " by=" << by
+                                            << " bz=" << bz << " z=" << z << " p=" << p
+                                            << " q=" << q << " t=" << t << " r=" << r << " s=" << s;
 
-        if (im2col_halo != expected_halo && ++mismatches >= 5)
-            break;
-    }
+                                        if (im2col_halo != expected_halo && ++mismatches >= 5)
+                                            break;
+                                    }
 }
 
 // =============================================================================
@@ -515,8 +508,9 @@ altParamName(::testing::TestParamInfo<LeafIGemmAltParam> const &info) {
 }
 
 class LeafIGemmAltConvTest : public ::testing::TestWithParam<LeafIGemmAltParam> {
-protected:
-    void SetUp() override {
+  protected:
+    void
+    SetUp() override {
         if (!cudaIsAvailable()) {
             GTEST_SKIP() << "CUDA not available";
         }
@@ -539,8 +533,7 @@ protected:
         double max_diff = diff.max().item<double>();
 
         EXPECT_TRUE(torch::allclose(test_f64, ref_f64, rtol, atol))
-            << context << ": max diff=" << max_diff
-            << ", mean diff=" << diff.mean().item<double>();
+            << context << ": max diff=" << max_diff << ", mean diff=" << diff.mean().item<double>();
     }
 };
 
@@ -655,8 +648,7 @@ TEST(LeafIGemmAltConvEdge, SingleVoxel) {
     auto test_f64 = test.cpu().to(torch::kFloat64);
 
     EXPECT_TRUE(torch::allclose(test_f64, ref_f64, 1e-1, 1e-1))
-        << "Single voxel mismatch, max diff="
-        << (test_f64 - ref_f64).abs().max().item<double>();
+        << "Single voxel mismatch, max diff=" << (test_f64 - ref_f64).abs().max().item<double>();
 }
 
 // Instantiate parameterized tests
@@ -664,14 +656,138 @@ TEST(LeafIGemmAltConvEdge, SingleVoxel) {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-but-set-variable"
 
-INSTANTIATE_TEST_SUITE_P(
-    LeafIGemmAlt,
-    LeafIGemmAltConvTest,
-    ::testing::Values(
-        LeafIGemmAltParam{32, 32},
-        LeafIGemmAltParam{32, 64},
-        LeafIGemmAltParam{64, 32},
-        LeafIGemmAltParam{64, 64}),
-    altParamName);
+INSTANTIATE_TEST_SUITE_P(LeafIGemmAlt,
+                         LeafIGemmAltConvTest,
+                         ::testing::Values(LeafIGemmAltParam{32, 32},
+                                           LeafIGemmAltParam{32, 64},
+                                           LeafIGemmAltParam{64, 32},
+                                           LeafIGemmAltParam{64, 64}),
+                         altParamName);
+
+#pragma GCC diagnostic pop
+
+// =============================================================================
+// CuTe kernel tests: exercise multiple kernel sizes (1x1x1, 3x3x3, 5x5x5)
+// =============================================================================
+
+using CuteKernelParam = std::tuple<int64_t, int64_t, int>;
+
+static std::string
+cuteParamName(::testing::TestParamInfo<CuteKernelParam> const &info) {
+    auto C_in  = std::get<0>(info.param);
+    auto C_out = std::get<1>(info.param);
+    auto K     = std::get<2>(info.param);
+    return "Cin" + std::to_string(C_in) + "_Cout" + std::to_string(C_out) + "_K" +
+           std::to_string(K);
+}
+
+class LeafIGemmAltCuteConvTest : public ::testing::TestWithParam<CuteKernelParam> {
+  protected:
+    void
+    SetUp() override {
+        if (!cudaIsAvailable()) {
+            GTEST_SKIP() << "CUDA not available";
+        }
+        if (!deviceSupportsSm80()) {
+            GTEST_SKIP() << "Leaf iGEMM Alt CuTe requires Sm80+ (Ampere or newer)";
+        }
+    }
+};
+
+TEST_P(LeafIGemmAltCuteConvTest, DenseSingleLeaf) {
+    auto [C_in, C_out, K] = GetParam();
+    auto device           = makeDevice();
+
+    auto grid = makeDenseTestGrid(8, device);
+    int64_t N = grid->totalVoxels();
+
+    torch::manual_seed(123);
+    auto features = torch::randn({N, C_in}, topts(device));
+    auto weights  = torch::randn({C_out, C_in, K, K, K}, topts(device));
+
+    auto ref  = referenceConv(features, weights, *grid);
+    auto test = ops::leafIGemmAltConv(features, weights, *grid, *grid);
+
+    assertNoNanInf(test, "CuTe dense single leaf");
+    EXPECT_EQ(test.size(0), N);
+    EXPECT_EQ(test.size(1), C_out);
+
+    auto ref_f64  = ref.cpu().to(torch::kFloat64);
+    auto test_f64 = test.cpu().to(torch::kFloat64);
+    auto diff     = (test_f64 - ref_f64).abs();
+    double maxd   = diff.max().item<double>();
+
+    EXPECT_TRUE(torch::allclose(test_f64, ref_f64, /*rtol=*/1e-1, /*atol=*/1e-1))
+        << "CuTe dense K=" << K << " C_in=" << C_in << " C_out=" << C_out << ": max diff=" << maxd;
+}
+
+TEST_P(LeafIGemmAltCuteConvTest, DenseMultiLeaf) {
+    auto [C_in, C_out, K] = GetParam();
+    auto device           = makeDevice();
+
+    auto grid = makeDenseTestGrid(16, device);
+    int64_t N = grid->totalVoxels();
+    EXPECT_GT(grid->totalLeaves(), 1);
+
+    torch::manual_seed(456);
+    auto features = torch::randn({N, C_in}, topts(device));
+    auto weights  = torch::randn({C_out, C_in, K, K, K}, topts(device));
+
+    auto ref  = referenceConv(features, weights, *grid);
+    auto test = ops::leafIGemmAltConv(features, weights, *grid, *grid);
+
+    assertNoNanInf(test, "CuTe dense multi-leaf");
+    EXPECT_EQ(test.size(0), N);
+    EXPECT_EQ(test.size(1), C_out);
+
+    auto ref_f64  = ref.cpu().to(torch::kFloat64);
+    auto test_f64 = test.cpu().to(torch::kFloat64);
+    auto diff     = (test_f64 - ref_f64).abs();
+    double maxd   = diff.max().item<double>();
+
+    EXPECT_TRUE(torch::allclose(test_f64, ref_f64, /*rtol=*/1e-1, /*atol=*/1e-1))
+        << "CuTe multi-leaf K=" << K << " C_in=" << C_in << " C_out=" << C_out
+        << ": max diff=" << maxd;
+}
+
+TEST_P(LeafIGemmAltCuteConvTest, SparseGrid) {
+    auto [C_in, C_out, K] = GetParam();
+    auto device           = makeDevice();
+
+    auto grid = makeSparseTestGrid(32, 10, device);
+    int64_t N = grid->totalVoxels();
+
+    torch::manual_seed(789);
+    auto features = torch::randn({N, C_in}, topts(device));
+    auto weights  = torch::randn({C_out, C_in, K, K, K}, topts(device));
+
+    auto ref  = referenceConv(features, weights, *grid);
+    auto test = ops::leafIGemmAltConv(features, weights, *grid, *grid);
+
+    assertNoNanInf(test, "CuTe sparse grid");
+    EXPECT_EQ(test.size(0), N);
+    EXPECT_EQ(test.size(1), C_out);
+
+    auto ref_f64  = ref.cpu().to(torch::kFloat64);
+    auto test_f64 = test.cpu().to(torch::kFloat64);
+    auto diff     = (test_f64 - ref_f64).abs();
+    double maxd   = diff.max().item<double>();
+
+    EXPECT_TRUE(torch::allclose(test_f64, ref_f64, /*rtol=*/1e-1, /*atol=*/1e-1))
+        << "CuTe sparse K=" << K << " C_in=" << C_in << " C_out=" << C_out << ": max diff=" << maxd;
+}
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-but-set-variable"
+
+INSTANTIATE_TEST_SUITE_P(LeafIGemmAltCute,
+                         LeafIGemmAltCuteConvTest,
+                         ::testing::Values(CuteKernelParam{32, 32, 1},
+                                           CuteKernelParam{32, 32, 3},
+                                           CuteKernelParam{32, 64, 3},
+                                           CuteKernelParam{64, 64, 3},
+                                           CuteKernelParam{32, 32, 5},
+                                           CuteKernelParam{64, 64, 5}),
+                         cuteParamName);
 
 #pragma GCC diagnostic pop

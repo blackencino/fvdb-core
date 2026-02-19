@@ -36,10 +36,9 @@ namespace ops {
 /// @param weights   Kernel weights, shape [Cout, Cin, k0, k1, k2].
 /// @param topo      Precomputed topology from gatherScatterDefaultSparseConvTopology.
 /// @return          Output features, shape [output_total_voxels, Cout].
-torch::Tensor
-implicitGemmConv(torch::Tensor features,
-                 torch::Tensor weights,
-                 GatherScatterDefaultTopology const &topo);
+torch::Tensor implicitGemmConv(torch::Tensor features,
+                               torch::Tensor weights,
+                               GatherScatterDefaultTopology const &topo);
 
 } // namespace ops
 } // namespace detail

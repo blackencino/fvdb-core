@@ -15,12 +15,103 @@
 //   Phase 2-3: Scalar GEMM with predicated gather + scatter epilogue
 //
 // Target architecture: SM80 (Ampere) and newer.
-
-#include "LeafIGemmAltConv.h"
+//
+// ---------------------------------------------------------------------------
+// STATUS: CuTe tensor-core kernel (Section 13b) does NOT compile.
+// ---------------------------------------------------------------------------
+//
+// The scalar kernel (leaf_igemm_alt_kernel, Section 13a) works and is the
+// active code path.  The CuTe kernel (leaf_igemm_alt_cute_kernel, Section
+// 13b) was written as a skeleton but was never instantiated or compiled
+// prior to this work.  Attempting to instantiate it surfaced a cascade of
+// template errors deep inside CuTe / CUTLASS.  The host-side dispatch
+// infrastructure (Section 15: weight permutation, launch wrapper, channel
+// dispatch) is complete and correct, but gated behind FVDB_ENABLE_CUTE_IGEMM
+// which defaults to 0.
+//
+// What was completed (correct and ready to use):
+//
+//   1. outputComposedScatterLayout (Section 11b) -- the Sifakis output
+//      scatter ComposedLayout.  Mirrors activationComposedGatherLayout but
+//      for the output dimension (Cout, spatial).  Templated on Cout_.
+//
+//   2. outputIndexLayout (Section 11b) -- now templated on Cout_ so the
+//      channel dimension is present (broadcast, stride 0) for TilerOut
+//      compatibility.
+//
+//   3. Weight permutation -- host code permutes PyTorch weights from
+//      [Cout, Cin, T, R, S] to [Cout, T, R, S, Cin] (Cin-contiguous) to
+//      match filterLayout()'s make_ordered_layout order.
+//
+//   4. launch_leaf_igemm_alt_cute (Section 14) -- launch wrapper that
+//      passes a raw tfloat32_t pointer to the kernel, which reconstructs
+//      the CuTe filter Tensor in-kernel.
+//
+//   5. tryLaunchCute / launchCuteDispatch (Section 15) -- compile-time
+//      channel dispatch mapping runtime Cin/Cout to template parameters.
+//      Falls back to the scalar kernel for unsupported channel pairs.
+//
+//   6. Test coverage -- LeafIGemmAltConvTest.cu extended with a
+//      LeafIGemmAltCuteConvTest parameterized suite covering kernel sizes
+//      1x1x1, 3x3x3, 5x5x5 and channel pairs (32,32), (32,64), (64,64).
+//
+// What is broken (pre-existing issues in the dead CuTe kernel body):
+//
+//   A. Tensor engine type mismatch (fixed).  The kernel signature declared
+//      the filter tensor as Tensor<tfloat32_t const *, Layout>, but
+//      make_tensor(make_gmem_ptr(...), layout) produces a gmem_ptr engine.
+//      Raw pointers lack the ::iterator / ::value_type nested types that
+//      cute::Tensor requires.  Fix: pass a raw pointer to the __global__
+//      kernel and reconstruct the tensor with make_tensor(make_gmem_ptr())
+//      inside the kernel body.  (Done.)
+//
+//   B. TiledMma N-dimension mismatch (fixed).  The original code used
+//      Tile<_32, _32, _8> but TileSizeN = blk_vol() = 16.  An MMA tile
+//      of 32 in N is larger than the problem tile of 16.  Fix: changed to
+//      Tile<TileSizeM, TileSizeN, _8>.  (Done.)
+//
+//   C. local_tile on ComposedLayout tensors (BLOCKING).  The kernel body
+//      calls local_tile(gOut, TilerOut, ...) and local_tile(gAct, TilerAct,
+//      ...) where gOut and gAct are tensors with ComposedLayout (the
+//      IndexedGather + CustomStride indirection).  CuTe's local_tile calls
+//      zipped_divide internally, which decomposes the layout by dividing
+//      shape/stride elements.  For a ComposedLayout whose inner strides
+//      contain ScaledBasis<> (E<0>, E<1>) elements from the 2D intermediate
+//      space, zipped_divide hits a static_assert("Mismatched Ranks")
+//      because the ScaledBasis stride algebra doesn't decompose the same
+//      way as integer strides.
+//
+//      This is not a bug in CuTe -- it is a design mismatch.  The Sifakis
+//      reference implementation does not use local_tile on ComposedLayout
+//      tensors.  Instead it:
+//        (a) Uses local_tile only on regular-layout tensors (filter,
+//            shared-memory index maps, predicates).
+//        (b) Constructs the ComposedLayout gmem tensors (gAct, gOut) at
+//            per-tile granularity inside the cluster loop, using the already
+//            tiled index-map pointers.  Each iteration creates a fresh
+//            make_tensor(make_gmem_ptr(base - offset), composed_layout)
+//            whose shape matches exactly one (TileM, TileN) or (TileN,
+//            TileK) tile.
+//
+//      WHERE TO START FIXING:
+//      Refactor igemm_cute_op::operator() so that gAct and gOut are NOT
+//      created at full-leaf scope and then tiled with local_tile.  Instead,
+//      create per-tile ComposedLayout tensors inside the m_coord / cluster
+//      loop, parameterized by the tile-local scatter/gather map pointers
+//      that are already available from the tiled index tensors (sBIdx_nk,
+//      sCIdx_mn).  This matches the Sifakis approach and avoids calling
+//      local_tile / zipped_divide on ComposedLayout entirely.
+//
+// ---------------------------------------------------------------------------
 
 #include <fvdb/detail/GridBatchImpl.h>
+#include <fvdb/detail/ops/convolution/LeafIGemmAltConv.h>
+
 #include <nanovdb/NanoVDB.h>
 
+// NOTE: torch / ATen / c10 headers MUST precede CuTe / CUTLASS headers.
+// See CutlassGroupedGemm.cu for the full explanation (CCCL version mismatch
+// between local nvcc 13.1 and conda CUDA 12.9 toolkit headers).
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
@@ -53,9 +144,9 @@ namespace detail {
 namespace leaf_igemm_alt {
 
 struct coord3 {
-    int x = 0;
-    int y = 0;
-    int z = 0;
+    int x                                           = 0;
+    int y                                           = 0;
+    int z                                           = 0;
     consteval bool operator==(coord3 const &) const = default;
 };
 
@@ -104,9 +195,11 @@ all_leq(coord3 a, coord3 b) {
     return a.x <= b.x && a.y <= b.y && a.z <= b.z;
 }
 
-template <bool B>
-struct consteval_bool_type {
-    static consteval bool value() { return B; }
+template <bool B> struct consteval_bool_type {
+    static consteval bool
+    value() {
+        return B;
+    }
 };
 using consteval_true_type  = consteval_bool_type<true>;
 using consteval_false_type = consteval_bool_type<false>;
@@ -117,32 +210,58 @@ using consteval_false_type = consteval_bool_type<false>;
 
 template <coord3 K_, coord3 S_ = coord3{1, 1, 1}, coord3 D_ = coord3{1, 1, 1}, int LEAF_ = 8>
 struct conv_geometry {
-    static consteval coord3 K() { return K_; }
-    static consteval coord3 S() { return S_; }
-    static consteval coord3 D() { return D_; }
-    static consteval int leaf() { return LEAF_; }
+    static consteval coord3
+    K() {
+        return K_;
+    }
+    static consteval coord3
+    S() {
+        return S_;
+    }
+    static consteval coord3
+    D() {
+        return D_;
+    }
+    static consteval int
+    leaf() {
+        return LEAF_;
+    }
 
-    static consteval coord3 offset() { return -((K_ - coord3{1, 1, 1}) * D_) / 2; }
-    static consteval coord3 halo() {
+    static consteval coord3
+    offset() {
+        return -((K_ - coord3{1, 1, 1}) * D_) / 2;
+    }
+    static consteval coord3
+    halo() {
         return coord3{LEAF_ - 1, LEAF_ - 1, LEAF_ - 1} * S_ + (K_ - coord3{1, 1, 1}) * D_ +
                coord3{1, 1, 1};
     }
-    static consteval int halo_vol() { return prod(halo()); }
-    static consteval int kern_vol() { return prod(K_); }
-    static consteval int leaf_vol() { return LEAF_ * LEAF_ * LEAF_; }
-    static consteval coord3 leaf3() { return {LEAF_, LEAF_, LEAF_}; }
+    static consteval int
+    halo_vol() {
+        return prod(halo());
+    }
+    static consteval int
+    kern_vol() {
+        return prod(K_);
+    }
+    static consteval int
+    leaf_vol() {
+        return LEAF_ * LEAF_ * LEAF_;
+    }
+    static consteval coord3
+    leaf3() {
+        return {LEAF_, LEAF_, LEAF_};
+    }
 
     static_assert(all_positive(K_), "Kernel size must be positive on all axes");
     static_assert(all_positive(S_), "Stride must be positive on all axes");
     static_assert(all_positive(D_), "Dilation must be positive on all axes");
     static_assert(LEAF_ > 0, "Leaf side length must be positive");
-    static_assert(
-        all_leq(halo(), coord3{2 * LEAF_ + 1, 2 * LEAF_ + 1, 2 * LEAF_ + 1}),
-        "C2 violated: halo exceeds 3-leaf neighborhood");
+    static_assert(all_leq(halo(), coord3{2 * LEAF_ + 1, 2 * LEAF_ + 1, 2 * LEAF_ + 1}),
+                  "C2 violated: halo exceeds 3-leaf neighborhood");
 };
 
-template <typename T>
-struct is_conv_geometry : consteval_false_type {};
+template <typename T> struct is_conv_geometry : consteval_false_type {};
 template <coord3 K, coord3 S, coord3 D, int L>
 struct is_conv_geometry<conv_geometry<K, S, D, L>> : consteval_true_type {};
 template <typename T>
@@ -157,18 +276,22 @@ using geom_1x1x1_s1 = conv_geometry<coord3{1, 1, 1}>;
 // Section 3: Scalar type traits (conv_types) -- no CuTe dependency
 // ============================================================================
 
-template <typename ElemWt_, typename ElemFeat_, typename ElemAcc_, typename ElemOut_, typename ElemIdx_>
+template <typename ElemWt_,
+          typename ElemFeat_,
+          typename ElemAcc_,
+          typename ElemOut_,
+          typename ElemIdx_>
 struct conv_types {
     using ElemWt   = ElemWt_;
     using ElemFeat = ElemFeat_;
     using ElemAcc  = ElemAcc_;
     using ElemOut  = ElemOut_;
     using ElemIdx  = ElemIdx_;
-    static_assert(sizeof(ElemOut_) <= sizeof(ElemAcc_), "C7: ElemOut must not be wider than ElemAcc");
+    static_assert(sizeof(ElemOut_) <= sizeof(ElemAcc_),
+                  "C7: ElemOut must not be wider than ElemAcc");
 };
 
-template <typename T>
-struct is_conv_types : consteval_false_type {};
+template <typename T> struct is_conv_types : consteval_false_type {};
 template <typename Wt, typename Feat, typename Acc, typename Out, typename Idx>
 struct is_conv_types<conv_types<Wt, Feat, Acc, Out, Idx>> : consteval_true_type {};
 template <typename T>
@@ -183,37 +306,85 @@ using types_f32 = conv_types<float, float, float, float, uint32_t>;
 inline constexpr size_t SMEM_BASELINE_BYTES = 48 * 1024;
 inline constexpr size_t SMEM_MAX_BYTES      = 164 * 1024;
 
-template <coord3 B_, coord3 CL_ = coord3{1, 1, 1}, int TileM_ = 32, int TileCK_ = 8,
-          int Stages_ = 3, geometry_like Geom = geom_3x3x3_s1, types_like Types = types_f32>
+template <coord3 B_,
+          coord3 CL_         = coord3{1, 1, 1},
+          int TileM_         = 32,
+          int TileCK_        = 8,
+          int Stages_        = 3,
+          geometry_like Geom = geom_3x3x3_s1,
+          types_like Types   = types_f32>
 struct conv_tiling {
-    static consteval coord3 B() { return B_; }
-    static consteval coord3 CL() { return CL_; }
-    static consteval int tile_m() { return TileM_; }
-    static consteval int tile_ck() { return TileCK_; }
-    static consteval int stages() { return Stages_; }
+    static consteval coord3
+    B() {
+        return B_;
+    }
+    static consteval coord3
+    CL() {
+        return CL_;
+    }
+    static consteval int
+    tile_m() {
+        return TileM_;
+    }
+    static consteval int
+    tile_ck() {
+        return TileCK_;
+    }
+    static consteval int
+    stages() {
+        return Stages_;
+    }
 
-    static consteval coord3 nblk() { return Geom::leaf3() / B_; }
-    static consteval int nblk_tot() { return prod(nblk()); }
-    static consteval int blk_vol() { return prod(B_); }
+    static consteval coord3
+    nblk() {
+        return Geom::leaf3() / B_;
+    }
+    static consteval int
+    nblk_tot() {
+        return prod(nblk());
+    }
+    static consteval int
+    blk_vol() {
+        return prod(B_);
+    }
 
-    static consteval coord3 ncl() { return nblk() / CL_; }
-    static consteval int ncl_tot() { return prod(ncl()); }
-    static consteval coord3 cl_extent() { return CL_ * B_; }
-    static consteval coord3 cl_halo() {
+    static consteval coord3
+    ncl() {
+        return nblk() / CL_;
+    }
+    static consteval int
+    ncl_tot() {
+        return prod(ncl());
+    }
+    static consteval coord3
+    cl_extent() {
+        return CL_ * B_;
+    }
+    static consteval coord3
+    cl_halo() {
         return (cl_extent() - coord3{1, 1, 1}) * Geom::S() +
                (Geom::K() - coord3{1, 1, 1}) * Geom::D() + coord3{1, 1, 1};
     }
-    static consteval int cl_halo_vol() { return prod(cl_halo()); }
-    static consteval int cl_vol() { return prod(cl_extent()); }
+    static consteval int
+    cl_halo_vol() {
+        return prod(cl_halo());
+    }
+    static consteval int
+    cl_vol() {
+        return prod(cl_extent());
+    }
 
-    static consteval size_t smem_index_maps() {
+    static consteval size_t
+    smem_index_maps() {
         return static_cast<size_t>(Geom::halo_vol() + Geom::leaf_vol()) *
                sizeof(typename Types::ElemIdx);
     }
-    static consteval size_t smem_predicates() {
+    static consteval size_t
+    smem_predicates() {
         return static_cast<size_t>(cl_halo_vol() + cl_vol());
     }
-    static consteval size_t smem_total() {
+    static consteval size_t
+    smem_total() {
         return smem_index_maps() + smem_predicates();
     }
 
@@ -227,8 +398,7 @@ struct conv_tiling {
     static_assert(smem_total() <= SMEM_MAX_BYTES, "C3: shared memory budget exceeded");
 };
 
-template <typename T>
-struct is_conv_tiling : consteval_false_type {};
+template <typename T> struct is_conv_tiling : consteval_false_type {};
 template <coord3 B, coord3 CL, int TM, int TCK, int S, geometry_like G, types_like Ty>
 struct is_conv_tiling<conv_tiling<B, CL, TM, TCK, S, G, Ty>> : consteval_true_type {};
 template <typename T>
@@ -243,31 +413,50 @@ using tiling_default = conv_tiling<coord3{4, 2, 2}, coord3{1, 2, 2}, 32, 8, 3, G
 
 enum class conv_variant { forward, input_grad, weight_grad, transposed_conv };
 
-template <conv_variant V>
-struct variant_traits;
+template <conv_variant V> struct variant_traits;
 
-template <>
-struct variant_traits<conv_variant::forward> {
-    static consteval bool flip() { return false; }
-    static consteval bool atomic_accum() { return false; }
+template <> struct variant_traits<conv_variant::forward> {
+    static consteval bool
+    flip() {
+        return false;
+    }
+    static consteval bool
+    atomic_accum() {
+        return false;
+    }
 };
 
-template <>
-struct variant_traits<conv_variant::input_grad> {
-    static consteval bool flip() { return true; }
-    static consteval bool atomic_accum() { return false; }
+template <> struct variant_traits<conv_variant::input_grad> {
+    static consteval bool
+    flip() {
+        return true;
+    }
+    static consteval bool
+    atomic_accum() {
+        return false;
+    }
 };
 
-template <>
-struct variant_traits<conv_variant::weight_grad> {
-    static consteval bool flip() { return false; }
-    static consteval bool atomic_accum() { return true; }
+template <> struct variant_traits<conv_variant::weight_grad> {
+    static consteval bool
+    flip() {
+        return false;
+    }
+    static consteval bool
+    atomic_accum() {
+        return true;
+    }
 };
 
-template <>
-struct variant_traits<conv_variant::transposed_conv> {
-    static consteval bool flip() { return true; }
-    static consteval bool atomic_accum() { return false; }
+template <> struct variant_traits<conv_variant::transposed_conv> {
+    static consteval bool
+    flip() {
+        return true;
+    }
+    static consteval bool
+    atomic_accum() {
+        return false;
+    }
 };
 
 // ============================================================================
@@ -278,26 +467,42 @@ struct dcoord3 {
     int x, y, z;
 };
 
-__device__ __forceinline__ dcoord3 operator+(dcoord3 a, dcoord3 b) { return {a.x+b.x, a.y+b.y, a.z+b.z}; }
-__device__ __forceinline__ dcoord3 operator-(dcoord3 a, dcoord3 b) { return {a.x-b.x, a.y-b.y, a.z-b.z}; }
-__device__ __forceinline__ dcoord3 operator*(dcoord3 a, dcoord3 b) { return {a.x*b.x, a.y*b.y, a.z*b.z}; }
+__device__ __forceinline__ dcoord3
+operator+(dcoord3 a, dcoord3 b) {
+    return {a.x + b.x, a.y + b.y, a.z + b.z};
+}
+__device__ __forceinline__ dcoord3
+operator-(dcoord3 a, dcoord3 b) {
+    return {a.x - b.x, a.y - b.y, a.z - b.z};
+}
+__device__ __forceinline__ dcoord3
+operator*(dcoord3 a, dcoord3 b) {
+    return {a.x * b.x, a.y * b.y, a.z * b.z};
+}
 
-__device__ __forceinline__ int dencode3(dcoord3 p, dcoord3 d) { return p.x*d.y*d.z + p.y*d.z + p.z; }
-__device__ __forceinline__ dcoord3 ddecode3(int i, dcoord3 d) { return {i/(d.y*d.z), (i/d.z)%d.y, i%d.z}; }
-__device__ __forceinline__ dcoord3 to_dcoord3(coord3 c) { return {c.x, c.y, c.z}; }
+__device__ __forceinline__ int
+dencode3(dcoord3 p, dcoord3 d) {
+    return p.x * d.y * d.z + p.y * d.z + p.z;
+}
+__device__ __forceinline__ dcoord3
+ddecode3(int i, dcoord3 d) {
+    return {i / (d.y * d.z), (i / d.z) % d.y, i % d.z};
+}
+__device__ __forceinline__ dcoord3
+to_dcoord3(coord3 c) {
+    return {c.x, c.y, c.z};
+}
 
 // ============================================================================
 // Section 7: im2col map -- virtual im2col address computation
 // ============================================================================
 
-template <typename ElemIdx>
-struct im2col_result {
+template <typename ElemIdx> struct im2col_result {
     ElemIdx voxel_idx;
     int channel;
 };
 
-template <geometry_like Geom, tiling_like Tiling, conv_variant Variant>
-struct im2col_map {
+template <geometry_like Geom, tiling_like Tiling, conv_variant Variant> struct im2col_map {
     static constexpr bool flip = variant_traits<Variant>::flip();
 
     template <typename ElemIdx>
@@ -336,37 +541,50 @@ struct im2col_map {
 
 using namespace cute;
 
-template <typename Index>
-struct IndexedGather {
+template <typename Index> struct IndexedGather {
     CUTE_HOST_DEVICE constexpr IndexedGather(Index const *indices = {}) : indices_(indices) {}
     template <typename I>
-    CUTE_HOST_DEVICE constexpr Index operator()(I i) const { return indices_[i]; }
-    CUTE_HOST_DEVICE friend void print(IndexedGather const &) { cute::print("Indexed"); }
+    CUTE_HOST_DEVICE constexpr Index
+    operator()(I i) const {
+        return indices_[i];
+    }
+    CUTE_HOST_DEVICE friend void
+    print(IndexedGather const &) {
+        cute::print("Indexed");
+    }
     Index const *indices_;
 };
 
-template <typename Func, typename Stride>
-struct CustomStride {
+template <typename Func, typename Stride> struct CustomStride {
     CUTE_HOST_DEVICE constexpr CustomStride(Func const &func, Stride const &stride)
         : func_(func), stride_(stride) {}
     template <typename I>
-    CUTE_HOST_DEVICE constexpr friend auto operator*(I i, CustomStride const &s) {
+    CUTE_HOST_DEVICE constexpr friend auto
+    operator*(I i, CustomStride const &s) {
         return s.func_(i) * s.stride_;
     }
     template <typename I>
-    CUTE_HOST_DEVICE constexpr friend auto operator*(CustomStride const &s, I i) {
+    CUTE_HOST_DEVICE constexpr friend auto
+    operator*(CustomStride const &s, I i) {
         return s.func_(i) * s.stride_;
     }
-    CUTE_HOST_DEVICE friend void print(CustomStride const &s) {
-        cute::print("Custom{"); print(s.func_); cute::print(","); print(s.stride_); cute::print("}");
+    CUTE_HOST_DEVICE friend void
+    print(CustomStride const &s) {
+        cute::print("Custom{");
+        print(s.func_);
+        cute::print(",");
+        print(s.stride_);
+        cute::print("}");
     }
     template <typename Div>
-    CUTE_HOST_DEVICE constexpr friend auto safe_div(CustomStride const &s, Div const &div) {
-        return CustomStride<Func, decltype(safe_div(s.stride_, div))>(
-            s.func_, safe_div(s.stride_, div));
+    CUTE_HOST_DEVICE constexpr friend auto
+    safe_div(CustomStride const &s, Div const &div) {
+        return CustomStride<Func, decltype(safe_div(s.stride_, div))>(s.func_,
+                                                                      safe_div(s.stride_, div));
     }
     template <typename Shape>
-    CUTE_HOST_DEVICE constexpr friend auto make_layout(Shape const &shape, CustomStride const &stride) {
+    CUTE_HOST_DEVICE constexpr friend auto
+    make_layout(Shape const &shape, CustomStride const &stride) {
         return Layout<Shape, CustomStride>(shape, stride);
     }
     Func func_;
@@ -376,7 +594,7 @@ struct CustomStride {
 template <typename Stride, typename Func>
 CUTLASS_HOST_DEVICE auto
 make_custom_stride_layout(Stride const &stride, Func &&func) {
-    auto idx = find_if(stride, [](auto x) { return not is_constant<1, decltype(x)>{}; });
+    auto idx        = find_if(stride, [](auto x) { return not is_constant<1, decltype(x)>{}; });
     constexpr int I = decltype(idx)::value;
     return make_layout(
         repeat_like(stride, _1{}),
@@ -387,7 +605,7 @@ template <typename Iterator, typename Shape, typename Stride, typename Func>
 CUTLASS_HOST_DEVICE auto
 make_gather_tensor(Iterator iter, Shape const &shape, Stride const &stride, Func &&func) {
     Layout<Shape, Stride> matrix_layout = make_identity_layout(shape);
-    auto offset        = as_arithmetic_tuple(repeat_like(shape, _0{}));
+    auto offset                         = as_arithmetic_tuple(repeat_like(shape, _0{}));
     auto gather_layout = make_custom_stride_layout(stride, static_cast<Func &&>(func));
     return make_tensor(iter, ComposedLayout{gather_layout, offset, matrix_layout});
 }
@@ -399,16 +617,20 @@ make_gather_tensor(Iterator iter, Shape const &shape, Stride const &stride, Func
 // ComposedLayout upcast overload (must be in namespace cute)
 namespace cute {
 
-template <int N, typename Shape_A, typename Stride_A, typename Offset, typename Shape, typename Stride>
+template <int N,
+          typename Shape_A,
+          typename Stride_A,
+          typename Offset,
+          typename Shape,
+          typename Stride>
 CUTE_HOST_DEVICE constexpr auto
 upcast(ComposedLayout<Layout<Shape_A, Stride_A>, Offset, Layout<Shape, Stride>> const &layout) {
-    auto idx = find_if(layout.layout_a().stride(), [](auto x) {
-        return is_constant<1, decltype(x)>{};
-    });
+    auto idx =
+        find_if(layout.layout_a().stride(), [](auto x) { return is_constant<1, decltype(x)>{}; });
     constexpr int I = decltype(idx)::value;
-    auto outer  = upcast<N>(layout.layout_a());
-    auto offset = as_arithmetic_tuple(
-        replace<I>(layout.offset(), upcast<N>(get<I>(layout.offset()))));
+    auto outer      = upcast<N>(layout.layout_a());
+    auto offset =
+        as_arithmetic_tuple(replace<I>(layout.offset(), upcast<N>(get<I>(layout.offset()))));
     auto inner = upcast<N>(layout.layout_b().shape(), layout.layout_b().stride());
     return composition(outer, offset, inner);
 }
@@ -423,12 +645,11 @@ namespace fvdb {
 namespace detail {
 namespace leaf_igemm_alt {
 
-template <int Stages_>
-struct MainloopSm80Predicated {
+template <int Stages_> struct MainloopSm80Predicated {
     static constexpr int Stages = Stages_;
-    using ArchTag    = cutlass::arch::Sm80;
-    using Schedule   = cutlass::gemm::KernelMultistage;
-    using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
+    using ArchTag               = cutlass::arch::Sm80;
+    using Schedule              = cutlass::gemm::KernelMultistage;
+    using ClusterShape          = cute::Shape<cute::_1, cute::_1, cute::_1>;
 };
 
 } // namespace leaf_igemm_alt
@@ -438,14 +659,36 @@ struct MainloopSm80Predicated {
 namespace cutlass::gemm::collective {
 using namespace cute;
 
-template <int Stages, class TileShape_, class ElementA_, class StrideA_, class ElementB_,
-          class StrideB_, class TiledMma_, class GmemTiledCopyA_, class SmemLayoutAtomA_,
-          class SmemCopyAtomA_, class TransformA_, class GmemTiledCopyB_, class SmemLayoutAtomB_,
-          class SmemCopyAtomB_, class TransformB_>
-struct CollectiveMma<fvdb::detail::leaf_igemm_alt::MainloopSm80Predicated<Stages>, TileShape_,
-                     ElementA_, StrideA_, ElementB_, StrideB_, TiledMma_, GmemTiledCopyA_,
-                     SmemLayoutAtomA_, SmemCopyAtomA_, TransformA_, GmemTiledCopyB_,
-                     SmemLayoutAtomB_, SmemCopyAtomB_, TransformB_> {
+template <int Stages,
+          class TileShape_,
+          class ElementA_,
+          class StrideA_,
+          class ElementB_,
+          class StrideB_,
+          class TiledMma_,
+          class GmemTiledCopyA_,
+          class SmemLayoutAtomA_,
+          class SmemCopyAtomA_,
+          class TransformA_,
+          class GmemTiledCopyB_,
+          class SmemLayoutAtomB_,
+          class SmemCopyAtomB_,
+          class TransformB_>
+struct CollectiveMma<fvdb::detail::leaf_igemm_alt::MainloopSm80Predicated<Stages>,
+                     TileShape_,
+                     ElementA_,
+                     StrideA_,
+                     ElementB_,
+                     StrideB_,
+                     TiledMma_,
+                     GmemTiledCopyA_,
+                     SmemLayoutAtomA_,
+                     SmemCopyAtomA_,
+                     TransformA_,
+                     GmemTiledCopyB_,
+                     SmemLayoutAtomB_,
+                     SmemCopyAtomB_,
+                     TransformB_> {
     using DispatchPolicy     = MainloopSm80CpAsyncUnpredicated<Stages>;
     using TileShape          = TileShape_;
     using ElementA           = ElementA_;
@@ -502,12 +745,24 @@ struct CollectiveMma<fvdb::detail::leaf_igemm_alt::MainloopSm80Predicated<Stages
         return args;
     }
 
-    template <class FrgTensorD, class TensorA, class TensorB, class TensorP, class FrgTensorC,
-              class KTileIterator, class ResidueMNK>
+    template <class FrgTensorD,
+              class TensorA,
+              class TensorB,
+              class TensorP,
+              class FrgTensorC,
+              class KTileIterator,
+              class ResidueMNK>
     CUTLASS_DEVICE void
-    operator()(FrgTensorD &accum, TensorA gA, TensorB gB, TensorP sP,
-               FrgTensorC const &src_accum, KTileIterator k_tile_iter, int k_tile_count,
-               ResidueMNK residue_mnk, int thread_idx, char *smem_buf) {
+    operator()(FrgTensorD &accum,
+               TensorA gA,
+               TensorB gB,
+               TensorP sP,
+               FrgTensorC const &src_accum,
+               KTileIterator k_tile_iter,
+               int k_tile_count,
+               ResidueMNK residue_mnk,
+               int thread_idx,
+               char *smem_buf) {
         static_assert(is_rmem<FrgTensorD>::value);
         static_assert(is_gmem<TensorA>::value);
         static_assert(is_gmem<TensorB>::value);
@@ -515,8 +770,8 @@ struct CollectiveMma<fvdb::detail::leaf_igemm_alt::MainloopSm80Predicated<Stages
         static_assert(is_rmem<FrgTensorC>::value);
 
         SharedStorage &storage = *reinterpret_cast<SharedStorage *>(smem_buf);
-        Tensor sA = make_tensor(make_smem_ptr(storage.smem_a.data()), SmemLayoutA{});
-        Tensor sB = make_tensor(make_smem_ptr(storage.smem_b.data()), SmemLayoutB{});
+        Tensor sA              = make_tensor(make_smem_ptr(storage.smem_a.data()), SmemLayoutA{});
+        Tensor sB              = make_tensor(make_smem_ptr(storage.smem_b.data()), SmemLayoutB{});
 
         GmemTiledCopyA gmem_tiled_copy_A;
         GmemTiledCopyB gmem_tiled_copy_B;
@@ -534,11 +789,15 @@ struct CollectiveMma<fvdb::detail::leaf_igemm_alt::MainloopSm80Predicated<Stages
         CUTLASS_PRAGMA_UNROLL
         for (int k_pipe = 0; k_pipe < Stages - 1; ++k_pipe) {
             copy(gmem_tiled_copy_A, tAgA(_, _, _, *k_tile_iter), tAsA(_, _, _, k_pipe));
-            copy_if(gmem_tiled_copy_B, tBsP(_, _, _, *k_tile_iter),
-                    tBgB(_, _, _, *k_tile_iter), tBsB(_, _, _, k_pipe));
+            copy_if(gmem_tiled_copy_B,
+                    tBsP(_, _, _, *k_tile_iter),
+                    tBgB(_, _, _, *k_tile_iter),
+                    tBsB(_, _, _, k_pipe));
             cp_async_fence();
             --k_tile_count;
-            if (k_tile_count > 0) { ++k_tile_iter; }
+            if (k_tile_count > 0) {
+                ++k_tile_iter;
+            }
         }
 
         TiledMma tiled_mma;
@@ -546,15 +805,15 @@ struct CollectiveMma<fvdb::detail::leaf_igemm_alt::MainloopSm80Predicated<Stages
         Tensor tCrA  = thr_mma.partition_fragment_A(sA(_, _, 0));
         Tensor tCrB  = thr_mma.partition_fragment_B(sB(_, _, 0));
 
-        auto smem_tiled_copy_A  = make_tiled_copy_A(SmemCopyAtomA{}, tiled_mma);
-        auto smem_thr_copy_A    = smem_tiled_copy_A.get_thread_slice(thread_idx);
-        Tensor tCsA             = smem_thr_copy_A.partition_S(sA);
-        Tensor tCrA_copy_view   = smem_thr_copy_A.retile_D(tCrA);
+        auto smem_tiled_copy_A = make_tiled_copy_A(SmemCopyAtomA{}, tiled_mma);
+        auto smem_thr_copy_A   = smem_tiled_copy_A.get_thread_slice(thread_idx);
+        Tensor tCsA            = smem_thr_copy_A.partition_S(sA);
+        Tensor tCrA_copy_view  = smem_thr_copy_A.retile_D(tCrA);
 
-        auto smem_tiled_copy_B  = make_tiled_copy_B(SmemCopyAtomB{}, tiled_mma);
-        auto smem_thr_copy_B    = smem_tiled_copy_B.get_thread_slice(thread_idx);
-        Tensor tCsB             = smem_thr_copy_B.partition_S(sB);
-        Tensor tCrB_copy_view   = smem_thr_copy_B.retile_D(tCrB);
+        auto smem_tiled_copy_B = make_tiled_copy_B(SmemCopyAtomB{}, tiled_mma);
+        auto smem_thr_copy_B   = smem_tiled_copy_B.get_thread_slice(thread_idx);
+        Tensor tCsB            = smem_thr_copy_B.partition_S(sB);
+        Tensor tCrB_copy_view  = smem_thr_copy_B.retile_D(tCrB);
 
         int smem_pipe_read  = 0;
         int smem_pipe_write = Stages - 1;
@@ -581,18 +840,25 @@ struct CollectiveMma<fvdb::detail::leaf_igemm_alt::MainloopSm80Predicated<Stages
                     __syncthreads();
                 }
                 auto k_block_next = (k_block + Int<1>{}) % K_BLOCK_MAX;
-                copy(smem_tiled_copy_A, tCsA_p(_, _, k_block_next),
+                copy(smem_tiled_copy_A,
+                     tCsA_p(_, _, k_block_next),
                      tCrA_copy_view(_, _, k_block_next));
-                copy(smem_tiled_copy_B, tCsB_p(_, _, k_block_next),
+                copy(smem_tiled_copy_B,
+                     tCsB_p(_, _, k_block_next),
                      tCrB_copy_view(_, _, k_block_next));
                 if (k_block == 0) {
-                    copy(gmem_tiled_copy_A, tAgA(_, _, _, *k_tile_iter),
+                    copy(gmem_tiled_copy_A,
+                         tAgA(_, _, _, *k_tile_iter),
                          tAsA(_, _, _, smem_pipe_write));
-                    copy_if(gmem_tiled_copy_B, tBsP(_, _, _, *k_tile_iter),
-                            tBgB(_, _, _, *k_tile_iter), tBsB(_, _, _, smem_pipe_write));
+                    copy_if(gmem_tiled_copy_B,
+                            tBsP(_, _, _, *k_tile_iter),
+                            tBgB(_, _, _, *k_tile_iter),
+                            tBsB(_, _, _, smem_pipe_write));
                     cp_async_fence();
                     --k_tile_count;
-                    if (k_tile_count > 0) { ++k_tile_iter; }
+                    if (k_tile_count > 0) {
+                        ++k_tile_iter;
+                    }
                     smem_pipe_write = smem_pipe_read;
                     ++smem_pipe_read;
                     smem_pipe_read = (smem_pipe_read == Stages) ? 0 : smem_pipe_read;
@@ -621,8 +887,7 @@ namespace leaf_igemm_alt {
 // Section 8: NanoVDB sparse grid adapter (from sparse_grid.h)
 // ============================================================================
 
-template <typename ElemIdx>
-struct nanovdb_sparse_grid {
+template <typename ElemIdx> struct nanovdb_sparse_grid {
     using grid_type = nanovdb::OnIndexGrid;
 
     grid_type const *grid_ptr;
@@ -682,7 +947,7 @@ build_scatter_map(SparseGrid const &iter_grid, int leaf_id, ElemIdx *scatter_map
 template <geometry_like Geom, typename ElemIdx, typename SparseGrid>
 __device__ void
 build_gather_map(SparseGrid const &gather_grid, dcoord3 halo_origin, ElemIdx *gather_map) {
-    constexpr int HALO_VOL = Geom::halo_vol();
+    constexpr int HALO_VOL  = Geom::halo_vol();
     dcoord3 const halo_dims = to_dcoord3(Geom::halo());
     for (int h = threadIdx.x; h < HALO_VOL; h += blockDim.x) {
         dcoord3 const h3    = ddecode3(h, halo_dims);
@@ -800,8 +1065,7 @@ scatter_write(ElemAcc const *accum_buf,
 // to a 2D space: (halo_index, channel_offset). The outer layout applies
 // IndexedGather to resolve halo_index through the shared-memory gather_map.
 
-template <geometry_like Geom, tiling_like Tiling, int Cin>
-struct igemm_layouts {
+template <geometry_like Geom, tiling_like Tiling, int Cin> struct igemm_layouts {
     static constexpr auto T  = Int<Geom::K().x>{};
     static constexpr auto R  = Int<Geom::K().y>{};
     static constexpr auto S  = Int<Geom::K().z>{};
@@ -828,18 +1092,15 @@ struct igemm_layouts {
         auto EC = E<1>{};
 
         auto inner = make_layout(
-            make_shape(
-                make_shape(make_shape(Bx, By, Bz), Z, P, Q),
-                make_shape(C, T, R, S)),
+            make_shape(make_shape(make_shape(Bx, By, Bz), Z, P, Q), make_shape(C, T, R, S)),
             make_stride(
                 make_stride(
-                    make_stride(Hy * Hz * Z * EG, Hz * P * EG, Q * EG),
-                    Hy * Hz * EG, Hz * EG, EG),
+                    make_stride(Hy * Hz * Z * EG, Hz * P * EG, Q * EG), Hy * Hz * EG, Hz * EG, EG),
                 make_stride(EC, Hy * Hz * EG, Hz * EG, EG)));
 
-        auto outer = make_layout(
-            make_shape(_1{}, _1{}),
-            make_stride(CustomStride{IndexedGather<ElemIdx>{gather_map}, C}, _1{}));
+        auto outer =
+            make_layout(make_shape(_1{}, _1{}),
+                        make_stride(CustomStride{IndexedGather<ElemIdx>{gather_map}, C}, _1{}));
 
         return composition(outer, make_arithmetic_tuple(_0{}, _0{}), inner);
     }
@@ -849,23 +1110,17 @@ struct igemm_layouts {
     __hostdev__ static auto
     activationIndexLayout() {
         return make_layout(
-            make_shape(
-                make_shape(make_shape(Bx, By, Bz), Z, P, Q),
-                make_shape(C, T, R, S)),
-            make_stride(
-                make_stride(
-                    make_stride(Hy * Hz * Z, Hz * P, Q),
-                    Hy * Hz, Hz, _1{}),
-                make_stride(_0{}, Hy * Hz, Hz, _1{})));
+            make_shape(make_shape(make_shape(Bx, By, Bz), Z, P, Q), make_shape(C, T, R, S)),
+            make_stride(make_stride(make_stride(Hy * Hz * Z, Hz * P, Q), Hy * Hz, Hz, _1{}),
+                        make_stride(_0{}, Hy * Hz, Hz, _1{})));
     }
 
     // Filter (A-matrix) layout: ordered so that C is contiguous.
     template <int Cout>
     __hostdev__ static auto
     filterLayout() {
-        return make_ordered_layout(
-            make_shape(Int<Cout>{}, make_shape(C, T, R, S)),
-            cute::tuple<_1, cute::tuple<_0, _4, _3, _2>>{});
+        return make_ordered_layout(make_shape(Int<Cout>{}, make_shape(C, T, R, S)),
+                                   cute::tuple<_1, cute::tuple<_0, _4, _3, _2>>{});
     }
 
     // Cluster activation predicate stride (channels collapsed)
@@ -874,32 +1129,49 @@ struct igemm_layouts {
         static constexpr auto CHy = Int<Tiling::cl_halo().y>{};
         static constexpr auto CHz = Int<Tiling::cl_halo().z>{};
         return make_stride(
-            make_stride(
-                make_stride(CHy * CHz * Z, CHz * P, Q),
-                CHy * CHz, CHz, _1{}),
+            make_stride(make_stride(CHy * CHz * Z, CHz * P, Q), CHy * CHz, CHz, _1{}),
             make_stride(_0{}, _0{}, _0{}, _0{}));
     }
 
-    // Output composed scatter layout
-    template <typename ElemIdx>
+    // Output composed scatter layout.
+    // Maps (cout_channel, ((block_x,y,z), voxel_z,p,q)) through the shared-memory
+    // scatter_map to produce global output addresses:
+    //   outData[scatter_map[voxel_linear_idx] * Cout_ + channel_offset]
+    template <int Cout_, typename ElemIdx>
     __hostdev__ static auto
     outputComposedScatterLayout(ElemIdx const *scatter_map) {
         auto ES = E<0>{};
         auto EC = E<1>{};
-        auto K_ = Int<64>{}; // placeholder, actual K comes from template
-        return make_layout(
-            make_shape(_1{}, _1{}),
-            make_stride(_1{}, _1{}));
+        auto K_ = Int<Cout_>{};
+
+        static constexpr auto L  = Int<Geom::leaf()>{};
+        static constexpr auto L2 = Int<Geom::leaf() * Geom::leaf()>{};
+
+        auto inner = make_layout(
+            make_shape(K_, make_shape(make_shape(Bx, By, Bz), Z, P, Q)),
+            make_stride(
+                EC,
+                make_stride(make_stride(L2 * Z * ES, L * P * ES, Q * ES), L2 * ES, L * ES, ES)));
+
+        auto outer =
+            make_layout(make_shape(_1{}, _1{}),
+                        make_stride(CustomStride{IndexedGather<ElemIdx>{scatter_map}, K_}, _1{}));
+
+        return composition(outer, make_arithmetic_tuple(_0{}, _0{}), inner);
     }
 
-    // Output index layout
+    // Output index layout.  Cout_ broadcasts (stride 0) so indices are
+    // shared across channel tiles, but the dimension must be present for
+    // local_tile(TilerOut) compatibility.
+    template <int Cout_>
     __hostdev__ static auto
     outputIndexLayout() {
-        return make_layout(
-            make_shape(Int<1>{}, make_shape(make_shape(Bx, By, Bz), Z, P, Q)),
-            make_stride(_0{}, make_stride(
-                make_stride(Int<64>{} * Z, Int<8>{} * P, Q),
-                Int<64>{}, Int<8>{}, _1{})));
+        return make_layout(make_shape(Int<Cout_>{}, make_shape(make_shape(Bx, By, Bz), Z, P, Q)),
+                           make_stride(_0{},
+                                       make_stride(make_stride(Int<64>{} * Z, Int<8>{} * P, Q),
+                                                   Int<64>{},
+                                                   Int<8>{},
+                                                   _1{})));
     }
 
     // Cluster output predicate stride
@@ -908,10 +1180,7 @@ struct igemm_layouts {
         static constexpr auto CVy = Int<Tiling::cl_extent().y>{};
         static constexpr auto CVz = Int<Tiling::cl_extent().z>{};
         return make_stride(
-            _0{},
-            make_stride(
-                make_stride(CVy * CVz * Z, CVz * P, Q),
-                CVy * CVz, CVz, _1{}));
+            _0{}, make_stride(make_stride(CVy * CVz * Z, CVz * P, Q), CVy * CVz, CVz, _1{}));
     }
 };
 
@@ -919,8 +1188,7 @@ struct igemm_layouts {
 // Section 12: Kernel parameters
 // ============================================================================
 
-template <typename Types>
-struct KernelParams {
+template <typename Types> struct KernelParams {
     using ElemFeat = typename Types::ElemFeat;
     using ElemWt   = typename Types::ElemWt;
     using ElemOut  = typename Types::ElemOut;
@@ -943,8 +1211,7 @@ struct KernelParams {
 // Section 12b: Shared storage
 // ============================================================================
 
-template <geometry_like Geom, tiling_like Tiling, types_like Types>
-struct SharedStorage {
+template <geometry_like Geom, tiling_like Tiling, types_like Types> struct SharedStorage {
     using ElemIdx = typename Types::ElemIdx;
     ElemIdx gather_map[Geom::halo_vol()];
     ElemIdx scatter_map[Geom::leaf_vol()];
@@ -958,7 +1225,7 @@ struct SharedStorage {
 
 template <geometry_like Geom, types_like Types, tiling_like Tiling, conv_variant Variant>
 __global__ void __launch_bounds__(256)
-    leaf_igemm_alt_kernel(KernelParams<Types> params) {
+leaf_igemm_alt_kernel(KernelParams<Types> params) {
     using ElemIdx  = typename Types::ElemIdx;
     using ElemFeat = typename Types::ElemFeat;
     using ElemWt   = typename Types::ElemWt;
@@ -973,8 +1240,8 @@ __global__ void __launch_bounds__(256)
     extern __shared__ char smem_raw[];
     auto &smem = *reinterpret_cast<SharedStorage<Geom, Tiling, Types> *>(smem_raw);
 
-    build_index_maps<Geom, Variant>(iter_grid, gather_grid, leaf_id,
-                                    smem.scatter_map, smem.gather_map);
+    build_index_maps<Geom, Variant>(
+        iter_grid, gather_grid, leaf_id, smem.scatter_map, smem.gather_map);
     __syncthreads();
 
     int const C_in     = params.C_in;
@@ -994,8 +1261,8 @@ __global__ void __launch_bounds__(256)
             dcoord3 const cl_coord = ddecode3(cl_id, to_dcoord3(Tiling::ncl()));
             dcoord3 const cl_orig  = cl_coord * to_dcoord3(Tiling::cl_extent());
 
-            build_cluster_predicates<Geom, Tiling>(smem.gather_map, smem.scatter_map, cl_orig,
-                                                   smem.gather_pred, smem.scatter_pred);
+            build_cluster_predicates<Geom, Tiling>(
+                smem.gather_map, smem.scatter_map, cl_orig, smem.gather_pred, smem.scatter_pred);
             __syncthreads();
 
             constexpr int BLOCKS_PER_CL = prod(Tiling::CL());
@@ -1013,21 +1280,22 @@ __global__ void __launch_bounds__(256)
 
                 for (int ck_tile = 0; ck_tile < contract; ck_tile += Tiling::tile_ck()) {
                     for (int idx = tid; idx < actual_m * BLK_VOL; idx += nthreads) {
-                        int const m = idx / BLK_VOL;
-                        int const n = idx % BLK_VOL;
+                        int const m     = idx / BLK_VOL;
+                        int const n     = idx % BLK_VOL;
                         ElemAcc partial = ElemAcc(0);
                         for (int ck_local = 0;
                              ck_local < Tiling::tile_ck() && (ck_tile + ck_local) < contract;
                              ++ck_local) {
-                            int const ck = ck_tile + ck_local;
-                            auto [voxel_idx, c] =
-                                im2col_map<Geom, Tiling, Variant>::apply(
-                                    ck, n, block_orig, smem.gather_map, Geom::kern_vol());
+                            int const ck        = ck_tile + ck_local;
+                            auto [voxel_idx, c] = im2col_map<Geom, Tiling, Variant>::apply(
+                                ck, n, block_orig, smem.gather_map, Geom::kern_vol());
                             ElemFeat b_val = ElemFeat(0);
                             if (voxel_idx != ElemIdx(0)) {
-                                b_val = params.features[static_cast<int64_t>(voxel_idx - 1) * C_in + c];
+                                b_val =
+                                    params.features[static_cast<int64_t>(voxel_idx - 1) * C_in + c];
                             }
-                            ElemWt const a_val = params.weights[static_cast<int64_t>(m_tile + m) * contract + ck];
+                            ElemWt const a_val =
+                                params.weights[static_cast<int64_t>(m_tile + m) * contract + ck];
                             partial += static_cast<ElemAcc>(a_val) * static_cast<ElemAcc>(b_val);
                         }
                         accum[idx] += partial;
@@ -1039,10 +1307,19 @@ __global__ void __launch_bounds__(256)
                 for (int n = 0; n < BLK_VOL; ++n) {
                     dcoord3 const v       = ddecode3(n, B_shape);
                     dcoord3 const out_pos = block_orig + v;
-                    block_scatter_pred[n] = (smem.scatter_map[dencode3(out_pos, leaf3d)] != ElemIdx(0));
+                    block_scatter_pred[n] =
+                        (smem.scatter_map[dencode3(out_pos, leaf3d)] != ElemIdx(0));
                 }
-                scatter_write<Variant>(accum, actual_m, BLK_VOL, smem.scatter_map, block_orig,
-                                       B_shape, leaf3d, params.output, C_out, m_tile,
+                scatter_write<Variant>(accum,
+                                       actual_m,
+                                       BLK_VOL,
+                                       smem.scatter_map,
+                                       block_orig,
+                                       B_shape,
+                                       leaf3d,
+                                       params.output,
+                                       C_out,
+                                       m_tile,
                                        block_scatter_pred);
                 __syncthreads();
             }
@@ -1058,8 +1335,12 @@ __global__ void __launch_bounds__(256)
 // virtual im2col, and predicated B-loads via CollectiveMma.
 // Requires compile-time Cin, Cout (multiples of 32).
 
-template <geometry_like Geom, types_like Types, tiling_like Tiling,
-          conv_variant Variant, int Cin, int Cout>
+template <geometry_like Geom,
+          types_like Types,
+          tiling_like Tiling,
+          conv_variant Variant,
+          int Cin,
+          int Cout>
 struct igemm_cute_op {
     using ElemIdx = typename Types::ElemIdx;
     using Layouts = igemm_layouts<Geom, Tiling, Cin>;
@@ -1100,14 +1381,12 @@ struct igemm_cute_op {
     using TileSizeN = Int<TileSizeNv>;
     using TileSizeK = Int<TileSizeKv>;
 
-    using ClusterShape = Shape<
-        Int<Geom::leaf() / (Tiling::CL().x * Tiling::B().x)>,
-        Int<Geom::leaf() / (Tiling::CL().y * Tiling::B().y)>,
-        Int<Geom::leaf() / (Tiling::CL().z * Tiling::B().z)>>;
+    using ClusterShape = Shape<Int<Geom::leaf() / (Tiling::CL().x * Tiling::B().x)>,
+                               Int<Geom::leaf() / (Tiling::CL().y * Tiling::B().y)>,
+                               Int<Geom::leaf() / (Tiling::CL().z * Tiling::B().z)>>;
 
     using HaloLayout = decltype(make_layout(
-        Shape<Int<Geom::halo().x>, Int<Geom::halo().y>, Int<Geom::halo().z>>{},
-        GenRowMajor{}));
+        Shape<Int<Geom::halo().x>, Int<Geom::halo().y>, Int<Geom::halo().z>>{}, GenRowMajor{}));
 
     using ClusterHaloLayout = decltype(make_layout(
         Shape<Int<Tiling::cl_halo().x>, Int<Tiling::cl_halo().y>, Int<Tiling::cl_halo().z>>{},
@@ -1117,12 +1396,11 @@ struct igemm_cute_op {
         Shape<Int<Tiling::cl_extent().x>, Int<Tiling::cl_extent().y>, Int<Tiling::cl_extent().z>>{},
         GenRowMajor{}));
 
-    using TiledMma = TiledMMA<
-        MMA_Atom<SM80_16x8x8_F32TF32TF32F32_TN>,
-        Layout<Shape<_2, _2, _1>>,
-        Tile<_32, _32, _8>>;
+    using TiledMma = TiledMMA<MMA_Atom<SM80_16x8x8_F32TF32TF32F32_TN>,
+                              Layout<Shape<_2, _2, _1>>,
+                              Tile<TileSizeM, TileSizeN, _8>>;
 
-    static constexpr int MaxThreadsPerBlock = size(TiledMma{});
+    static constexpr int MaxThreadsPerBlock         = size(TiledMma{});
     static constexpr int MinBlocksPerMultiprocessor = 1;
 
     using GmemTiledCopyFlt = decltype(make_tiled_copy(
@@ -1130,9 +1408,8 @@ struct igemm_cute_op {
         Layout<Shape<_16, _8>, Stride<_8, _1>>{},
         Layout<Shape<_1, _4>>{}));
 
-    using SmemLayoutAtomFlt = decltype(
-        composition(Swizzle<1, 2, 3>{},
-                    Layout<Shape<_8, Shape<_4, _8>>, Stride<_4, Stride<_1, _32>>>{}));
+    using SmemLayoutAtomFlt = decltype(composition(
+        Swizzle<1, 2, 3>{}, Layout<Shape<_8, Shape<_4, _8>>, Stride<_4, Stride<_1, _32>>>{}));
 
     using SmemCopyAtomFlt = Copy_Atom<UniversalCopy<float>, float>;
 
@@ -1141,29 +1418,36 @@ struct igemm_cute_op {
         Layout<Shape<_16, _8>, Stride<_8, _1>>{},
         Layout<Shape<_1, _4>>{}));
 
-    using SmemLayoutAtomAct = decltype(
-        composition(Swizzle<1, 2, 3>{},
-                    Layout<Shape<_8, Shape<_4, _8>>, Stride<_4, Stride<_1, _32>>>{}));
+    using SmemLayoutAtomAct = decltype(composition(
+        Swizzle<1, 2, 3>{}, Layout<Shape<_8, Shape<_4, _8>>, Stride<_4, Stride<_1, _32>>>{}));
 
     using SmemCopyAtomAct = Copy_Atom<UniversalCopy<float>, float>;
 
-    using GmemTiledCopyOut = decltype(make_tiled_copy(
-        Copy_Atom<UniversalCopy<uint32_t>, ElementAct>{},
-        Layout<Shape<_16, _8>, Stride<_1, _16>>{},
-        Layout<Shape<_1, _1>>{}));
+    using GmemTiledCopyOut =
+        decltype(make_tiled_copy(Copy_Atom<UniversalCopy<uint32_t>, ElementAct>{},
+                                 Layout<Shape<_16, _8>, Stride<_1, _16>>{},
+                                 Layout<Shape<_1, _1>>{}));
 
     using SmemCopyAtomOut = Copy_Atom<UniversalCopy<float>, ElementOut>;
 
     using SmemLayoutOut = Layout<Shape<TileSizeM, TileSizeN>>;
 
-    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveMma<
-        MainloopSm80Predicated<PIPE::value>,
-        Shape<TileSizeM, TileSizeN, TileSizeK>,
-        ElementFlt, Underscore,
-        ElementAct, Underscore,
-        TiledMma,
-        GmemTiledCopyFlt, SmemLayoutAtomFlt, SmemCopyAtomFlt, cute::identity,
-        GmemTiledCopyAct, SmemLayoutAtomAct, SmemCopyAtomAct, cute::identity>;
+    using CollectiveMainloop =
+        typename cutlass::gemm::collective::CollectiveMma<MainloopSm80Predicated<PIPE::value>,
+                                                          Shape<TileSizeM, TileSizeN, TileSizeK>,
+                                                          ElementFlt,
+                                                          Underscore,
+                                                          ElementAct,
+                                                          Underscore,
+                                                          TiledMma,
+                                                          GmemTiledCopyFlt,
+                                                          SmemLayoutAtomFlt,
+                                                          SmemCopyAtomFlt,
+                                                          cute::identity,
+                                                          GmemTiledCopyAct,
+                                                          SmemLayoutAtomAct,
+                                                          SmemCopyAtomAct,
+                                                          cute::identity>;
 
     struct KernelSharedStorage {
         union {
@@ -1181,8 +1465,9 @@ struct igemm_cute_op {
         bool sCPredMatrix[Tiling::cl_vol()];
     };
 
+    template <typename FltTensor>
     __device__ void
-    operator()(Tensor<ElementFlt const *, decltype(Layouts::template filterLayout<Cout>())> mFlt,
+    operator()(FltTensor mFlt,
                GridBatchImpl::Accessor const &iter_acc,
                GridBatchImpl::Accessor const &gather_acc,
                int64_t batch_idx,
@@ -1198,15 +1483,15 @@ struct igemm_cute_op {
         for (int v = threadIdx.x; v < Geom::leaf_vol(); v += MaxThreadsPerBlock)
             sCIdx_ptr[v] = iter_grid.leaf_value(leafID, v);
 
-        auto sBIdx_ptr = &reinterpret_cast<KernelSharedStorage *>(smem_buf)->sBIdxMatrix[0];
+        auto sBIdx_ptr       = &reinterpret_cast<KernelSharedStorage *>(smem_buf)->sBIdxMatrix[0];
         dcoord3 const origin = iter_grid.leaf_origin(leafID);
         dcoord3 const off    = to_dcoord3(Geom::offset());
         dcoord3 const filterOrigin = {origin.x + off.x, origin.y + off.y, origin.z + off.z};
 
         for (int v = threadIdx.x; v < Geom::halo_vol(); v += MaxThreadsPerBlock) {
             auto [i, j, k] = idx2crd(v, shape(HaloLayout{}), stride(HaloLayout{}));
-            dcoord3 coord   = {filterOrigin.x + i, filterOrigin.y + j, filterOrigin.z + k};
-            sBIdx_ptr[v]    = gather_grid.coord_to_idx(coord);
+            dcoord3 coord  = {filterOrigin.x + i, filterOrigin.y + j, filterOrigin.z + k};
+            sBIdx_ptr[v]   = gather_grid.coord_to_idx(coord);
         }
 
         __syncthreads();
@@ -1214,15 +1499,14 @@ struct igemm_cute_op {
         // Adjust feature pointer: gather_map stores 1-based NanoVDB values.
         // Offset by -Cin so that gather_map[h] * Cin accesses the correct 0-based row.
         Tensor gAct    = make_tensor(make_gmem_ptr(actData - Cin),
-                                     Layouts::activationComposedGatherLayout(sBIdx_ptr));
-        Tensor sActIdx = make_tensor(make_smem_ptr(sBIdx_ptr),
-                                     Layouts::activationIndexLayout());
+                                  Layouts::activationComposedGatherLayout(sBIdx_ptr));
+        Tensor sActIdx = make_tensor(make_smem_ptr(sBIdx_ptr), Layouts::activationIndexLayout());
 
         // Output uses 1-based scatter indices; offset by -Cout.
-        Tensor gOut    = make_tensor(make_gmem_ptr(outData - Cout),
-                                     Layouts::template outputComposedScatterLayout(sCIdx_ptr));
-        Tensor sOutIdx = make_tensor(make_smem_ptr(sCIdx_ptr),
-                                     Layouts::outputIndexLayout());
+        Tensor gOut = make_tensor(make_gmem_ptr(outData - Cout),
+                                  Layouts::template outputComposedScatterLayout<Cout>(sCIdx_ptr));
+        Tensor sOutIdx =
+            make_tensor(make_smem_ptr(sCIdx_ptr), Layouts::template outputIndexLayout<Cout>());
 
         TiledMma tiled_mma;
         Tensor accum = partition_fragment_C(tiled_mma, TilerOut{});
@@ -1247,46 +1531,57 @@ struct igemm_cute_op {
                 Tensor sCIdx = sCIdx_mn(_, _, m_coord, n_coord);
 
                 // Build gather predicate
-                auto sBPred_ptr = &reinterpret_cast<KernelSharedStorage *>(smem_buf)->sBPredMatrix[0];
-                Tensor sBPred   = make_tensor(make_smem_ptr(sBPred_ptr), shape(sBIdx),
-                                              Layouts::clusterActivationPredicateStride());
+                auto sBPred_ptr =
+                    &reinterpret_cast<KernelSharedStorage *>(smem_buf)->sBPredMatrix[0];
+                Tensor sBPred = make_tensor(make_smem_ptr(sBPred_ptr),
+                                            shape(sBIdx),
+                                            Layouts::clusterActivationPredicateStride());
                 for (int v = threadIdx.x; v < Tiling::cl_halo_vol(); v += MaxThreadsPerBlock) {
                     if (v < Tiling::cl_halo_vol()) {
-                        auto [i, j, k] = idx2crd(v, shape(ClusterHaloLayout{}),
-                                                  stride(ClusterHaloLayout{}));
-                        auto coord     = make_tuple(
-                            make_tuple(make_tuple(0, 0, 0), i, j, k),
-                            make_tuple(0, 0, 0, 0));
+                        auto [i, j, k] =
+                            idx2crd(v, shape(ClusterHaloLayout{}), stride(ClusterHaloLayout{}));
+                        auto coord    = make_tuple(make_tuple(make_tuple(0, 0, 0), i, j, k),
+                                                make_tuple(0, 0, 0, 0));
                         sBPred(coord) = sBIdx(coord);
                     }
                 }
 
                 // Build scatter predicate
-                auto sCPred_ptr = &reinterpret_cast<KernelSharedStorage *>(smem_buf)->sCPredMatrix[0];
-                Tensor sCPred   = make_tensor(make_smem_ptr(sCPred_ptr), shape(sCIdx),
-                                              Layouts::clusterOutputPredicateStride());
+                auto sCPred_ptr =
+                    &reinterpret_cast<KernelSharedStorage *>(smem_buf)->sCPredMatrix[0];
+                Tensor sCPred = make_tensor(make_smem_ptr(sCPred_ptr),
+                                            shape(sCIdx),
+                                            Layouts::clusterOutputPredicateStride());
                 for (int v = threadIdx.x; v < Tiling::cl_vol(); v += MaxThreadsPerBlock) {
                     if (v < Tiling::cl_vol()) {
-                        auto [i, j, k] = idx2crd(v, shape(ClusterVoxelLayout{}),
-                                                  stride(ClusterVoxelLayout{}));
-                        auto coord     = make_tuple(0, make_tuple(make_tuple(0, 0, 0), i, j, k));
+                        auto [i, j, k] =
+                            idx2crd(v, shape(ClusterVoxelLayout{}), stride(ClusterVoxelLayout{}));
+                        auto coord    = make_tuple(0, make_tuple(make_tuple(0, 0, 0), i, j, k));
                         sCPred(coord) = sCIdx(coord);
                     }
                 }
 
                 __syncthreads();
 
-                auto k_tile_iter  = cute::make_coord_iterator(size<2>(gA));
-                int  k_tile_count = size<2>(gA);
+                auto k_tile_iter = cute::make_coord_iterator(size<2>(gA));
+                int k_tile_count = size<2>(gA);
 
                 CollectiveMainloop collective_mma;
-                collective_mma(accum, gA, gB, sBPred, accum,
-                               k_tile_iter, k_tile_count,
-                               Underscore{}, threadIdx.x, smem_buf);
+                collective_mma(accum,
+                               gA,
+                               gB,
+                               sBPred,
+                               accum,
+                               k_tile_iter,
+                               k_tile_count,
+                               Underscore{},
+                               threadIdx.x,
+                               smem_buf);
 
                 // Staged epilogue: accum -> smem -> global (predicated scatter)
                 KernelSharedStorage &storage = *reinterpret_cast<KernelSharedStorage *>(smem_buf);
-                Tensor sC = make_tensor(make_smem_ptr(&storage.epilogue.sCMatrix[0]), SmemLayoutOut{});
+                Tensor sC =
+                    make_tensor(make_smem_ptr(&storage.epilogue.sCMatrix[0]), SmemLayoutOut{});
 
                 auto smem_tiled_copy_C = make_tiled_copy_C(SmemCopyAtomOut{}, tiled_mma);
                 auto smem_thr_copy_C   = smem_tiled_copy_C.get_slice(threadIdx.x);
@@ -1309,19 +1604,28 @@ struct igemm_cute_op {
     }
 };
 
-template <geometry_like Geom, types_like Types, tiling_like Tiling,
-          conv_variant Variant, int Cin, int Cout>
+template <geometry_like Geom,
+          types_like Types,
+          tiling_like Tiling,
+          conv_variant Variant,
+          int Cin,
+          int Cout>
 __global__ void
-__launch_bounds__(igemm_cute_op<Geom, Types, Tiling, Variant, Cin, Cout>::MaxThreadsPerBlock,
-                  igemm_cute_op<Geom, Types, Tiling, Variant, Cin, Cout>::MinBlocksPerMultiprocessor)
-leaf_igemm_alt_cute_kernel(
-    Tensor<cute::tfloat32_t const *,
-           decltype(igemm_layouts<Geom, tiling_default<Geom, Types>, Cin>::template filterLayout<Cout>())> mFlt,
-    KernelParams<Types> params) {
+    __launch_bounds__(igemm_cute_op<Geom, Types, Tiling, Variant, Cin, Cout>::MaxThreadsPerBlock,
+                      igemm_cute_op<Geom, Types, Tiling, Variant, Cin, Cout>::
+                          MinBlocksPerMultiprocessor)
+    leaf_igemm_alt_cute_kernel(cute::tfloat32_t const *filter_ptr, KernelParams<Types> params) {
+    using Layouts = igemm_layouts<Geom, tiling_default<Geom, Types>, Cin>;
+    auto mFlt     = make_tensor(make_gmem_ptr(filter_ptr), Layouts::template filterLayout<Cout>());
     extern __shared__ char smem_buf[];
     igemm_cute_op<Geom, Types, Tiling, Variant, Cin, Cout> op;
-    op(mFlt, params.iter_acc, params.gather_acc, params.iter_batch_idx,
-       params.features, params.output, smem_buf);
+    op(mFlt,
+       params.iter_acc,
+       params.gather_acc,
+       params.iter_batch_idx,
+       params.features,
+       params.output,
+       smem_buf);
 }
 
 // ============================================================================
@@ -1347,6 +1651,37 @@ launch_leaf_igemm_alt(KernelParams<Types> const &params, int num_leaves, cudaStr
         <<<num_leaves, THREADS, SMEM, stream>>>(params);
 }
 
+template <geometry_like Geom,
+          types_like Types,
+          tiling_like Tiling,
+          conv_variant Variant,
+          int Cin,
+          int Cout>
+void
+launch_leaf_igemm_alt_cute(KernelParams<Types> const &params,
+                           typename Types::ElemWt const *permuted_weights,
+                           int num_leaves,
+                           cudaStream_t stream) {
+    if (num_leaves == 0)
+        return;
+
+    using Op = igemm_cute_op<Geom, Types, Tiling, Variant, Cin, Cout>;
+
+    auto const *flt_ptr = reinterpret_cast<cute::tfloat32_t const *>(permuted_weights);
+
+    constexpr int THREADS = Op::MaxThreadsPerBlock;
+    constexpr size_t SMEM = sizeof(typename Op::KernelSharedStorage);
+
+    if constexpr (SMEM > SMEM_BASELINE_BYTES) {
+        cudaFuncSetAttribute(leaf_igemm_alt_cute_kernel<Geom, Types, Tiling, Variant, Cin, Cout>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(SMEM));
+    }
+
+    leaf_igemm_alt_cute_kernel<Geom, Types, Tiling, Variant, Cin, Cout>
+        <<<num_leaves, THREADS, SMEM, stream>>>(flt_ptr, params);
+}
+
 } // namespace leaf_igemm_alt
 } // namespace detail
 } // namespace fvdb
@@ -1365,6 +1700,67 @@ deviceSupportsSm80Alt(torch::Device device) {
     cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device.index());
     return major >= 8;
 }
+
+template <typename Types, leaf_igemm_alt::geometry_like Geom, int Cin, int Cout>
+static void
+launchCuteDispatch(leaf_igemm_alt::KernelParams<Types> const &params,
+                   typename Types::ElemWt const *permuted_weights,
+                   int num_leaves,
+                   cudaStream_t stream) {
+    using namespace leaf_igemm_alt;
+    using Tiling = tiling_default<Geom, Types>;
+    launch_leaf_igemm_alt_cute<Geom, Types, Tiling, conv_variant::forward, Cin, Cout>(
+        params, permuted_weights, num_leaves, stream);
+}
+
+// CuTe kernel dispatch is disabled until the kernel body's local_tile /
+// ComposedLayout interactions are fixed (the kernel was never compiled
+// prior to this work).  Set FVDB_ENABLE_CUTE_IGEMM=1 to opt-in.
+#ifndef FVDB_ENABLE_CUTE_IGEMM
+#define FVDB_ENABLE_CUTE_IGEMM 0
+#endif
+
+#if FVDB_ENABLE_CUTE_IGEMM
+
+template <typename Types, leaf_igemm_alt::geometry_like Geom>
+static bool
+tryLaunchCute(leaf_igemm_alt::KernelParams<Types> const &params,
+              typename Types::ElemWt const *permuted_weights,
+              int64_t C_in,
+              int64_t C_out,
+              int num_leaves,
+              cudaStream_t stream) {
+#define FVDB_CUTE_CHANNEL_CASE(CIN, COUT)                  \
+    if (C_in == (CIN) && C_out == (COUT)) {                \
+        launchCuteDispatch<Types, Geom, (CIN), (COUT)>(    \
+            params, permuted_weights, num_leaves, stream); \
+        return true;                                       \
+    }
+    FVDB_CUTE_CHANNEL_CASE(32, 32)
+    FVDB_CUTE_CHANNEL_CASE(32, 64)
+    FVDB_CUTE_CHANNEL_CASE(64, 32)
+    FVDB_CUTE_CHANNEL_CASE(64, 64)
+    FVDB_CUTE_CHANNEL_CASE(64, 128)
+    FVDB_CUTE_CHANNEL_CASE(128, 64)
+    FVDB_CUTE_CHANNEL_CASE(128, 128)
+#undef FVDB_CUTE_CHANNEL_CASE
+    return false;
+}
+
+#else
+
+template <typename Types, leaf_igemm_alt::geometry_like Geom>
+static bool
+tryLaunchCute(leaf_igemm_alt::KernelParams<Types> const &,
+              typename Types::ElemWt const *,
+              int64_t,
+              int64_t,
+              int,
+              cudaStream_t) {
+    return false;
+}
+
+#endif // FVDB_ENABLE_CUTE_IGEMM
 
 template <typename Types, leaf_igemm_alt::geometry_like Geom>
 static torch::Tensor
@@ -1403,7 +1799,10 @@ leafIGemmAltConvTyped(torch::Tensor features,
         return output.to(output_dtype);
     }
 
-    auto W = weights.reshape({C_out, -1}).contiguous();
+    // Permute weights to Cin-contiguous order [Cout, T, R, S, Cin] for CuTe filterLayout,
+    // or reshape to [Cout, Cin*K_vol] for the scalar kernel.
+    auto W_perm = weights.permute({0, 2, 3, 4, 1}).contiguous();
+    auto W_flat = weights.reshape({C_out, -1}).contiguous();
 
     KernelParams<Types> params{
         iter_acc,
@@ -1411,14 +1810,21 @@ leafIGemmAltConvTyped(torch::Tensor features,
         0,
         0,
         reinterpret_cast<ElemFeat const *>(features.data_ptr()),
-        reinterpret_cast<ElemWt const *>(W.data_ptr()),
+        reinterpret_cast<ElemWt const *>(W_flat.data_ptr()),
         reinterpret_cast<ElemOut *>(output.data_ptr()),
         static_cast<int>(C_in),
         static_cast<int>(C_out),
     };
 
-    launch_leaf_igemm_alt<Geom, Types, Tiling, conv_variant::forward>(
-        params, static_cast<int>(num_leaves), stream);
+    auto const *permuted_weights = reinterpret_cast<ElemWt const *>(W_perm.data_ptr());
+
+    bool launched = tryLaunchCute<Types, Geom>(
+        params, permuted_weights, C_in, C_out, static_cast<int>(num_leaves), stream);
+
+    if (!launched) {
+        launch_leaf_igemm_alt<Geom, Types, Tiling, conv_variant::forward>(
+            params, static_cast<int>(num_leaves), stream);
+    }
 
     return output.to(output_dtype);
 }
@@ -1429,9 +1835,8 @@ leafIGemmAltConv(torch::Tensor features,
                  GridBatchImpl const &input_grid,
                  GridBatchImpl const &output_grid) {
     TORCH_CHECK(features.is_cuda(), "leafIGemmAltConv: features must be on CUDA");
-    TORCH_CHECK(
-        deviceSupportsSm80Alt(features.device()),
-        "leafIGemmAltConv: requires SM80+ (Ampere or newer)");
+    TORCH_CHECK(deviceSupportsSm80Alt(features.device()),
+                "leafIGemmAltConv: requires SM80+ (Ampere or newer)");
 
     TORCH_CHECK(features.dim() == 2, "leafIGemmAltConv: features must be 2D [N, C_in]");
     TORCH_CHECK(features.is_contiguous(), "leafIGemmAltConv: features must be contiguous");
@@ -1448,9 +1853,11 @@ leafIGemmAltConv(torch::Tensor features,
     int64_t const Cin  = features.size(1);
     int64_t const Cout = weights.size(0);
     TORCH_CHECK(Cin > 0 && Cin % 32 == 0,
-                "leafIGemmAltConv: C_in must be a positive multiple of 32, got ", Cin);
+                "leafIGemmAltConv: C_in must be a positive multiple of 32, got ",
+                Cin);
     TORCH_CHECK(Cout > 0 && Cout % 32 == 0,
-                "leafIGemmAltConv: C_out must be a positive multiple of 32, got ", Cout);
+                "leafIGemmAltConv: C_out must be a positive multiple of 32, got ",
+                Cout);
 
     int64_t const k0 = weights.size(2);
     int64_t const k1 = weights.size(3);
@@ -1470,7 +1877,11 @@ leafIGemmAltConv(torch::Tensor features,
         } else {
             TORCH_CHECK(false,
                         "leafIGemmAltConv: unsupported kernel size ",
-                        k0, "x", k1, "x", k2,
+                        k0,
+                        "x",
+                        k1,
+                        "x",
+                        k2,
                         ". Supported: 1x1x1, 3x3x3, 5x5x5.");
         }
     } else {

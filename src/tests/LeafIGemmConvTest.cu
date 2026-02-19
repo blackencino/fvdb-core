@@ -115,9 +115,7 @@ assertNoNanInf(torch::Tensor t, char const *label) {
 
 // Run the reference (gather-scatter default) for a 3x3x3 stride-1 conv.
 static torch::Tensor
-referenceConv(torch::Tensor features,
-              torch::Tensor weights,
-              GridBatchImpl const &grid) {
+referenceConv(torch::Tensor features, torch::Tensor weights, GridBatchImpl const &grid) {
     nanovdb::Coord ks(3, 3, 3);
     nanovdb::Coord stride(1, 1, 1);
     auto topo = ops::gatherScatterDefaultSparseConvTopology(grid, grid, ks, stride);
@@ -145,8 +143,9 @@ leafIGemmParamName(::testing::TestParamInfo<LeafIGemmParam> const &info) {
 // =============================================================================
 
 class LeafIGemmConvTest : public ::testing::TestWithParam<LeafIGemmParam> {
-protected:
-    void SetUp() override {
+  protected:
+    void
+    SetUp() override {
         if (!cudaIsAvailable()) {
             GTEST_SKIP() << "CUDA not available";
         }
@@ -168,12 +167,11 @@ protected:
         double atol = (dtype == torch::kFloat16) ? 0.5 : 1e-1;
         double rtol = (dtype == torch::kFloat16) ? 5e-2 : 1e-1;
 
-        auto diff = (test_f64 - ref_f64).abs();
+        auto diff       = (test_f64 - ref_f64).abs();
         double max_diff = diff.max().item<double>();
 
         EXPECT_TRUE(torch::allclose(test_f64, ref_f64, rtol, atol))
-            << context << ": max diff=" << max_diff
-            << ", mean diff=" << diff.mean().item<double>();
+            << context << ": max diff=" << max_diff << ", mean diff=" << diff.mean().item<double>();
     }
 };
 
@@ -312,8 +310,7 @@ TEST(LeafIGemmConvEdge, SingleVoxel) {
     auto test_f64 = test.cpu().to(torch::kFloat64);
 
     EXPECT_TRUE(torch::allclose(test_f64, ref_f64, 1e-1, 1e-1))
-        << "Single voxel mismatch, max diff="
-        << (test_f64 - ref_f64).abs().max().item<double>();
+        << "Single voxel mismatch, max diff=" << (test_f64 - ref_f64).abs().max().item<double>();
 }
 
 TEST(LeafIGemmConvEdge, SingleLeafPartiallyActive) {
@@ -381,20 +378,19 @@ TEST(LeafIGemmConvEdge, SingleVoxelF16) {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-but-set-variable"
 
-INSTANTIATE_TEST_SUITE_P(
-    LeafIGemm,
-    LeafIGemmConvTest,
-    ::testing::Values(
-        // fp32 configs (alignment: C must be multiple of 4)
-        LeafIGemmParam{torch::kFloat32, 4, 4},
-        LeafIGemmParam{torch::kFloat32, 32, 32},
-        LeafIGemmParam{torch::kFloat32, 32, 64},
-        LeafIGemmParam{torch::kFloat32, 64, 32},
-        // fp16 configs (alignment: C must be multiple of 8)
-        LeafIGemmParam{torch::kFloat16, 8, 8},
-        LeafIGemmParam{torch::kFloat16, 32, 32},
-        LeafIGemmParam{torch::kFloat16, 32, 64},
-        LeafIGemmParam{torch::kFloat16, 128, 128}),
-    leafIGemmParamName);
+INSTANTIATE_TEST_SUITE_P(LeafIGemm,
+                         LeafIGemmConvTest,
+                         ::testing::Values(
+                             // fp32 configs (alignment: C must be multiple of 4)
+                             LeafIGemmParam{torch::kFloat32, 4, 4},
+                             LeafIGemmParam{torch::kFloat32, 32, 32},
+                             LeafIGemmParam{torch::kFloat32, 32, 64},
+                             LeafIGemmParam{torch::kFloat32, 64, 32},
+                             // fp16 configs (alignment: C must be multiple of 8)
+                             LeafIGemmParam{torch::kFloat16, 8, 8},
+                             LeafIGemmParam{torch::kFloat16, 32, 32},
+                             LeafIGemmParam{torch::kFloat16, 32, 64},
+                             LeafIGemmParam{torch::kFloat16, 128, 128}),
+                         leafIGemmParamName);
 
 #pragma GCC diagnostic pop

@@ -30,10 +30,9 @@ namespace ops {
 /// @param weights   Kernel weights, shape [Cout, Cin, k0, k1, k2], fp16.
 /// @param topo      Precomputed topology from gatherScatterDefaultSparseConvTopology.
 /// @return          Output features, shape [output_total_voxels, Cout], fp16.
-torch::Tensor
-cutlassGroupedGemmConv(torch::Tensor features,
-                       torch::Tensor weights,
-                       GatherScatterDefaultTopology const &topo);
+torch::Tensor cutlassGroupedGemmConv(torch::Tensor features,
+                                     torch::Tensor weights,
+                                     GatherScatterDefaultTopology const &topo);
 
 } // namespace ops
 } // namespace detail

@@ -156,6 +156,7 @@ set(FVDB_CU_FILES
     fvdb/detail/ops/VoxelNeighborhood.cu
     fvdb/detail/ops/VoxelsAlongRays.cu
     fvdb/detail/utils/cuda/ForEachCUDA.cu
+    fvdb/detail/ops/convolution/sifakis_ref.cu
 )
 
 # Build library

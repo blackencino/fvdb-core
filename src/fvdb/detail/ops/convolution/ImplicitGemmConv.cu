@@ -13,15 +13,18 @@
 
 #include <fvdb/detail/ops/convolution/ImplicitGemmConv.h>
 
+// NOTE: torch / ATen / c10 headers MUST precede CUTLASS headers.
+// See CutlassGroupedGemm.cu for the full explanation (CCCL version mismatch
+// between local nvcc 13.1 and conda CUDA 12.9 toolkit headers).
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/torch.h>
 
-#include "cutlass/cutlass.h"
-#include "cutlass/gemm/device/gemm_universal.h"
-#include "cutlass/gemm/gemm.h"
-#include "cutlass/epilogue/thread/linear_combination.h"
+#include <cutlass/cutlass.h>
+#include <cutlass/epilogue/thread/linear_combination.h>
+#include <cutlass/gemm/device/gemm_universal.h>
+#include <cutlass/gemm/gemm.h>
 
 #include <cstdint>
 
@@ -44,11 +47,9 @@ deviceSupportsImplicitGemm(torch::Device device) {
 // CUTLASS type definitions -- explicit specializations per element type
 // ============================================================================
 
-template <typename Element>
-struct ImplicitGemmTypes;
+template <typename Element> struct ImplicitGemmTypes;
 
-template <>
-struct ImplicitGemmTypes<cutlass::half_t> {
+template <> struct ImplicitGemmTypes<cutlass::half_t> {
     using ElementA           = cutlass::half_t;
     using ElementB           = cutlass::half_t;
     using ElementC           = float;
@@ -62,16 +63,19 @@ struct ImplicitGemmTypes<cutlass::half_t> {
     static constexpr int AlignmentA = 8;
     static constexpr int AlignmentB = 8;
 
-    using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
-        ElementC,
-        128 / cutlass::sizeof_bits<ElementC>::value,
-        ElementAccumulator,
-        ElementCompute>;
+    using EpilogueOp =
+        cutlass::epilogue::thread::LinearCombination<ElementC,
+                                                     128 / cutlass::sizeof_bits<ElementC>::value,
+                                                     ElementAccumulator,
+                                                     ElementCompute>;
 
     using Gemm = cutlass::gemm::device::GemmUniversal<
-        ElementA, LayoutA,
-        ElementB, LayoutB,
-        ElementC, LayoutC,
+        ElementA,
+        LayoutA,
+        ElementB,
+        LayoutB,
+        ElementC,
+        LayoutC,
         ElementAccumulator,
         cutlass::arch::OpClassTensorOp,
         cutlass::arch::Sm80,
@@ -91,8 +95,7 @@ struct ImplicitGemmTypes<cutlass::half_t> {
         true>;
 };
 
-template <>
-struct ImplicitGemmTypes<float> {
+template <> struct ImplicitGemmTypes<float> {
     using ElementA           = float;
     using ElementB           = float;
     using ElementC           = float;
@@ -106,16 +109,19 @@ struct ImplicitGemmTypes<float> {
     static constexpr int AlignmentA = 4;
     static constexpr int AlignmentB = 4;
 
-    using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
-        ElementC,
-        128 / cutlass::sizeof_bits<ElementC>::value,
-        ElementAccumulator,
-        ElementCompute>;
+    using EpilogueOp =
+        cutlass::epilogue::thread::LinearCombination<ElementC,
+                                                     128 / cutlass::sizeof_bits<ElementC>::value,
+                                                     ElementAccumulator,
+                                                     ElementCompute>;
 
     using Gemm = cutlass::gemm::device::GemmUniversal<
-        ElementA, LayoutA,
-        ElementB, LayoutB,
-        ElementC, LayoutC,
+        ElementA,
+        LayoutA,
+        ElementB,
+        LayoutB,
+        ElementC,
+        LayoutC,
         ElementAccumulator,
         cutlass::arch::OpClassTensorOp,
         cutlass::arch::Sm80,
@@ -161,47 +167,51 @@ runOneOffset(void const *features_ptr,
 
     typename Types::EpilogueOp::Params epilogue_params(alpha, beta);
 
-    typename Gemm::Arguments args(
-        cutlass::gemm::GemmUniversalMode::kGemm,
-        problem_size,
-        1,
-        epilogue_params,
-        reinterpret_cast<ElementA const *>(features_ptr),
-        reinterpret_cast<ElementB const *>(weights_k_ptr),
-        reinterpret_cast<ElementC const *>(output_ptr),
-        reinterpret_cast<ElementC *>(output_ptr),
-        0, 0, 0, 0,
-        K,
-        N,
-        N,
-        N,
-        gather_ptr,
-        nullptr,
-        scatter_ptr);
+    typename Gemm::Arguments args(cutlass::gemm::GemmUniversalMode::kGemm,
+                                  problem_size,
+                                  1,
+                                  epilogue_params,
+                                  reinterpret_cast<ElementA const *>(features_ptr),
+                                  reinterpret_cast<ElementB const *>(weights_k_ptr),
+                                  reinterpret_cast<ElementC const *>(output_ptr),
+                                  reinterpret_cast<ElementC *>(output_ptr),
+                                  0,
+                                  0,
+                                  0,
+                                  0,
+                                  K,
+                                  N,
+                                  N,
+                                  N,
+                                  gather_ptr,
+                                  nullptr,
+                                  scatter_ptr);
 
     Gemm gemm_op;
     cutlass::Status status = gemm_op.can_implement(args);
-    TORCH_CHECK(
-        status == cutlass::Status::kSuccess,
-        "implicitGemmConv: CUTLASS can_implement failed for M_k=", M_k,
-        " N=", N, " K=", K, ": ", cutlass::cutlassGetStatusString(status));
+    TORCH_CHECK(status == cutlass::Status::kSuccess,
+                "implicitGemmConv: CUTLASS can_implement failed for M_k=",
+                M_k,
+                " N=",
+                N,
+                " K=",
+                K,
+                ": ",
+                cutlass::cutlassGetStatusString(status));
 
     size_t workspace_bytes = Gemm::get_workspace_size(args);
-    auto workspace = torch::empty(
-        {std::max(static_cast<int64_t>(workspace_bytes), int64_t{1})},
-        torch::dtype(torch::kByte).device(torch::kCUDA));
+    auto workspace = torch::empty({std::max(static_cast<int64_t>(workspace_bytes), int64_t{1})},
+                                  torch::dtype(torch::kByte).device(torch::kCUDA));
 
     status = gemm_op.initialize(args, workspace.data_ptr(), stream);
-    TORCH_CHECK(
-        status == cutlass::Status::kSuccess,
-        "implicitGemmConv: CUTLASS initialize failed: ",
-        cutlass::cutlassGetStatusString(status));
+    TORCH_CHECK(status == cutlass::Status::kSuccess,
+                "implicitGemmConv: CUTLASS initialize failed: ",
+                cutlass::cutlassGetStatusString(status));
 
     status = gemm_op.run(stream);
-    TORCH_CHECK(
-        status == cutlass::Status::kSuccess,
-        "implicitGemmConv: CUTLASS run failed: ",
-        cutlass::cutlassGetStatusString(status));
+    TORCH_CHECK(status == cutlass::Status::kSuccess,
+                "implicitGemmConv: CUTLASS run failed: ",
+                cutlass::cutlassGetStatusString(status));
 }
 
 // ============================================================================
@@ -251,18 +261,17 @@ implicitGemmConvTyped(torch::Tensor features,
         void const *W_k = reinterpret_cast<void const *>(
             reinterpret_cast<ElementA const *>(W.data_ptr()) + k * Cin * Cout);
 
-        runOneOffset<Types>(
-            features.data_ptr(),
-            W_k,
-            output.data_ptr(),
-            gather_k,
-            scatter_k,
-            static_cast<int>(M_k),
-            static_cast<int>(Cout),
-            static_cast<int>(Cin),
-            1.0f,
-            1.0f,
-            stream);
+        runOneOffset<Types>(features.data_ptr(),
+                            W_k,
+                            output.data_ptr(),
+                            gather_k,
+                            scatter_k,
+                            static_cast<int>(M_k),
+                            static_cast<int>(Cout),
+                            static_cast<int>(Cin),
+                            1.0f,
+                            1.0f,
+                            stream);
     }
 
     return output.to(output_dtype);
@@ -277,62 +286,51 @@ implicitGemmConv(torch::Tensor features,
                  torch::Tensor weights,
                  GatherScatterDefaultTopology const &topo) {
     TORCH_CHECK(features.is_cuda(), "implicitGemmConv: features must be on CUDA");
-    TORCH_CHECK(
-        deviceSupportsImplicitGemm(features.device()),
-        "implicitGemmConv: requires Sm80+ (Ampere or newer), got compute capability < 8.0");
+    TORCH_CHECK(deviceSupportsImplicitGemm(features.device()),
+                "implicitGemmConv: requires Sm80+ (Ampere or newer), got compute capability < 8.0");
 
     TORCH_CHECK(features.dim() == 2, "implicitGemmConv: features must be 2D");
-    TORCH_CHECK(
-        features.size(0) == topo.feature_total_voxels,
-        "implicitGemmConv: features.size(0) mismatch");
+    TORCH_CHECK(features.size(0) == topo.feature_total_voxels,
+                "implicitGemmConv: features.size(0) mismatch");
     TORCH_CHECK(features.is_contiguous(), "implicitGemmConv: features must be contiguous");
 
     TORCH_CHECK(weights.dim() == 5, "implicitGemmConv: weights must be 5D [Cout, Cin, k0, k1, k2]");
-    TORCH_CHECK(
-        features.size(1) == weights.size(1),
-        "implicitGemmConv: Cin mismatch between features and weights");
-    TORCH_CHECK(
-        weights.size(2) == topo.kernel_size[0] && weights.size(3) == topo.kernel_size[1] &&
-            weights.size(4) == topo.kernel_size[2],
-        "implicitGemmConv: weights spatial dims must match topology kernel_size");
-    TORCH_CHECK(
-        features.device() == weights.device(),
-        "implicitGemmConv: features and weights must be on same device");
-    TORCH_CHECK(
-        features.scalar_type() == weights.scalar_type(),
-        "implicitGemmConv: features and weights must have same dtype");
+    TORCH_CHECK(features.size(1) == weights.size(1),
+                "implicitGemmConv: Cin mismatch between features and weights");
+    TORCH_CHECK(weights.size(2) == topo.kernel_size[0] && weights.size(3) == topo.kernel_size[1] &&
+                    weights.size(4) == topo.kernel_size[2],
+                "implicitGemmConv: weights spatial dims must match topology kernel_size");
+    TORCH_CHECK(features.device() == weights.device(),
+                "implicitGemmConv: features and weights must be on same device");
+    TORCH_CHECK(features.scalar_type() == weights.scalar_type(),
+                "implicitGemmConv: features and weights must have same dtype");
 
     int64_t const Cin  = features.size(1);
     int64_t const Cout = weights.size(0);
 
     if (features.scalar_type() == torch::kFloat16) {
-        TORCH_CHECK(
-            Cin > 0 && Cin % 8 == 0,
-            "implicitGemmConv (fp16): Cin must be a positive multiple of 8, got ",
-            Cin);
-        TORCH_CHECK(
-            Cout > 0 && Cout % 8 == 0,
-            "implicitGemmConv (fp16): Cout must be a positive multiple of 8, got ",
-            Cout);
+        TORCH_CHECK(Cin > 0 && Cin % 8 == 0,
+                    "implicitGemmConv (fp16): Cin must be a positive multiple of 8, got ",
+                    Cin);
+        TORCH_CHECK(Cout > 0 && Cout % 8 == 0,
+                    "implicitGemmConv (fp16): Cout must be a positive multiple of 8, got ",
+                    Cout);
         return implicitGemmConvTyped<ImplicitGemmTypes<cutlass::half_t>>(
             features, weights, topo, torch::kFloat16);
     } else if (features.scalar_type() == torch::kFloat32) {
-        TORCH_CHECK(
-            Cin > 0 && Cin % 4 == 0,
-            "implicitGemmConv (fp32): Cin must be a positive multiple of 4, got ",
-            Cin);
-        TORCH_CHECK(
-            Cout > 0 && Cout % 4 == 0,
-            "implicitGemmConv (fp32): Cout must be a positive multiple of 4, got ",
-            Cout);
+        TORCH_CHECK(Cin > 0 && Cin % 4 == 0,
+                    "implicitGemmConv (fp32): Cin must be a positive multiple of 4, got ",
+                    Cin);
+        TORCH_CHECK(Cout > 0 && Cout % 4 == 0,
+                    "implicitGemmConv (fp32): Cout must be a positive multiple of 4, got ",
+                    Cout);
         return implicitGemmConvTyped<ImplicitGemmTypes<float>>(
             features, weights, topo, torch::kFloat32);
     } else {
-        TORCH_CHECK(
-            false,
-            "implicitGemmConv: unsupported dtype ",
-            features.scalar_type(),
-            ". Supported: fp16, fp32.");
+        TORCH_CHECK(false,
+                    "implicitGemmConv: unsupported dtype ",
+                    features.scalar_type(),
+                    ". Supported: fp16, fp32.");
     }
 }
 
