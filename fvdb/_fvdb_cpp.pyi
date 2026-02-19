@@ -61,6 +61,16 @@ def gs_conv(
     weights: torch.Tensor,
     topology: GatherScatterDefaultTopology,
 ) -> torch.Tensor: ...
+def cutlass_grouped_gemm_conv(
+    features: torch.Tensor,
+    weights: torch.Tensor,
+    topology: GatherScatterDefaultTopology,
+) -> torch.Tensor: ...
+def implicit_gemm_conv(
+    features: torch.Tensor,
+    weights: torch.Tensor,
+    topology: GatherScatterDefaultTopology,
+) -> torch.Tensor: ...
 def gs_conv_backward(
     grad_output: torch.Tensor,
     features: torch.Tensor,

@@ -91,7 +91,10 @@ set(FVDB_CU_FILES
     fvdb/detail/ops/BuildPaddedGrid.cu
     fvdb/detail/ops/BuildPrunedGrid.cu
     fvdb/detail/ops/CoarseIjkForFineGrid.cu
+    fvdb/detail/ops/convolution/CutlassGroupedGemm.cu
     fvdb/detail/ops/convolution/GatherScatterDefault.cu
+    fvdb/detail/ops/convolution/ImplicitGemmConv.cu
+    fvdb/detail/ops/convolution/LeafIGemmConv.cu
     fvdb/detail/ops/CoordsInGrid.cu
     fvdb/detail/ops/CubesInGrid.cu
     fvdb/detail/ops/DownsampleGridAvgPool.cu

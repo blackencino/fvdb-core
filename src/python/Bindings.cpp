@@ -9,7 +9,9 @@
 
 #include <fvdb/Config.h>
 #include <fvdb/FVDB.h>
+#include <fvdb/detail/ops/convolution/CutlassGroupedGemm.h>
 #include <fvdb/detail/ops/convolution/GatherScatterDefault.h>
+#include <fvdb/detail/ops/convolution/ImplicitGemmConv.h>
 
 #include <c10/cuda/CUDAFunctions.h>
 #include <torch/extension.h>
@@ -426,6 +428,26 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             return fvdb::detail::ops::gatherScatterDefaultSparseConv(features, weights, topo);
         },
         "Gather-scatter default forward sparse convolution using precomputed topology.",
+        py::arg("features"),
+        py::arg("weights"),
+        py::arg("topology"));
+
+    m.def(
+        "cutlass_grouped_gemm_conv",
+        [](torch::Tensor features, torch::Tensor weights, const GSDTopo &topo) -> torch::Tensor {
+            return fvdb::detail::ops::cutlassGroupedGemmConv(features, weights, topo);
+        },
+        "CUTLASS grouped-GEMM forward sparse convolution (fp16, channels % 32).",
+        py::arg("features"),
+        py::arg("weights"),
+        py::arg("topology"));
+
+    m.def(
+        "implicit_gemm_conv",
+        [](torch::Tensor features, torch::Tensor weights, const GSDTopo &topo) -> torch::Tensor {
+            return fvdb::detail::ops::implicitGemmConv(features, weights, topo);
+        },
+        "CUTLASS 3.x gather-GEMM-scatter forward sparse convolution (Sm90+, fp16/fp32).",
         py::arg("features"),
         py::arg("weights"),
         py::arg("topology"));
