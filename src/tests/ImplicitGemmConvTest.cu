@@ -1,11 +1,10 @@
 // Copyright Contributors to the OpenVDB Project
 // SPDX-License-Identifier: Apache-2.0
 //
-// ImplicitGemmConvTest.cu -- Tests for the CUTLASS 2.x implicit GEMM convolution.
+// ImplicitGemmConvTest.cu -- Tests for the leaf-fused implicit GEMM convolution.
 //
 // Compares implicitGemmConv output against gatherScatterDefaultSparseConv
-// (the validated reference) to verify correctness of the fused
-// gather-GEMM-scatter kernel.
+// (the validated reference) to verify correctness of the leaf-fused kernel.
 //
 // Requires Sm80+ (Ampere or newer). Tests are skipped on older hardware.
 //
@@ -164,7 +163,7 @@ TEST_P(ImplicitGemmConvTest, DenseGridMatchesReference) {
     auto weights  = torch::randn({C, C, K, K, K}, topts(device, dtype));
 
     auto ref  = ops::gatherScatterDefaultSparseConv(features, weights, topo);
-    auto test = ops::implicitGemmConv(features, weights, topo);
+    auto test = ops::implicitGemmConv(features, weights, *grid, *grid, ks, stride);
 
     assertNoNanInf(test, "ImplicitGemm dense output");
 
@@ -200,7 +199,7 @@ TEST_P(ImplicitGemmConvTest, SparseGridMatchesReference) {
     auto weights  = torch::randn({C, C, K, K, K}, topts(device, dtype));
 
     auto ref  = ops::gatherScatterDefaultSparseConv(features, weights, topo);
-    auto test = ops::implicitGemmConv(features, weights, topo);
+    auto test = ops::implicitGemmConv(features, weights, *grid, *grid, ks, stride);
 
     assertNoNanInf(test, "ImplicitGemm sparse output");
 
@@ -239,7 +238,7 @@ TEST_P(ImplicitGemmConvTest, AsymmetricChannels) {
     auto weights  = torch::randn({C_out, C_in, K, K, K}, topts(device, dtype));
 
     auto ref  = ops::gatherScatterDefaultSparseConv(features, weights, topo);
-    auto test = ops::implicitGemmConv(features, weights, topo);
+    auto test = ops::implicitGemmConv(features, weights, *grid, *grid, ks, stride);
 
     EXPECT_EQ(test.size(0), N);
     EXPECT_EQ(test.size(1), C_out);
@@ -273,12 +272,11 @@ TEST(ImplicitGemmConvEdge, EmptyGrid) {
 
     nanovdb::Coord ks(3, 3, 3);
     nanovdb::Coord stride(1, 1, 1);
-    auto topo = ops::gatherScatterDefaultSparseConvTopology(*grid, *grid, ks, stride);
 
     auto features = torch::empty({0, 32}, topts(device, torch::kFloat16));
     auto weights  = torch::randn({32, 32, 3, 3, 3}, topts(device, torch::kFloat16));
 
-    auto out = ops::implicitGemmConv(features, weights, topo);
+    auto out = ops::implicitGemmConv(features, weights, *grid, *grid, ks, stride);
     EXPECT_EQ(out.size(0), 0);
     EXPECT_EQ(out.size(1), 32);
 }
@@ -305,7 +303,7 @@ TEST(ImplicitGemmConvEdge, SingleVoxel) {
     auto weights  = torch::randn({32, 32, 3, 3, 3}, topts(device, torch::kFloat16));
 
     auto ref  = ops::gatherScatterDefaultSparseConv(features, weights, topo);
-    auto test = ops::implicitGemmConv(features, weights, topo);
+    auto test = ops::implicitGemmConv(features, weights, *grid, *grid, ks, stride);
 
     auto ref_f64  = ref.cpu().to(torch::kFloat64);
     auto test_f64 = test.cpu().to(torch::kFloat64);
@@ -324,11 +322,11 @@ TEST(ImplicitGemmConvEdge, SingleVoxel) {
 INSTANTIATE_TEST_SUITE_P(ImplicitGemm,
                          ImplicitGemmConvTest,
                          ::testing::Values(
-                             // fp16 configs (alignment: C must be multiple of 8)
+                             // fp16 configs (channels must be multiples of 32)
                              ImplicitGemmParam{torch::kFloat16, 32, 3},
                              ImplicitGemmParam{torch::kFloat16, 64, 3},
                              ImplicitGemmParam{torch::kFloat16, 32, 5},
-                             // fp32 configs (alignment: C must be multiple of 4)
+                             // fp32 configs
                              ImplicitGemmParam{torch::kFloat32, 32, 3},
                              ImplicitGemmParam{torch::kFloat32, 64, 3}),
                          igParamName);

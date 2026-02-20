@@ -444,13 +444,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     m.def(
         "implicit_gemm_conv",
-        [](torch::Tensor features, torch::Tensor weights, const GSDTopo &topo) -> torch::Tensor {
-            return fvdb::detail::ops::implicitGemmConv(features, weights, topo);
+        [](torch::Tensor features,
+           torch::Tensor weights,
+           const fvdb::GridBatch &feature_grid,
+           const fvdb::GridBatch &output_grid,
+           fvdb::Vec3iOrScalar kernelSize,
+           fvdb::Vec3iOrScalar stride) -> torch::Tensor {
+            return fvdb::GridBatch::implicitGemmConvolution(
+                features, weights, feature_grid, output_grid, kernelSize, stride);
         },
-        "CUTLASS 3.x gather-GEMM-scatter forward sparse convolution (Sm90+, fp16/fp32).",
+        "Leaf-fused sparse convolution (Sm80+, fp16/fp32, stride=1 only).",
         py::arg("features"),
         py::arg("weights"),
-        py::arg("topology"));
+        py::arg("feature_grid"),
+        py::arg("output_grid"),
+        py::arg("kernel_size"),
+        py::arg("stride"));
 
     m.def(
         "gs_conv_backward",

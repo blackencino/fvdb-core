@@ -1220,4 +1220,16 @@ GridBatch::buildGatherScatterDefaultTransposeTopology(const GridBatch &feature_g
         *feature_grid.mImpl, *output_grid.mImpl, kernelSize.value(), stride.value());
 }
 
+torch::Tensor
+GridBatch::implicitGemmConvolution(torch::Tensor features,
+                                   torch::Tensor weights,
+                                   const GridBatch &feature_grid,
+                                   const GridBatch &output_grid,
+                                   const Vec3iOrScalar &kernelSize,
+                                   const Vec3iOrScalar &stride) {
+    return detail::ops::implicitGemmConv(
+        features, weights, *feature_grid.mImpl, *output_grid.mImpl, kernelSize.value(),
+        stride.value());
+}
+
 } // namespace fvdb

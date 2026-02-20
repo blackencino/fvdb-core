@@ -8,6 +8,7 @@
 #include <fvdb/Types.h>
 #include <fvdb/detail/GridBatchImpl.h>
 #include <fvdb/detail/ops/convolution/GatherScatterDefault.h>
+#include <fvdb/detail/ops/convolution/ImplicitGemmConv.h>
 #include <fvdb/detail/utils/Utils.h>
 
 #include <nanovdb/NanoVDB.h>
@@ -834,6 +835,14 @@ struct GridBatch : torch::CustomClassHolder {
                                                const GridBatch &output_grid,
                                                const Vec3iOrScalar &kernelSize,
                                                const Vec3iOrScalar &stride);
+
+    /// Leaf-fused implicit GEMM sparse convolution (forward only).
+    static torch::Tensor implicitGemmConvolution(torch::Tensor features,
+                                                 torch::Tensor weights,
+                                                 const GridBatch &feature_grid,
+                                                 const GridBatch &output_grid,
+                                                 const Vec3iOrScalar &kernelSize,
+                                                 const Vec3iOrScalar &stride);
 
     /// @brief Perform one integration step of the TSDF fusion algorithm on a batch of sparse grids.
     ///        The TSDF fusion algorithm integrates depth and feature images (e.g. colors)

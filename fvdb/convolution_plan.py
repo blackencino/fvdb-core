@@ -77,14 +77,14 @@ class _CutlassGroupedGemmConvFn(torch.autograd.Function):
 
 
 class _ImplicitGemmConvFn(torch.autograd.Function):
-    """Autograd wrapper for CUTLASS 3.x gather-GEMM-scatter convolution (forward only)."""
+    """Autograd wrapper for leaf-fused implicit GEMM convolution (forward only)."""
 
     @staticmethod
-    def forward(ctx, features: torch.Tensor, weights: torch.Tensor, topo: _fvdb_cpp.GatherScatterDefaultTopology) -> torch.Tensor:  # type: ignore[override]
-        return _fvdb_cpp.implicit_gemm_conv(features, weights, topo)
+    def forward(ctx, features: torch.Tensor, weights: torch.Tensor, feature_grid, output_grid, kernel_size, stride) -> torch.Tensor:  # type: ignore[override]
+        return _fvdb_cpp.implicit_gemm_conv(features, weights, feature_grid, output_grid, kernel_size, stride)
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, None]:  # type: ignore[override]
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, None, None, None, None]:  # type: ignore[override]
         raise NotImplementedError("Implicit GEMM backward not yet implemented")
 
 
@@ -123,9 +123,12 @@ class _CutlassGroupedGemmBackend:
 
 @dataclass(frozen=True)
 class _ImplicitGemmBackend:
-    """CUTLASS 2.x fused gather-GEMM-scatter. Sm80+, fp16/fp32, zero intermediate buffer, forward only."""
+    """Leaf-fused implicit GEMM. Sm80+, fp16/fp32, stride=1, forward only. No topology pre-pass."""
 
-    topology: _fvdb_cpp.GatherScatterDefaultTopology
+    source_grid: Any
+    target_grid: Any
+    kernel_size: tuple[int, int, int]
+    stride: tuple[int, int, int]
 
 
 _Backend = _MatmulBackend | _DenseBackend | _GatherScatterBackend | _CutlassGroupedGemmBackend | _ImplicitGemmBackend
@@ -650,9 +653,16 @@ class ConvolutionPlan:
                 raise ValueError("CUTLASS grouped GEMM convolution returned non-tensor")
             result = self._target_grid.jagged_like(out_tensor)
 
-        # Implicit GEMM: CUTLASS 3.x fused gather-GEMM-scatter, zero intermediate buffer
+        # Implicit GEMM: leaf-fused, single kernel launch, no topology pre-pass
         elif isinstance(backend, _ImplicitGemmBackend):
-            out_tensor = _ImplicitGemmConvFn.apply(data.jdata, weights, backend.topology)
+            out_tensor = _ImplicitGemmConvFn.apply(
+                data.jdata,
+                weights,
+                backend.source_grid,
+                backend.target_grid,
+                backend.kernel_size,
+                backend.stride,
+            )
             if out_tensor is None:
                 raise ValueError("Implicit GEMM convolution returned None")
             if not isinstance(out_tensor, torch.Tensor):
@@ -789,15 +799,18 @@ class ConvolutionPlan:
                 topo = _fvdb_cpp.gs_build_topology(source_grid._impl, target_grid._impl, kernel_size, stride)
             return _CutlassGroupedGemmBackend(topology=topo)
 
-        # Implicit GEMM — CUTLASS 2.x fused gather-GEMM-scatter (Sm80+, zero intermediate buffer)
+        # Implicit GEMM — leaf-fused, single kernel launch, no topology pre-pass
         if backend_name == "implicit_gemm":
             if source_grid._impl.device.type != "cuda":
                 raise ValueError("Implicit GEMM backend requires CUDA.")
             if transposed:
-                topo = _fvdb_cpp.gs_build_transpose_topology(source_grid._impl, target_grid._impl, kernel_size, stride)
-            else:
-                topo = _fvdb_cpp.gs_build_topology(source_grid._impl, target_grid._impl, kernel_size, stride)
-            return _ImplicitGemmBackend(topology=topo)
+                raise ValueError("Implicit GEMM backend does not support transposed convolution.")
+            return _ImplicitGemmBackend(
+                source_grid=source_grid._impl,
+                target_grid=target_grid._impl,
+                kernel_size=kernel_size,
+                stride=stride,
+            )
 
         raise ValueError(f"Unknown backend: {backend_name!r}")
 
