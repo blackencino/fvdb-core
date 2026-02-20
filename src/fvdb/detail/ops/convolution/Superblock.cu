@@ -94,91 +94,108 @@ template <typename Scalar> struct SbMmaConfig;
 template <> struct SbMmaConfig<float> {
     using MmaElement = cute::tfloat32_t;
     using MmaAtom    = cute::SM80_16x8x8_F32TF32TF32F32_TN;
-    static constexpr int TILE_K = 8;
+    static constexpr int MMA_K = 8;
 };
 
 template <> struct SbMmaConfig<c10::Half> {
     using MmaElement = cute::half_t;
     using MmaAtom    = cute::SM80_16x8x16_F32F16F16F32_TN;
-    static constexpr int TILE_K = 16;
+    static constexpr int MMA_K = 16;
 };
+
+// ============================================================================
+// Tile and pipeline constants
+// ============================================================================
+
+static constexpr int SB_TILE_M = 32;
+static constexpr int SB_TILE_N = 32;
+static constexpr int SB_TILE_K = 32;
+static constexpr int SB_STAGES = 3;
 
 // ============================================================================
 // Shared memory layout
 // ============================================================================
 
-static constexpr int SB_TILE_M = 32;
-static constexpr int SB_TILE_N = 32;
-
 template <typename Geom, int N_LEAVES> struct SuperblockSmem {
     int32_t halo_maps[N_LEAVES][Geom::HaloVol];
     CompactEntry compact_list[N_LEAVES * Geom::LeafVol];
     int compact_count;
-    // A+B tile buffers and C epilogue tile share this space (used at different
-    // times within the GEMM loop body vs epilogue).
-    static constexpr int MMA_BUF_BYTES = SB_TILE_M * SB_TILE_N * sizeof(float);
+    // 3-stage pipeline buffers (A+B) unioned with epilogue C buffer.
+    // Sized for the largest MmaElement (tfloat32_t = 4 bytes).
+    static constexpr int MAINLOOP_BYTES =
+        (SB_TILE_M + SB_TILE_N) * SB_TILE_K * SB_STAGES * 4;
+    static constexpr int EPILOGUE_BYTES = SB_TILE_M * SB_TILE_N * sizeof(float);
+    static constexpr int MMA_BUF_BYTES =
+        MAINLOOP_BYTES > EPILOGUE_BYTES ? MAINLOOP_BYTES : EPILOGUE_BYTES;
     alignas(16) char mma_buf[MMA_BUF_BYTES];
 };
 
 // ============================================================================
-// Phase B helpers: tile loading
+// cp.async helpers
 // ============================================================================
 
-// Load weight tile A[TILE_M, TILE_K] into smem.
-// Weights are stored as [K_total, C_fast] row-major (stride-1 along C_fast).
+__device__ __forceinline__ void
+sb_cp_async_zfill_4(void *smem_dst, const void *gmem_src, bool pred) {
+    uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n"
+                 :
+                 : "r"(smem_addr), "l"(gmem_src), "r"(pred ? 4 : 0)
+                 : "memory");
+}
+
+// ============================================================================
+// Phase B helpers: async tile loading
+// ============================================================================
+
+// Load weight tile A[TILE_M, TILE_K] into a pipeline stage via cp.async.
+// Weights: [K_total, C_fast] row-major (stride-1 along C_fast = M dim).
 template <typename MmaElement>
 __device__ void
-load_weight_tile(MmaElement const *__restrict__ weights,
-                 MmaElement *tile_A,
-                 int C_fast,
-                 int m0,
-                 int k0,
-                 int K_total,
-                 int tid,
-                 int nthreads) {
-    int tile_k = (sizeof(MmaElement) == 2) ? SbMmaConfig<c10::Half>::TILE_K
-                                           : SbMmaConfig<float>::TILE_K;
-    int elems  = SB_TILE_M * tile_k;
+load_a_tile_async(MmaElement const *__restrict__ weights,
+                  MmaElement *stage_A,
+                  int C_fast,
+                  int m0,
+                  int k0,
+                  int K_total,
+                  int tid,
+                  int nthreads) {
+    constexpr int elems = SB_TILE_M * SB_TILE_K;
     for (int i = tid; i < elems; i += nthreads) {
         int m_local = i % SB_TILE_M;
         int k_local = i / SB_TILE_M;
         int m       = m0 + m_local;
         int k       = k0 + k_local;
-        if (m < C_fast && k < K_total) {
-            tile_A[i] = weights[static_cast<int64_t>(k) * C_fast + m];
-        } else {
-            tile_A[i] = MmaElement{};
-        }
+        bool valid  = (m < C_fast && k < K_total);
+        auto const *src = valid ? &weights[static_cast<int64_t>(k) * C_fast + m]
+                                : reinterpret_cast<MmaElement const *>(0);
+        sb_cp_async_zfill_4(&stage_A[i], src, valid);
     }
 }
 
-// Load B tile for forward / input-grad / transposed-fwd.
+// Load B tile for forward / input-grad / transposed-fwd via cp.async.
 // Double indirection: compact_list -> halo_map -> feature address.
 template <typename Geom, bool FlipKernel, typename MmaElement>
 __device__ void
-load_b_tile(int32_t const *__restrict__ halo_maps,
-            CompactEntry const *__restrict__ compact_list,
-            MmaElement const *__restrict__ data,
-            int C_channel,
-            int voxel_start,
-            int kernel_start,
-            int N_active,
-            int K_total,
-            MmaElement *tile_B,
-            int tid,
-            int nthreads) {
-    int tile_k = (sizeof(MmaElement) == 2) ? SbMmaConfig<c10::Half>::TILE_K
-                                           : SbMmaConfig<float>::TILE_K;
-    int elems  = SB_TILE_N * tile_k;
+load_b_tile_async(int32_t const *__restrict__ halo_maps,
+                  CompactEntry const *__restrict__ compact_list,
+                  MmaElement const *__restrict__ data,
+                  int C_channel,
+                  int voxel_start,
+                  int k0,
+                  int N_active,
+                  int K_total,
+                  MmaElement *stage_B,
+                  int tid,
+                  int nthreads) {
+    constexpr int elems = SB_TILE_N * SB_TILE_K;
     for (int i = tid; i < elems; i += nthreads) {
         int n_local = i % SB_TILE_N;
         int k_local = i / SB_TILE_N;
-
-        int n = voxel_start + n_local;
-        int k = kernel_start + k_local;
+        int n       = voxel_start + n_local;
+        int k       = k0 + k_local;
 
         if (n >= N_active || k >= K_total) {
-            tile_B[i] = MmaElement{};
+            sb_cp_async_zfill_4(&stage_B[i], nullptr, false);
             continue;
         }
 
@@ -199,34 +216,60 @@ load_b_tile(int32_t const *__restrict__ halo_maps,
             dk = Geom::S - 1 - dk;
         }
 
-        int halo_idx = (vi + di) * Geom::Hy * Geom::Hz + (vj + dj) * Geom::Hz + (vk + dk);
+        int halo_idx = (vi + di) * Geom::Hy * Geom::Hz
+                     + (vj + dj) * Geom::Hz + (vk + dk);
         int32_t src  = halo_maps[entry.leaf_in_block * Geom::HaloVol + halo_idx];
-
-        tile_B[i] = (src >= 0) ? data[static_cast<int64_t>(src) * C_channel + c] : MmaElement{};
+        bool active  = (src >= 0);
+        auto const *ptr = active
+            ? &data[static_cast<int64_t>(src) * C_channel + c]
+            : reinterpret_cast<MmaElement const *>(0);
+        sb_cp_async_zfill_4(&stage_B[i], ptr, active);
     }
 }
 
-// Load B tile for weight gradient.
-// The GEMM is C[C_out, K_total] = A[C_out, N_active] x B_features^T
-// A tile rows = C_out (M dimension), A tile cols = N_active slice (K dimension)
-// B tile rows = K_total (N dimension), B tile cols = N_active slice (K dimension)
+// Load A tile for weight gradient via cp.async.
+// grad_output gathered by scatter_idx. A[TILE_M, TILE_K]: M=C_out, K=N_active.
+template <typename MmaElement>
+__device__ void
+load_a_tile_wgrad_async(MmaElement const *__restrict__ grad_output,
+                        CompactEntry const *__restrict__ compact_list,
+                        MmaElement *stage_A,
+                        int C_out,
+                        int m0,
+                        int k0,
+                        int N_active,
+                        int tid,
+                        int nthreads) {
+    constexpr int elems = SB_TILE_M * SB_TILE_K;
+    for (int i = tid; i < elems; i += nthreads) {
+        int m_local = i % SB_TILE_M;
+        int k_local = i / SB_TILE_M;
+        int m       = m0 + m_local;
+        int k       = k0 + k_local;
+        bool valid  = (m < C_out && k < N_active);
+        auto const *src = valid
+            ? &grad_output[static_cast<int64_t>(compact_list[k].scatter_idx) * C_out + m]
+            : reinterpret_cast<MmaElement const *>(0);
+        sb_cp_async_zfill_4(&stage_A[i], src, valid);
+    }
+}
+
+// Load B tile for weight gradient via cp.async.
 // sB[n_local, k_local]: n indexes K_total (free), k indexes N_active (reduction).
 template <typename Geom, typename MmaElement>
 __device__ void
-load_b_tile_wgrad(int32_t const *__restrict__ halo_maps,
-                  CompactEntry const *__restrict__ compact_list,
-                  MmaElement const *__restrict__ data,
-                  int C_channel,
-                  int ktotal_start,
-                  int voxel_start,
-                  int N_active,
-                  int K_total,
-                  MmaElement *tile_B,
-                  int tid,
-                  int nthreads) {
-    int tile_k = (sizeof(MmaElement) == 2) ? SbMmaConfig<c10::Half>::TILE_K
-                                           : SbMmaConfig<float>::TILE_K;
-    int elems  = SB_TILE_N * tile_k;
+load_b_tile_wgrad_async(int32_t const *__restrict__ halo_maps,
+                        CompactEntry const *__restrict__ compact_list,
+                        MmaElement const *__restrict__ data,
+                        int C_channel,
+                        int ktotal_start,
+                        int voxel_start,
+                        int N_active,
+                        int K_total,
+                        MmaElement *stage_B,
+                        int tid,
+                        int nthreads) {
+    constexpr int elems = SB_TILE_N * SB_TILE_K;
     for (int i = tid; i < elems; i += nthreads) {
         int n_local = i % SB_TILE_N;
         int k_local = i / SB_TILE_N;
@@ -235,7 +278,7 @@ load_b_tile_wgrad(int32_t const *__restrict__ halo_maps,
         int voxel_idx  = voxel_start + k_local;
 
         if (ktotal_pos >= K_total || voxel_idx >= N_active) {
-            tile_B[i] = MmaElement{};
+            sb_cp_async_zfill_4(&stage_B[i], nullptr, false);
             continue;
         }
 
@@ -250,43 +293,14 @@ load_b_tile_wgrad(int32_t const *__restrict__ halo_maps,
         int dj       = (kern_pos / Geom::S) % Geom::R;
         int dk       = kern_pos % Geom::S;
 
-        int halo_idx = (vi + di) * Geom::Hy * Geom::Hz + (vj + dj) * Geom::Hz + (vk + dk);
+        int halo_idx = (vi + di) * Geom::Hy * Geom::Hz
+                     + (vj + dj) * Geom::Hz + (vk + dk);
         int32_t src  = halo_maps[entry.leaf_in_block * Geom::HaloVol + halo_idx];
-
-        tile_B[i] = (src >= 0) ? data[static_cast<int64_t>(src) * C_channel + c] : MmaElement{};
-    }
-}
-
-// Load A tile for weight gradient: grad_output gathered by scatter_idx.
-// A[TILE_M, TILE_K]: M = C_out, K = N_active (reduction).
-template <typename MmaElement>
-__device__ void
-load_a_tile_wgrad(MmaElement const *__restrict__ grad_output,
-                  CompactEntry const *__restrict__ compact_list,
-                  MmaElement *tile_A,
-                  int C_out,
-                  int m0,
-                  int k0,
-                  int N_active,
-                  int tid,
-                  int nthreads) {
-    int tile_k = (sizeof(MmaElement) == 2) ? SbMmaConfig<c10::Half>::TILE_K
-                                           : SbMmaConfig<float>::TILE_K;
-    int elems  = SB_TILE_M * tile_k;
-    for (int i = tid; i < elems; i += nthreads) {
-        int m_local = i % SB_TILE_M;
-        int k_local = i / SB_TILE_M;
-
-        int m = m0 + m_local;
-        int k = k0 + k_local;
-
-        if (m >= C_out || k >= N_active) {
-            tile_A[i] = MmaElement{};
-            continue;
-        }
-
-        int32_t idx = compact_list[k].scatter_idx;
-        tile_A[i]   = grad_output[static_cast<int64_t>(idx) * C_out + m];
+        bool active  = (src >= 0);
+        auto const *ptr = active
+            ? &data[static_cast<int64_t>(src) * C_channel + c]
+            : reinterpret_cast<MmaElement const *>(0);
+        sb_cp_async_zfill_4(&stage_B[i], ptr, active);
     }
 }
 
@@ -311,13 +325,15 @@ superblock_conv_kernel(GridBatchImpl::Accessor primary_acc,
 
     constexpr int TILE_M = SB_TILE_M;
     constexpr int TILE_N = SB_TILE_N;
-    constexpr int TILE_K = Cfg::TILE_K;
+    constexpr int TILE_K = SB_TILE_K;
+    constexpr int MMA_K  = Cfg::MMA_K;
+    constexpr int STAGES = SB_STAGES;
 
     constexpr bool Flip = (Op == ConvOp::InputGrad || Op == ConvOp::TransposedFwd);
 
     using TiledMma =
         TiledMMA<MMA_Atom<typename Cfg::MmaAtom>, Layout<Shape<_2, _2, _1>>,
-                 Tile<Int<TILE_M>, Int<TILE_N>, Int<TILE_K>>>;
+                 Tile<Int<TILE_M>, Int<TILE_N>, Int<MMA_K>>>;
 
     extern __shared__ char smem_raw[];
     auto &smem = *reinterpret_cast<SuperblockSmem<Geom, N_LEAVES> *>(smem_raw);
@@ -385,33 +401,62 @@ superblock_conv_kernel(GridBatchImpl::Accessor primary_acc,
     if (N_active == 0) return;
 
     // ================================================================
-    // Phase B: Compacted dense GEMM
+    // Phase B: Pipelined compacted dense GEMM
     // ================================================================
 
     int const K_total = C_slow * Geom::KernVol;
 
-    auto const *data_B_mma   = reinterpret_cast<MmaElement const *>(data_B);
-    auto const *weights_mma  = reinterpret_cast<MmaElement const *>(weights);
-    auto const *extra_mma    = reinterpret_cast<MmaElement const *>(data_A_extra);
+    auto const *data_B_mma  = reinterpret_cast<MmaElement const *>(data_B);
+    auto const *weights_mma = reinterpret_cast<MmaElement const *>(weights);
+    auto const *extra_mma   = reinterpret_cast<MmaElement const *>(data_A_extra);
 
-    auto *tile_A_ptr = reinterpret_cast<MmaElement *>(smem.mma_buf);
-    auto *tile_B_ptr = reinterpret_cast<MmaElement *>(
-        smem.mma_buf + TILE_M * TILE_K * sizeof(MmaElement));
+    constexpr int STAGE_A_ELEMS = TILE_M * TILE_K;
+    constexpr int STAGE_B_ELEMS = TILE_N * TILE_K;
+    auto *smem_A_base = reinterpret_cast<MmaElement *>(smem.mma_buf);
+    auto *smem_B_base = smem_A_base + STAGE_A_ELEMS * STAGES;
 
-    auto sA = make_tensor(make_smem_ptr(tile_A_ptr),
-                          make_layout(make_shape(Int<TILE_M>{}, Int<TILE_K>{}),
-                                      make_stride(Int<1>{}, Int<TILE_M>{})));
-    auto sB = make_tensor(make_smem_ptr(tile_B_ptr),
-                          make_layout(make_shape(Int<TILE_N>{}, Int<TILE_K>{}),
-                                      make_stride(Int<1>{}, Int<TILE_N>{})));
+    auto get_A_stage = [&](int s) -> MmaElement * {
+        return smem_A_base + s * STAGE_A_ELEMS;
+    };
+    auto get_B_stage = [&](int s) -> MmaElement * {
+        return smem_B_base + s * STAGE_B_ELEMS;
+    };
+
+    auto make_sA = [](MmaElement *ptr) {
+        return make_tensor(
+            make_smem_ptr(ptr),
+            make_layout(make_shape(Int<TILE_M>{}, Int<TILE_K>{}),
+                        make_stride(Int<1>{}, Int<TILE_M>{})));
+    };
+    auto make_sB = [](MmaElement *ptr) {
+        return make_tensor(
+            make_smem_ptr(ptr),
+            make_layout(make_shape(Int<TILE_N>{}, Int<TILE_K>{}),
+                        make_stride(Int<1>{}, Int<TILE_N>{})));
+    };
 
     TiledMma tiled_mma;
     auto thr_mma = tiled_mma.get_thread_slice(tid);
 
-    auto tCsA = thr_mma.partition_A(sA);
-    auto tCsB = thr_mma.partition_B(sB);
-    auto tCrA = thr_mma.partition_fragment_A(sA);
-    auto tCrB = thr_mma.partition_fragment_B(sB);
+    // Register fragments for one full smem stage (TILE_K elements in K).
+    // K_BLOCK_MAX = TILE_K / MMA_K sub-steps per stage.
+    auto tCrA = thr_mma.partition_fragment_A(make_sA(get_A_stage(0)));
+    auto tCrB = thr_mma.partition_fragment_B(make_sB(get_B_stage(0)));
+    constexpr int K_BLOCK_MAX = TILE_K / MMA_K;
+
+    // Helper: copy one K sub-block from smem stage into register fragment.
+    auto copy_smem_to_reg_kb = [&](int stage, int kb) {
+        auto tCsA_s = thr_mma.partition_A(make_sA(get_A_stage(stage)));
+        auto tCsB_s = thr_mma.partition_B(make_sB(get_B_stage(stage)));
+#pragma unroll
+        for (int j = 0; j < size(tCrA(_, _, 0)); ++j) {
+            tCrA(_, _, kb)(j) = tCsA_s(_, _, kb)(j);
+        }
+#pragma unroll
+        for (int j = 0; j < size(tCrB(_, _, 0)); ++j) {
+            tCrB(_, _, kb)(j) = tCsB_s(_, _, kb)(j);
+        }
+    };
 
     if constexpr (Op == ConvOp::Forward || Op == ConvOp::InputGrad ||
                   Op == ConvOp::TransposedFwd) {
@@ -422,39 +467,98 @@ superblock_conv_kernel(GridBatchImpl::Accessor primary_acc,
                     tiled_mma, make_shape(Int<TILE_M>{}, Int<TILE_N>{}));
                 clear(accum);
 
-                for (int k0 = 0; k0 < K_total; k0 += TILE_K) {
-                    load_weight_tile<MmaElement>(
-                        weights_mma, tile_A_ptr, C_fast, m0, k0, K_total,
-                        tid, nthreads);
+                int const k_tile_total = (K_total + TILE_K - 1) / TILE_K;
+                int k_tile_count = k_tile_total;
+                int k_iter       = 0;
 
-                    load_b_tile<Geom, Flip, MmaElement>(
+                // -- Prefetch: fill first STAGES-1 pipeline stages --
+                int const prefetch_count = (STAGES - 1 < k_tile_count)
+                                               ? STAGES - 1
+                                               : k_tile_count;
+                for (int pipe = 0; pipe < prefetch_count; ++pipe) {
+                    int k0 = k_iter * TILE_K;
+                    load_a_tile_async<MmaElement>(
+                        weights_mma, get_A_stage(pipe), C_fast,
+                        m0, k0, K_total, tid, nthreads);
+                    load_b_tile_async<Geom, Flip, MmaElement>(
                         &smem.halo_maps[0][0], smem.compact_list,
-                        data_B_mma, C_slow,
-                        n0, k0, N_active, K_total,
-                        tile_B_ptr, tid, nthreads);
-
-                    __syncthreads();
-
-#pragma unroll
-                    for (int j = 0; j < size(tCrA); ++j) tCrA(j) = tCsA(j);
-#pragma unroll
-                    for (int j = 0; j < size(tCrB); ++j) tCrB(j) = tCsB(j);
-
-                    gemm(tiled_mma, accum, tCrA, tCrB, accum);
-
-                    __syncthreads();
+                        data_B_mma, C_slow, n0, k0, N_active, K_total,
+                        get_B_stage(pipe), tid, nthreads);
+                    cute::cp_async_fence();
+                    ++k_iter;
+                    --k_tile_count;
                 }
+
+                int smem_pipe_read  = 0;
+                int smem_pipe_write = STAGES - 1;
+                int current_read_stage = 0;
+
+                // Wait for first prefetched stage
+                cute::cp_async_wait<STAGES - 2>();
+                __syncthreads();
+
+                // Prefetch registers: load k_block 0 from stage 0
+                copy_smem_to_reg_kb(current_read_stage, 0);
+
+                // -- Pipelined main loop --
+                while (k_tile_count > -(STAGES - 1)) {
+#pragma unroll
+                    for (int kb = 0; kb < K_BLOCK_MAX; ++kb) {
+                        if (kb == K_BLOCK_MAX - 1) {
+                            // Advance read stage
+                            current_read_stage = smem_pipe_read;
+                            cute::cp_async_wait<STAGES - 2>();
+                            __syncthreads();
+                        }
+
+                        // Load next k_block from smem -> registers
+                        int kb_next = (kb + 1) % K_BLOCK_MAX;
+                        copy_smem_to_reg_kb(current_read_stage, kb_next);
+
+                        // Issue gmem -> smem for the write stage (once per stage)
+                        if (kb == 0) {
+                            if (k_tile_count > 0) {
+                                int k0 = k_iter * TILE_K;
+                                load_a_tile_async<MmaElement>(
+                                    weights_mma, get_A_stage(smem_pipe_write),
+                                    C_fast, m0, k0, K_total, tid, nthreads);
+                                load_b_tile_async<Geom, Flip, MmaElement>(
+                                    &smem.halo_maps[0][0], smem.compact_list,
+                                    data_B_mma, C_slow, n0, k0,
+                                    N_active, K_total,
+                                    get_B_stage(smem_pipe_write),
+                                    tid, nthreads);
+                            }
+                            cute::cp_async_fence();
+                            --k_tile_count;
+                            if (k_tile_count > 0) ++k_iter;
+
+                            smem_pipe_write = smem_pipe_read;
+                            ++smem_pipe_read;
+                            if (smem_pipe_read == STAGES)
+                                smem_pipe_read = 0;
+                        }
+
+                        // MMA for the current k_block
+                        gemm(tiled_mma, accum,
+                             tCrA(_, _, kb), tCrB(_, _, kb), accum);
+                    }
+                }
+
+                cute::cp_async_wait<0>();
+                __syncthreads();
 
                 // Epilogue: accumulator -> smem -> gmem (scatter)
                 auto *smem_C = reinterpret_cast<float *>(smem.mma_buf);
-                auto sC      = make_tensor(
+                auto sC = make_tensor(
                     make_smem_ptr(smem_C),
                     make_layout(make_shape(Int<TILE_M>{}, Int<TILE_N>{}),
-                                     make_stride(Int<1>{}, Int<TILE_M>{})));
+                                make_stride(Int<1>{}, Int<TILE_M>{})));
 
                 auto smem_copy_c =
-                    make_tiled_copy_C(Copy_Atom<UniversalCopy<uint32_t>, float>{},
-                                     tiled_mma);
+                    make_tiled_copy_C(
+                        Copy_Atom<UniversalCopy<uint32_t>, float>{},
+                        tiled_mma);
                 auto smem_thr_copy_c = smem_copy_c.get_thread_slice(tid);
                 auto tCrC_copy       = smem_thr_copy_c.retile_S(accum);
                 auto tCsC            = smem_thr_copy_c.partition_D(sC);
@@ -468,7 +572,8 @@ superblock_conv_kernel(GridBatchImpl::Accessor primary_acc,
                     int cout    = m0 + m_local;
                     int voxel   = n0 + n_local;
                     if (cout < C_fast && voxel < N_active) {
-                        int32_t s_idx = smem.compact_list[voxel].scatter_idx;
+                        int32_t s_idx =
+                            smem.compact_list[voxel].scatter_idx;
                         output[static_cast<int64_t>(s_idx) * C_fast + cout] =
                             static_cast<Scalar>(smem_C[i]);
                     }
@@ -486,40 +591,93 @@ superblock_conv_kernel(GridBatchImpl::Accessor primary_acc,
                     tiled_mma, make_shape(Int<TILE_M>{}, Int<TILE_N>{}));
                 clear(accum);
 
-                for (int k0 = 0; k0 < N_active; k0 += TILE_K) {
-                    load_a_tile_wgrad<MmaElement>(
+                int const k_tile_total =
+                    (N_active + TILE_K - 1) / TILE_K;
+                int k_tile_count = k_tile_total;
+                int k_iter       = 0;
+
+                int const prefetch_count = (STAGES - 1 < k_tile_count)
+                                               ? STAGES - 1
+                                               : k_tile_count;
+                for (int pipe = 0; pipe < prefetch_count; ++pipe) {
+                    int k0 = k_iter * TILE_K;
+                    load_a_tile_wgrad_async<MmaElement>(
                         extra_mma, smem.compact_list,
-                        tile_A_ptr, C_fast, m0, k0, N_active,
+                        get_A_stage(pipe), C_fast, m0, k0, N_active,
                         tid, nthreads);
-
-                    load_b_tile_wgrad<Geom, MmaElement>(
+                    load_b_tile_wgrad_async<Geom, MmaElement>(
                         &smem.halo_maps[0][0], smem.compact_list,
-                        data_B_mma, C_slow,
-                        n0, k0, N_active, K_total,
-                        tile_B_ptr, tid, nthreads);
-
-                    __syncthreads();
-
-#pragma unroll
-                    for (int j = 0; j < size(tCrA); ++j) tCrA(j) = tCsA(j);
-#pragma unroll
-                    for (int j = 0; j < size(tCrB); ++j) tCrB(j) = tCsB(j);
-
-                    gemm(tiled_mma, accum, tCrA, tCrB, accum);
-
-                    __syncthreads();
+                        data_B_mma, C_slow, n0, k0, N_active, K_total,
+                        get_B_stage(pipe), tid, nthreads);
+                    cute::cp_async_fence();
+                    ++k_iter;
+                    --k_tile_count;
                 }
 
-                // Epilogue: accumulator -> smem -> atomicAdd to global grad_W
+                int smem_pipe_read  = 0;
+                int smem_pipe_write = STAGES - 1;
+                int current_read_stage = 0;
+
+                cute::cp_async_wait<STAGES - 2>();
+                __syncthreads();
+                copy_smem_to_reg_kb(current_read_stage, 0);
+
+                while (k_tile_count > -(STAGES - 1)) {
+#pragma unroll
+                    for (int kb = 0; kb < K_BLOCK_MAX; ++kb) {
+                        if (kb == K_BLOCK_MAX - 1) {
+                            current_read_stage = smem_pipe_read;
+                            cute::cp_async_wait<STAGES - 2>();
+                            __syncthreads();
+                        }
+
+                        int kb_next = (kb + 1) % K_BLOCK_MAX;
+                        copy_smem_to_reg_kb(current_read_stage, kb_next);
+
+                        if (kb == 0) {
+                            if (k_tile_count > 0) {
+                                int k0 = k_iter * TILE_K;
+                                load_a_tile_wgrad_async<MmaElement>(
+                                    extra_mma, smem.compact_list,
+                                    get_A_stage(smem_pipe_write),
+                                    C_fast, m0, k0, N_active,
+                                    tid, nthreads);
+                                load_b_tile_wgrad_async<Geom, MmaElement>(
+                                    &smem.halo_maps[0][0],
+                                    smem.compact_list,
+                                    data_B_mma, C_slow, n0, k0,
+                                    N_active, K_total,
+                                    get_B_stage(smem_pipe_write),
+                                    tid, nthreads);
+                            }
+                            cute::cp_async_fence();
+                            --k_tile_count;
+                            if (k_tile_count > 0) ++k_iter;
+
+                            smem_pipe_write = smem_pipe_read;
+                            ++smem_pipe_read;
+                            if (smem_pipe_read == STAGES)
+                                smem_pipe_read = 0;
+                        }
+
+                        gemm(tiled_mma, accum,
+                             tCrA(_, _, kb), tCrB(_, _, kb), accum);
+                    }
+                }
+
+                cute::cp_async_wait<0>();
+                __syncthreads();
+
                 auto *smem_C = reinterpret_cast<float *>(smem.mma_buf);
-                auto sC      = make_tensor(
+                auto sC = make_tensor(
                     make_smem_ptr(smem_C),
                     make_layout(make_shape(Int<TILE_M>{}, Int<TILE_N>{}),
-                                     make_stride(Int<1>{}, Int<TILE_M>{})));
+                                make_stride(Int<1>{}, Int<TILE_M>{})));
 
                 auto smem_copy_c =
-                    make_tiled_copy_C(Copy_Atom<UniversalCopy<uint32_t>, float>{},
-                                     tiled_mma);
+                    make_tiled_copy_C(
+                        Copy_Atom<UniversalCopy<uint32_t>, float>{},
+                        tiled_mma);
                 auto smem_thr_copy_c = smem_copy_c.get_thread_slice(tid);
                 auto tCrC_copy       = smem_thr_copy_c.retile_S(accum);
                 auto tCsC            = smem_thr_copy_c.partition_D(sC);
@@ -535,7 +693,8 @@ superblock_conv_kernel(GridBatchImpl::Accessor primary_acc,
                     int kpos    = n0 + n_local;
                     if (cout < C_fast && kpos < K_total) {
                         atomicAdd(
-                            &output_f[static_cast<int64_t>(cout) * K_total + kpos],
+                            &output_f[static_cast<int64_t>(cout) * K_total
+                                      + kpos],
                             smem_C[i]);
                     }
                 }
