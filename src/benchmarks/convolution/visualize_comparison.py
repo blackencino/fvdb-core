@@ -1,11 +1,11 @@
 # Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: Apache-2.0
 #
-# Visualization for the sparse convolution comparison benchmark.
+# Visualization for sparse convolution benchmarks.
 #
-# Reads JSON output from benchmark_sparse_conv_comparison.py and produces
-# publication-quality plots comparing fVDB against spconv, torchsparse,
-# MinkowskiEngine, and dense PyTorch conv3d.
+# Reads JSON output from benchmark_sparse_conv_comparison.py or
+# benchmark_sparse_conv_narrowband.py and produces publication-quality
+# plots.  Handles all suite types from both benchmarks.
 #
 # Usage:
 #   python visualize_comparison.py --file comparison_results.json
@@ -30,6 +30,8 @@ from matplotlib.ticker import FuncFormatter
 # instantly recognizable across all plots.
 LIBRARY_STYLE = {
     "fVDB": {"color": "#1f77b4", "marker": "o", "linestyle": "-"},
+    "fVDB (CUTLASS)": {"color": "#17becf", "marker": "p", "linestyle": "--"},
+    "fVDB (ImplicitGEMM)": {"color": "#1b4f72", "marker": "*", "linestyle": "-."},
     "spconv": {"color": "#ff7f0e", "marker": "s", "linestyle": "--"},
     "torchsparse": {"color": "#2ca02c", "marker": "^", "linestyle": "-."},
     "MinkowskiEngine": {"color": "#9467bd", "marker": "D", "linestyle": ":"},
@@ -93,11 +95,18 @@ def format_ms(x, _pos):
 
 
 def plot_grid_size_scaling(df: pd.DataFrame) -> None:
-    """Time vs grid size, one line per library.  Log-log axes."""
-    suite_df = df[df["suite"] == "grid_size"].copy()
+    """Time vs voxel count, one line per library.  Log-log axes.
+
+    Handles both the ``grid_size`` suite (dense grids from the comparison
+    benchmark) and the ``scale`` suite (narrow-band spheres from the
+    narrowband benchmark).
+    """
+    suite_df = df[df["suite"].isin(["grid_size", "scale"])].copy()
     if suite_df.empty:
-        print("No grid_size data to plot.")
+        print("No grid_size / scale data to plot.")
         return
+
+    is_narrowband = "scale" in suite_df["suite"].values
 
     sns.set_theme(style="whitegrid", context="talk")
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -122,9 +131,10 @@ def plot_grid_size_scaling(df: pd.DataFrame) -> None:
     ax.set_yscale("log")
     ax.xaxis.set_major_formatter(FuncFormatter(format_voxels))
     ax.yaxis.set_major_formatter(FuncFormatter(format_ms))
-    ax.set_xlabel("Grid Size (voxels)")
+    ax.set_xlabel("Voxels")
     ax.set_ylabel("Forward Time")
-    ax.set_title("Grid-Size Scaling (C=32, K=3x3x3)")
+    title = "Narrow-Band Sphere Scaling (C=32, K=3x3x3)" if is_narrowband else "Grid-Size Scaling (C=32, K=3x3x3)"
+    ax.set_title(title)
     ax.legend(loc="upper left", fontsize=10)
     ax.grid(True, which="both", alpha=0.3)
     plt.tight_layout()
@@ -239,12 +249,22 @@ def plot_channel_scaling(df: pd.DataFrame) -> None:
         ax.plot(chan_vals, y_lin, ":", alpha=0.4, color="gray", label="O(C) ref")
         ax.plot(chan_vals, y_quad, "-.", alpha=0.4, color="gray", label="O(C^2) ref")
 
-    ax.set_xscale("log")
+    ax.set_xscale("log", base=2)
     ax.set_yscale("log")
+    chan_vals_sorted = np.sort(suite_df["channels"].unique())
+    ax.set_xticks(chan_vals_sorted)
+    ax.set_xticklabels([str(int(c)) for c in chan_vals_sorted])
+    ax.minorticks_off()
     ax.set_xlabel("Channels (C)")
     ax.set_ylabel("Forward Time")
     ax.yaxis.set_major_formatter(FuncFormatter(format_ms))
-    ax.set_title("Channel Scaling (16^3 grid, K=3x3x3)")
+    n_vox = suite_df["num_voxels"].iloc[0] if not suite_df.empty else 0
+    if "grid_dim" in suite_df.columns and suite_df["grid_dim"].notna().any():
+        dim = int(suite_df["grid_dim"].iloc[0])
+        subtitle = f"{dim}^3 grid"
+    else:
+        subtitle = f"~{n_vox:,} voxels"
+    ax.set_title(f"Channel Scaling ({subtitle}, K=3x3x3)")
     ax.legend(loc="upper left", fontsize=10)
     ax.grid(True, which="both", alpha=0.3)
     plt.tight_layout()
@@ -297,6 +317,48 @@ def plot_topology_overhead(df: pd.DataFrame) -> None:
     plt.tight_layout()
 
     out = "comparison_topology_overhead.png"
+    print(f"Saving {out}")
+    plt.savefig(out, bbox_inches="tight", dpi=150)
+    plt.show()
+
+
+def plot_extent(df: pd.DataFrame) -> None:
+    """Time vs sphere separation -- shows behavior at huge spatial extents."""
+    suite_df = df[df["suite"] == "extent"].copy()
+    if suite_df.empty:
+        return
+
+    sns.set_theme(style="whitegrid", context="talk")
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    for lib in suite_df["library"].unique():
+        sub = suite_df[suite_df["library"] == lib].sort_values("separation")
+        s = _style_for(lib)
+        ax.errorbar(
+            sub["separation"],
+            sub["mean_ms"],
+            yerr=sub["std_ms"],
+            marker=s["marker"],
+            color=s["color"],
+            linestyle=s["linestyle"],
+            linewidth=2.5,
+            markersize=8,
+            capsize=3,
+            label=lib,
+        )
+
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.yaxis.set_major_formatter(FuncFormatter(format_ms))
+    ax.set_xlabel("Sphere Separation (voxels)")
+    ax.set_ylabel("Forward Time")
+    n_vox = suite_df["num_voxels"].iloc[0] if not suite_df.empty else 0
+    ax.set_title(f"Spatial Extent Scaling (~{n_vox:,} voxels, C=32, K=3x3x3)")
+    ax.legend(loc="upper left", fontsize=10)
+    ax.grid(True, which="both", alpha=0.3)
+    plt.tight_layout()
+
+    out = "comparison_extent.png"
     print(f"Saving {out}")
     plt.savefig(out, bbox_inches="tight", dpi=150)
     plt.show()
@@ -357,10 +419,31 @@ def print_summary(df: pd.DataFrame) -> None:
                         row += f"  {'--':>16s}"
                 print(row)
 
+    # Scale suite (narrowband spheres)
+    scale_df = df[df["suite"] == "scale"]
+    if not scale_df.empty:
+        print("\n--- Narrow-Band Sphere Scaling (C=32, K=3) ---")
+        header = f"  {'Radius':>6s}  {'Voxels':>10s}"
+        for lib in libs:
+            header += f"  {lib:>16s}"
+        print(header)
+        for r in sorted(scale_df["radius"].unique()):
+            r_sub = scale_df[scale_df["radius"] == r]
+            vox = int(r_sub["num_voxels"].iloc[0])
+            row = f"  {int(r):>6d}  {vox:>10,d}"
+            for lib in libs:
+                sub = r_sub[r_sub["library"] == lib]
+                if not sub.empty:
+                    row += f"  {sub['mean_ms'].values[0]:>13.3f}ms"
+                else:
+                    row += f"  {'--':>16s}"
+            print(row)
+
     # Channel scaling
     chan_df = df[df["suite"] == "channels"]
     if not chan_df.empty:
-        print(f"\n--- Channel Scaling (16^3 grid, K=3) ---")
+        n_vox = int(chan_df["num_voxels"].iloc[0])
+        print(f"\n--- Channel Scaling ({n_vox:,} voxels, K=3) ---")
         header = f"  {'C':>6s}"
         for lib in libs:
             header += f"  {lib:>16s}"
@@ -369,6 +452,27 @@ def print_summary(df: pd.DataFrame) -> None:
             row = f"  {int(c):>6d}"
             for lib in libs:
                 sub = chan_df[(chan_df["channels"] == c) & (chan_df["library"] == lib)]
+                if not sub.empty:
+                    row += f"  {sub['mean_ms'].values[0]:>13.3f}ms"
+                else:
+                    row += f"  {'--':>16s}"
+            print(row)
+
+    # Extent suite (two separated spheres)
+    extent_df = df[df["suite"] == "extent"]
+    if not extent_df.empty:
+        print("\n--- Spatial Extent (2 spheres, C=32, K=3) ---")
+        header = f"  {'Sep':>6s}  {'Voxels':>10s}  {'BBox':>6s}"
+        for lib in libs:
+            header += f"  {lib:>16s}"
+        print(header)
+        for sep in sorted(extent_df["separation"].unique()):
+            sep_sub = extent_df[extent_df["separation"] == sep]
+            vox = int(sep_sub["num_voxels"].iloc[0])
+            bd = int(sep_sub["bbox_dim"].iloc[0])
+            row = f"  {int(sep):>6d}  {vox:>10,d}  {bd:>6d}"
+            for lib in libs:
+                sub = sep_sub[sep_sub["library"] == lib]
                 if not sub.empty:
                     row += f"  {sub['mean_ms'].values[0]:>13.3f}ms"
                 else:
@@ -414,6 +518,7 @@ def main() -> None:
     plot_sparsity_breakeven(df)
     plot_channel_scaling(df)
     plot_topology_overhead(df)
+    plot_extent(df)
 
 
 if __name__ == "__main__":
