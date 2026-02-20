@@ -161,6 +161,7 @@ ConfigureTest(ImplicitGemmConvTest "ImplicitGemmConvTest.cu")
 ConfigureTest(LeafIGemmAltConvTest "LeafIGemmAltConvTest.cu")
 ConfigureTest(LeafIGemmConvTest "LeafIGemmConvTest.cu")
 ConfigureTest(SifakisRefConvTest "SifakisRefConvTest.cu")
+ConfigureTest(SuperblockConvTest "SuperblockConvTest.cu")
 
 if(NOT NANOVDB_EDITOR_SKIP)
   #ConfigureTest(ViewerTest "ViewerTest.cpp")

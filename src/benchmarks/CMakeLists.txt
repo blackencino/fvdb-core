@@ -137,3 +137,8 @@ ConfigureDispatchBench(gather_scatter_conv_benchmark
     convolution/gather_scatter_conv_benchmark.cu
 )
 
+# Superblock GEMM sparse convolution benchmark
+ConfigureDispatchBench(superblock_conv_benchmark
+    convolution/superblock_conv_benchmark.cu
+)
+

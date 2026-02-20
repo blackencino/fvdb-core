@@ -88,6 +88,32 @@ class _ImplicitGemmConvFn(torch.autograd.Function):
         raise NotImplementedError("Implicit GEMM backward not yet implemented")
 
 
+class _SuperblockConvFn(torch.autograd.Function):
+    """Autograd wrapper for superblock GEMM sparse convolution (forward + backward)."""
+
+    @staticmethod
+    def forward(ctx, features: torch.Tensor, weights: torch.Tensor, source_grid, target_grid, kernel_size, stride, transposed: bool) -> torch.Tensor:  # type: ignore[override]
+        ctx.save_for_backward(features, weights)
+        ctx.source_grid = source_grid
+        ctx.target_grid = target_grid
+        ctx.kernel_size = kernel_size
+        ctx.stride = stride
+        ctx.transposed = transposed
+        if transposed:
+            return _fvdb_cpp.superblock_conv_transpose(features, weights, source_grid, target_grid, kernel_size, stride)
+        return _fvdb_cpp.superblock_conv(features, weights, source_grid, target_grid, kernel_size, stride)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, None, None, None, None, None]:  # type: ignore[override]
+        features, weights = ctx.saved_tensors
+        if ctx.transposed:
+            raise NotImplementedError("Superblock transposed backward not yet implemented")
+        grad_features, grad_weights = _fvdb_cpp.superblock_conv_backward(
+            grad_output, features, weights, ctx.source_grid, ctx.target_grid, ctx.kernel_size, ctx.stride
+        )
+        return grad_features, grad_weights, None, None, None, None, None
+
+
 # ============================================================
 #  Backend data classes — cached precomputed data per method
 # ============================================================
@@ -131,7 +157,24 @@ class _ImplicitGemmBackend:
     stride: tuple[int, int, int]
 
 
-_Backend = _MatmulBackend | _DenseBackend | _GatherScatterBackend | _CutlassGroupedGemmBackend | _ImplicitGemmBackend
+@dataclass(frozen=True)
+class _SuperblockBackend:
+    """Superblock GEMM. Sm80+, fp16/fp32, stride=1, forward+backward+transpose. No topology pre-pass."""
+
+    source_grid: Any
+    target_grid: Any
+    kernel_size: tuple[int, int, int]
+    stride: tuple[int, int, int]
+
+
+_Backend = (
+    _MatmulBackend
+    | _DenseBackend
+    | _GatherScatterBackend
+    | _CutlassGroupedGemmBackend
+    | _ImplicitGemmBackend
+    | _SuperblockBackend
+)
 
 
 @dataclass(frozen=True)
@@ -669,6 +712,23 @@ class ConvolutionPlan:
                 raise ValueError("Implicit GEMM convolution returned non-tensor")
             result = self._target_grid.jagged_like(out_tensor)
 
+        # Superblock GEMM: compacted active-voxel GEMM, no topology pre-pass
+        elif isinstance(backend, _SuperblockBackend):
+            out_tensor = _SuperblockConvFn.apply(
+                data.jdata,
+                weights,
+                backend.source_grid,
+                backend.target_grid,
+                backend.kernel_size,
+                backend.stride,
+                self._transposed,
+            )
+            if out_tensor is None:
+                raise ValueError("Superblock convolution returned None")
+            if not isinstance(out_tensor, torch.Tensor):
+                raise ValueError("Superblock convolution returned non-tensor")
+            result = self._target_grid.jagged_like(out_tensor)
+
         else:
             raise TypeError(f"Unknown backend type: {type(backend)}")
 
@@ -806,6 +866,17 @@ class ConvolutionPlan:
             if transposed:
                 raise ValueError("Implicit GEMM backend does not support transposed convolution.")
             return _ImplicitGemmBackend(
+                source_grid=source_grid._impl,
+                target_grid=target_grid._impl,
+                kernel_size=kernel_size,
+                stride=stride,
+            )
+
+        # Superblock GEMM — compacted active-voxel GEMM, no topology pre-pass
+        if backend_name == "superblock":
+            if source_grid._impl.device.type != "cuda":
+                raise ValueError("Superblock backend requires CUDA.")
+            return _SuperblockBackend(
                 source_grid=source_grid._impl,
                 target_grid=target_grid._impl,
                 kernel_size=kernel_size,

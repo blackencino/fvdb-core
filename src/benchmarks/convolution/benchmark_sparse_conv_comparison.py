@@ -289,6 +289,57 @@ class FVDBImplicitGemmAdapter(BackendAdapter):
 
 
 # ---------------------------------------------------------------------------
+# fVDB superblock GEMM adapter (compacted active-voxel GEMM)
+# ---------------------------------------------------------------------------
+
+
+class FVDBSuperblockAdapter(BackendAdapter):
+    name = "fVDB (Superblock)"
+
+    @staticmethod
+    def available() -> bool:
+        try:
+            import fvdb
+
+            fvdb._fvdb_cpp.superblock_conv
+            if not torch.cuda.is_available():
+                return False
+            return torch.cuda.get_device_capability()[0] >= 8
+        except (ImportError, AttributeError):
+            return False
+
+    def setup(self, ijk, in_channels, out_channels, kernel_size, device, bbox_dim):
+        if in_channels % 32 != 0 or out_channels % 32 != 0:
+            raise ValueError("Superblock requires channels divisible by 32")
+
+        import fvdb
+
+        self._num_voxels = ijk.shape[0]
+        ijk_dev = ijk.to(device)
+        jt = fvdb.JaggedTensor(ijk_dev)
+        self._grid = fvdb.GridBatch.from_ijk(jt, voxel_sizes=1, origins=0, device=device)
+        self._plan = fvdb.ConvolutionPlan.from_grid_batch(
+            kernel_size=kernel_size,
+            stride=1,
+            source_grid=self._grid,
+            target_grid=self._grid,
+            expert_config={"backend": "superblock"},
+        )
+        torch.manual_seed(0)
+        n = self._grid.total_voxels
+        self._features = torch.randn(n, in_channels, device=device, dtype=torch.float32)
+        self._weights = torch.randn(
+            out_channels, in_channels, kernel_size, kernel_size, kernel_size, device=device, dtype=torch.float32
+        )
+
+    def forward(self):
+        return self._plan.execute(self._features, self._weights)
+
+    def teardown(self):
+        del self._plan, self._grid, self._features, self._weights
+
+
+# ---------------------------------------------------------------------------
 # spconv adapter
 # ---------------------------------------------------------------------------
 
@@ -439,6 +490,7 @@ ALL_ADAPTERS: list[type[BackendAdapter]] = [
     FVDBAdapter,
     FVDBCutlassAdapter,
     FVDBImplicitGemmAdapter,
+    FVDBSuperblockAdapter,
     SpconvAdapter,
     TorchSparseAdapter,
     MinkowskiAdapter,

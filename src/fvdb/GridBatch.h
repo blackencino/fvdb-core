@@ -9,6 +9,7 @@
 #include <fvdb/detail/GridBatchImpl.h>
 #include <fvdb/detail/ops/convolution/GatherScatterDefault.h>
 #include <fvdb/detail/ops/convolution/ImplicitGemmConv.h>
+#include <fvdb/detail/ops/convolution/Superblock.h>
 #include <fvdb/detail/utils/Utils.h>
 
 #include <nanovdb/NanoVDB.h>
@@ -843,6 +844,32 @@ struct GridBatch : torch::CustomClassHolder {
                                                  const GridBatch &output_grid,
                                                  const Vec3iOrScalar &kernelSize,
                                                  const Vec3iOrScalar &stride);
+
+    /// Superblock GEMM sparse convolution (forward).
+    static torch::Tensor superblockConvolution(torch::Tensor features,
+                                               torch::Tensor weights,
+                                               const GridBatch &feature_grid,
+                                               const GridBatch &output_grid,
+                                               const Vec3iOrScalar &kernelSize,
+                                               const Vec3iOrScalar &stride);
+
+    /// Superblock GEMM sparse convolution (backward).
+    static std::tuple<torch::Tensor, torch::Tensor>
+    superblockConvolutionBackward(torch::Tensor grad_output,
+                                 torch::Tensor features,
+                                 torch::Tensor weights,
+                                 const GridBatch &feature_grid,
+                                 const GridBatch &output_grid,
+                                 const Vec3iOrScalar &kernelSize,
+                                 const Vec3iOrScalar &stride);
+
+    /// Superblock GEMM transposed sparse convolution (forward direction).
+    static torch::Tensor superblockConvolutionTranspose(torch::Tensor features,
+                                                        torch::Tensor weights,
+                                                        const GridBatch &source_grid,
+                                                        const GridBatch &target_grid,
+                                                        const Vec3iOrScalar &kernelSize,
+                                                        const Vec3iOrScalar &stride);
 
     /// @brief Perform one integration step of the TSDF fusion algorithm on a batch of sparse grids.
     ///        The TSDF fusion algorithm integrates depth and feature images (e.g. colors)

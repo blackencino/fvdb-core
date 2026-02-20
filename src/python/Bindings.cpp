@@ -462,6 +462,66 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("stride"));
 
     m.def(
+        "superblock_conv",
+        [](torch::Tensor features,
+           torch::Tensor weights,
+           const fvdb::GridBatch &feature_grid,
+           const fvdb::GridBatch &output_grid,
+           fvdb::Vec3iOrScalar kernelSize,
+           fvdb::Vec3iOrScalar stride) -> torch::Tensor {
+            return fvdb::GridBatch::superblockConvolution(
+                features, weights, feature_grid, output_grid, kernelSize, stride);
+        },
+        "Superblock GEMM sparse convolution (Sm80+, fp16/fp32, stride=1 only).",
+        py::arg("features"),
+        py::arg("weights"),
+        py::arg("feature_grid"),
+        py::arg("output_grid"),
+        py::arg("kernel_size"),
+        py::arg("stride"));
+
+    m.def(
+        "superblock_conv_backward",
+        [](torch::Tensor grad_output,
+           torch::Tensor features,
+           torch::Tensor weights,
+           const fvdb::GridBatch &feature_grid,
+           const fvdb::GridBatch &output_grid,
+           fvdb::Vec3iOrScalar kernelSize,
+           fvdb::Vec3iOrScalar stride) -> std::tuple<torch::Tensor, torch::Tensor> {
+            return fvdb::GridBatch::superblockConvolutionBackward(
+                grad_output, features, weights, feature_grid, output_grid,
+                kernelSize, stride);
+        },
+        "Superblock GEMM backward sparse convolution (Sm80+, fp16/fp32, stride=1 only).",
+        py::arg("grad_output"),
+        py::arg("features"),
+        py::arg("weights"),
+        py::arg("feature_grid"),
+        py::arg("output_grid"),
+        py::arg("kernel_size"),
+        py::arg("stride"));
+
+    m.def(
+        "superblock_conv_transpose",
+        [](torch::Tensor features,
+           torch::Tensor weights,
+           const fvdb::GridBatch &source_grid,
+           const fvdb::GridBatch &target_grid,
+           fvdb::Vec3iOrScalar kernelSize,
+           fvdb::Vec3iOrScalar stride) -> torch::Tensor {
+            return fvdb::GridBatch::superblockConvolutionTranspose(
+                features, weights, source_grid, target_grid, kernelSize, stride);
+        },
+        "Superblock GEMM transposed sparse convolution (Sm80+, fp16/fp32, stride=1 only).",
+        py::arg("features"),
+        py::arg("weights"),
+        py::arg("source_grid"),
+        py::arg("target_grid"),
+        py::arg("kernel_size"),
+        py::arg("stride"));
+
+    m.def(
         "gs_conv_backward",
         [](torch::Tensor grad_output,
            torch::Tensor features,

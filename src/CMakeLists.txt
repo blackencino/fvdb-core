@@ -96,6 +96,7 @@ set(FVDB_CU_FILES
     fvdb/detail/ops/convolution/ImplicitGemmConv.cu
     fvdb/detail/ops/convolution/LeafIGemmAltConv.cu
     fvdb/detail/ops/convolution/LeafIGemmConv.cu
+    fvdb/detail/ops/convolution/Superblock.cu
     fvdb/detail/ops/CoordsInGrid.cu
     fvdb/detail/ops/CubesInGrid.cu
     fvdb/detail/ops/DownsampleGridAvgPool.cu
