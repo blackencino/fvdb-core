@@ -1,10 +1,10 @@
 // Copyright Contributors to the OpenVDB Project
 // SPDX-License-Identifier: Apache-2.0
 //
-// SifakisRefConvTest.cu -- GTest wrapper for the Sifakis reference IGEMM
+// SifakisRefConvTest.cu -- GTest wrapper for the Sifakis CUTLASS IGEMM
 // sparse convolution built-in test, plus cross-comparison tests that run the
-// Sifakis reference scatter-gather convolution and GatherScatterDefault on
-// the same Sifakis-style sparse grids and compare their outputs.
+// IGEMM and GatherScatterDefault on the same Sifakis-style sparse grids and
+// compare their outputs.
 //
 // Weight layout difference:
 //   Sifakis:  filter[T][R][S][K][C]  (spatial-major, Cout before Cin)
@@ -16,11 +16,10 @@
 //   fVDB's GatherScatterDefault subtracts 1 internally, producing 0-based
 //   feature/output tensor indices.
 
-#include <fvdb/detail/ops/convolution/sifakis_ref.h>
-
 #include <fvdb/JaggedTensor.h>
 #include <fvdb/detail/GridBatchImpl.h>
 #include <fvdb/detail/ops/convolution/GatherScatterDefault.h>
+#include <fvdb/detail/ops/convolution/sifakis_ref.h>
 
 #include <c10/cuda/CUDAStream.h>
 #include <torch/types.h>
@@ -78,11 +77,8 @@ coordinateBitpack(uint32_t x) {
 /// Generate input and output coordinate vectors using the same Morton-curve
 /// algorithm as sifakis_ref.cu's test_sparse_convolution_igemm_nanovdb_cuda.
 static std::pair<std::vector<nanovdb::Coord>, std::vector<nanovdb::Coord>>
-generateCoordinates(int ambient_voxels,
-                    float input_occ,
-                    float output_occ,
-                    float overlap,
-                    int seed = 12345) {
+generateCoordinates(
+    int ambient_voxels, float input_occ, float output_occ, float overlap, int seed = 12345) {
     std::mt19937 generator(seed);
     std::uniform_int_distribution<int> distribution(0, ambient_voxels - 1);
     std::vector<bool> voxmap(ambient_voxels, false);
@@ -167,9 +163,13 @@ struct CudaTimer {
     CudaTimer(const CudaTimer &)            = delete;
     CudaTimer &operator=(const CudaTimer &) = delete;
 
-    void recordStart() { cudaEventRecord(start_); }
+    void
+    recordStart() {
+        cudaEventRecord(start_);
+    }
 
-    float recordStopMs() {
+    float
+    recordStopMs() {
         cudaEventRecord(stop_);
         cudaEventSynchronize(stop_);
         float ms = 0.f;
@@ -190,18 +190,16 @@ TEST(SifakisRefConv, BuiltInTest) {
 }
 
 // =============================================================================
-// Cross-comparison: Sifakis reference vs GatherScatterDefault
+// Correctness: Sifakis IGEMM vs GatherScatterDefault
 // =============================================================================
 
-TEST(SifakisRefConv, MatchesGatherScatterDefault) {
+TEST(SifakisRefConv, IGemmMatchesGatherScatterDefault) {
     if (!deviceSupportsSm80()) {
         GTEST_SKIP() << "Requires SM80+";
     }
     auto device = makeDevice();
 
-    // -- Coordinate generation (same algorithm as sifakis_ref) --
-    auto [inputCoords, outputCoords] =
-        generateCoordinates(16 * 1024, 0.75f, 0.75f, 0.65f);
+    auto [inputCoords, outputCoords] = generateCoordinates(16 * 1024, 0.75f, 0.75f, 0.65f);
 
     auto input_grid  = makeFvdbGrid(inputCoords, device);
     auto output_grid = makeFvdbGrid(outputCoords, device);
@@ -211,58 +209,55 @@ TEST(SifakisRefConv, MatchesGatherScatterDefault) {
     ASSERT_GT(N_in, 0);
     ASSERT_GT(N_out, 0);
 
-    // Sifakis geometry: Cin=64, Cout=128, 3x3x3 filter
     const int64_t Cin = 64, Cout = 128;
-    torch::manual_seed(7777);
+    torch::manual_seed(8888);
 
-    // -- Filter / weights --
-    // Generate in Sifakis layout [T,R,S,K,C] then permute for fVDB [K,C,T,R,S]
     auto sifakis_filter = torch::randn({3, 3, 3, Cout, Cin}, topts(device));
     auto fvdb_weights   = sifakis_filter.permute({3, 4, 0, 1, 2}).contiguous();
 
-    // -- Features --
-    auto features     = torch::randn({N_in, Cin}, topts(device));
-    // Sifakis expects [valueCount][C] with 1-based active indices; index 0 = background zeros
+    auto features      = torch::randn({N_in, Cin}, topts(device));
     auto sifakis_input = torch::zeros({N_in + 1, Cin}, topts(device));
     sifakis_input.slice(0, 1).copy_(features);
 
-    // -- Run Sifakis reference --
-    auto sifakis_output = torch::zeros({N_out + 1, Cout}, topts(device));
-    auto *nanoInputGrid =
-        input_grid->nanoGridHandle().template deviceGrid<nanovdb::ValueOnIndex>();
+    // -- Run Sifakis IGEMM --
+    auto igemm_output   = torch::zeros({N_out + 1, Cout}, topts(device));
+    auto *nanoInputGrid = input_grid->nanoGridHandle().template deviceGrid<nanovdb::ValueOnIndex>();
     auto *nanoOutputGrid =
         output_grid->nanoGridHandle().template deviceGrid<nanovdb::ValueOnIndex>();
     uint32_t leafCount = output_grid->numLeavesAt(0);
 
-    sifakisRefSparseConv(leafCount,
-                         nanoInputGrid,
-                         nanoOutputGrid,
-                         sifakis_filter.data_ptr<float>(),
-                         sifakis_input.data_ptr<float>(),
-                         sifakis_output.data_ptr<float>(),
-                         at::cuda::getCurrentCUDAStream());
+    sifakisIGemmConv(leafCount,
+                     nanoInputGrid,
+                     nanoOutputGrid,
+                     sifakis_filter.data_ptr<float>(),
+                     sifakis_input.data_ptr<float>(),
+                     igemm_output.data_ptr<float>(),
+                     at::cuda::getCurrentCUDAStream());
     cudaDeviceSynchronize();
 
     // -- Run GatherScatterDefault --
     nanovdb::Coord ks(3, 3, 3);
     nanovdb::Coord stride(1, 1, 1);
-    auto topo = ops::gatherScatterDefaultSparseConvTopology(
-        *input_grid, *output_grid, ks, stride);
+    auto topo = ops::gatherScatterDefaultSparseConvTopology(*input_grid, *output_grid, ks, stride);
     auto gs_output = ops::gatherScatterDefaultSparseConv(features, fvdb_weights, topo);
 
     // -- Compare (Sifakis indices 1..N vs fVDB indices 0..N-1) --
-    auto sifakis_active = sifakis_output.slice(0, 1).cpu().to(torch::kFloat64);
-    auto gs_f64         = gs_output.cpu().to(torch::kFloat64);
-    auto diff           = (sifakis_active - gs_f64).abs();
+    auto igemm_active = igemm_output.slice(0, 1).cpu().to(torch::kFloat64);
+    auto gs_f64       = gs_output.cpu().to(torch::kFloat64);
+    auto diff         = (igemm_active - gs_f64).abs();
 
-    ASSERT_EQ(sifakis_active.size(0), gs_f64.size(0));
-    ASSERT_EQ(sifakis_active.size(1), gs_f64.size(1));
+    ASSERT_EQ(igemm_active.size(0), gs_f64.size(0));
+    ASSERT_EQ(igemm_active.size(1), gs_f64.size(1));
 
-    // The two implementations use different accumulation orders (serial loop vs
-    // cuBLAS GEMM + scatter_add), so float32 rounding produces small differences.
-    // Each output element sums 27*Cin=1728 products; the observed max diff is ~3e-4.
-    EXPECT_TRUE(torch::allclose(sifakis_active, gs_f64, /*rtol=*/1e-4, /*atol=*/1e-3))
-        << "MatchesGatherScatterDefault: max diff=" << diff.max().item<double>()
+    // The CUTLASS IGEMM uses TF32 tensor-core arithmetic (10-bit mantissa) on
+    // Ampere+, while GatherScatterDefault uses full f32 cuBLAS GEMM.  With randn
+    // inputs the expected per-element error is ~0.3% relative; observed max diff
+    // is ~0.14 on outputs of magnitude ~40.  The IGEMM is validated against the
+    // naive f32 reference by sifakis_ref's own built-in test (Discrepancy = 0 on
+    // restricted-range inputs where TF32 is exact), so correctness is established
+    // transitively.
+    EXPECT_TRUE(torch::allclose(igemm_active, gs_f64, /*rtol=*/5e-3, /*atol=*/0.5))
+        << "IGemmMatchesGatherScatterDefault: max diff=" << diff.max().item<double>()
         << ", mean diff=" << diff.mean().item<double>();
 }
 
@@ -270,14 +265,18 @@ TEST(SifakisRefConv, MatchesGatherScatterDefault) {
 // Speed comparison
 // =============================================================================
 
-TEST(SifakisRefConv, SpeedComparison) {
-    if (!deviceSupportsSm80()) {
-        GTEST_SKIP() << "Requires SM80+";
-    }
-    auto device = makeDevice();
+struct BenchConfig {
+    const char *label;
+    int ambient_voxels;
+    float input_occ;
+    float output_occ;
+    float overlap;
+};
 
+static void
+runBenchmark(const BenchConfig &cfg, torch::Device device) {
     auto [inputCoords, outputCoords] =
-        generateCoordinates(128 * 1024, 0.75f, 0.75f, 0.65f);
+        generateCoordinates(cfg.ambient_voxels, cfg.input_occ, cfg.output_occ, cfg.overlap);
 
     auto input_grid  = makeFvdbGrid(inputCoords, device);
     auto output_grid = makeFvdbGrid(outputCoords, device);
@@ -297,8 +296,7 @@ TEST(SifakisRefConv, SpeedComparison) {
     auto sifakis_input = torch::zeros({N_in + 1, Cin}, topts(device));
     sifakis_input.slice(0, 1).copy_(features);
 
-    auto *nanoInputGrid =
-        input_grid->nanoGridHandle().template deviceGrid<nanovdb::ValueOnIndex>();
+    auto *nanoInputGrid = input_grid->nanoGridHandle().template deviceGrid<nanovdb::ValueOnIndex>();
     auto *nanoOutputGrid =
         output_grid->nanoGridHandle().template deviceGrid<nanovdb::ValueOnIndex>();
     uint32_t leafCount = output_grid->numLeavesAt(0);
@@ -306,30 +304,50 @@ TEST(SifakisRefConv, SpeedComparison) {
     nanovdb::Coord ks(3, 3, 3);
     nanovdb::Coord stride(1, 1, 1);
 
-    std::cout << "SpeedComparison: N_in=" << N_in << "  N_out=" << N_out
-              << "  Cin=" << Cin << "  Cout=" << Cout << std::endl;
+    std::cout << "  [" << cfg.label << "] N_in=" << N_in << "  N_out=" << N_out
+              << "  leaves=" << leafCount << "  leaf_occ=" << (100.f * N_out / (leafCount * 512))
+              << "%" << std::endl;
 
-    constexpr int kWarmup = 1;
+    constexpr int kWarmup = 2;
     constexpr int kIters  = 5;
     CudaTimer timer;
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    // --- Sifakis IGEMM ---
+    auto igemm_output = torch::zeros({N_out + 1, Cout}, topts(device));
+    for (int i = 0; i < kWarmup; ++i)
+        sifakisIGemmConv(leafCount,
+                         nanoInputGrid,
+                         nanoOutputGrid,
+                         sifakis_filter.data_ptr<float>(),
+                         sifakis_input.data_ptr<float>(),
+                         igemm_output.data_ptr<float>(),
+                         stream);
+    timer.recordStart();
+    for (int i = 0; i < kIters; ++i)
+        sifakisIGemmConv(leafCount,
+                         nanoInputGrid,
+                         nanoOutputGrid,
+                         sifakis_filter.data_ptr<float>(),
+                         sifakis_input.data_ptr<float>(),
+                         igemm_output.data_ptr<float>(),
+                         stream);
+    float igemm_ms = timer.recordStopMs() / kIters;
 
     // --- GatherScatterDefault (with topology) ---
     for (int i = 0; i < kWarmup; ++i) {
-        auto t = ops::gatherScatterDefaultSparseConvTopology(
-            *input_grid, *output_grid, ks, stride);
+        auto t = ops::gatherScatterDefaultSparseConvTopology(*input_grid, *output_grid, ks, stride);
         ops::gatherScatterDefaultSparseConv(features, fvdb_weights, t);
     }
     timer.recordStart();
     for (int i = 0; i < kIters; ++i) {
-        auto t = ops::gatherScatterDefaultSparseConvTopology(
-            *input_grid, *output_grid, ks, stride);
+        auto t = ops::gatherScatterDefaultSparseConvTopology(*input_grid, *output_grid, ks, stride);
         ops::gatherScatterDefaultSparseConv(features, fvdb_weights, t);
     }
     float gs_with_topo_ms = timer.recordStopMs() / kIters;
 
     // --- GatherScatterDefault (topology pre-computed) ---
-    auto topo = ops::gatherScatterDefaultSparseConvTopology(
-        *input_grid, *output_grid, ks, stride);
+    auto topo = ops::gatherScatterDefaultSparseConvTopology(*input_grid, *output_grid, ks, stride);
     for (int i = 0; i < kWarmup; ++i)
         ops::gatherScatterDefaultSparseConv(features, fvdb_weights, topo);
     timer.recordStart();
@@ -337,46 +355,47 @@ TEST(SifakisRefConv, SpeedComparison) {
         ops::gatherScatterDefaultSparseConv(features, fvdb_weights, topo);
     float gs_no_topo_ms = timer.recordStopMs() / kIters;
 
-    // --- Sifakis reference ---
-    auto sifakis_output = torch::zeros({N_out + 1, Cout}, topts(device));
-    auto stream         = at::cuda::getCurrentCUDAStream();
-    for (int i = 0; i < kWarmup; ++i) {
-        sifakis_output.zero_();
-        sifakisRefSparseConv(leafCount, nanoInputGrid, nanoOutputGrid,
-                             sifakis_filter.data_ptr<float>(),
-                             sifakis_input.data_ptr<float>(),
-                             sifakis_output.data_ptr<float>(), stream);
-    }
-    timer.recordStart();
-    for (int i = 0; i < kIters; ++i) {
-        sifakis_output.zero_();
-        sifakisRefSparseConv(leafCount, nanoInputGrid, nanoOutputGrid,
-                             sifakis_filter.data_ptr<float>(),
-                             sifakis_input.data_ptr<float>(),
-                             sifakis_output.data_ptr<float>(), stream);
-    }
-    float sifakis_ms = timer.recordStopMs() / kIters;
+    std::cout << "    IGEMM: " << igemm_ms << " ms"
+              << "  |  GS+topo: " << gs_with_topo_ms << " ms"
+              << "  |  GS only: " << gs_no_topo_ms << " ms" << std::endl;
 
-    std::cout << "  GatherScatter (with topo): " << gs_with_topo_ms << " ms"
-              << "  |  GatherScatter (no topo): " << gs_no_topo_ms << " ms"
-              << "  |  Sifakis ref: " << sifakis_ms << " ms" << std::endl;
-
-    // -- Correctness sanity check on the timed results --
+    // -- Correctness sanity check --
+    sifakisIGemmConv(leafCount,
+                     nanoInputGrid,
+                     nanoOutputGrid,
+                     sifakis_filter.data_ptr<float>(),
+                     sifakis_input.data_ptr<float>(),
+                     igemm_output.data_ptr<float>(),
+                     stream);
+    cudaDeviceSynchronize();
     auto gs_out = ops::gatherScatterDefaultSparseConv(features, fvdb_weights, topo);
 
-    sifakis_output.zero_();
-    sifakisRefSparseConv(leafCount, nanoInputGrid, nanoOutputGrid,
-                         sifakis_filter.data_ptr<float>(),
-                         sifakis_input.data_ptr<float>(),
-                         sifakis_output.data_ptr<float>(), stream);
-    cudaDeviceSynchronize();
+    auto igemm_active = igemm_output.slice(0, 1).cpu().to(torch::kFloat64);
+    auto gs_f64       = gs_out.cpu().to(torch::kFloat64);
+    auto diff         = (igemm_active - gs_f64).abs();
 
-    auto sifakis_active = sifakis_output.slice(0, 1).cpu().to(torch::kFloat64);
-    auto gs_f64         = gs_out.cpu().to(torch::kFloat64);
-    auto diff           = (sifakis_active - gs_f64).abs();
-
-    EXPECT_TRUE(torch::allclose(sifakis_active, gs_f64, /*rtol=*/1e-4, /*atol=*/1e-3))
-        << "SpeedComparison correctness check failed, max diff="
-        << diff.max().item<double>()
+    // TF32 tolerance (see IGemmMatchesGatherScatterDefault for rationale)
+    EXPECT_TRUE(torch::allclose(igemm_active, gs_f64, /*rtol=*/5e-3, /*atol=*/0.5))
+        << cfg.label << " correctness failed, max diff=" << diff.max().item<double>()
         << ", mean diff=" << diff.mean().item<double>();
+}
+
+TEST(SifakisRefConv, SpeedComparison) {
+    if (!deviceSupportsSm80()) {
+        GTEST_SKIP() << "Requires SM80+";
+    }
+    auto device = makeDevice();
+
+    // clang-format off
+    BenchConfig configs[] = {
+        {"1M dense",         1024 * 1024, 0.75f, 0.75f, 0.65f},
+        {"2M dense",     2 * 1024 * 1024, 0.75f, 0.75f, 0.65f},
+        {"4M sparse-25",     4 * 1024 * 1024, 0.25f, 0.25f, 0.20f},
+        {"8M sparse-10",     8 * 1024 * 1024, 0.10f, 0.10f, 0.08f},
+    };
+    // clang-format on
+
+    std::cout << "SpeedComparison (Cin=64, Cout=128, kernel 3x3x3):" << std::endl;
+    for (const auto &cfg: configs)
+        runBenchmark(cfg, device);
 }

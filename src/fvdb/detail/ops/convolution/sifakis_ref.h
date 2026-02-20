@@ -35,4 +35,18 @@ void sifakisRefSparseConv(uint32_t outputLeafCount,
                           float *d_outputData,
                           cudaStream_t stream = 0);
 
+/// Non-template wrapper around the CUTLASS implicit-GEMM sparse convolution
+/// kernel (AmperePredicatedFprop) with hardcoded IGEMM_Geometry (3x3x3, C=64, K=128).
+///
+/// Same interface as sifakisRefSparseConv but launches the optimized IGEMM
+/// instead of the naive reference.  All pointer arguments must reside in
+/// device memory.
+void sifakisIGemmConv(uint32_t outputLeafCount,
+                      const nanovdb::NanoGrid<nanovdb::ValueOnIndex> *inputGrid,
+                      const nanovdb::NanoGrid<nanovdb::ValueOnIndex> *outputGrid,
+                      const float *d_filterData,
+                      const float *d_inputData,
+                      float *d_outputData,
+                      cudaStream_t stream = 0);
+
 #endif // FVDB_DETAIL_OPS_CONVOLUTION_SIFAKIS_REF_H

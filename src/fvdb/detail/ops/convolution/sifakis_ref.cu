@@ -22,8 +22,6 @@
 
 #include <torch/types.h>
 
-#include <vector>
-
 #include <cute/algorithm/functional.hpp>
 #include <cute/algorithm/gemm.hpp>
 #include <cute/atom/copy_atom.hpp>
@@ -44,6 +42,7 @@
 #include <cutlass/util/print_error.hpp>
 
 #include <random>
+#include <vector>
 
 namespace example {
 
@@ -1318,297 +1317,301 @@ mainSparseConvolutionIGEMM(const std::vector<nanovdb::Coord> &inputPoints,
     cudaStream_t stream;
     cudaCheck(cudaStreamCreate(&stream));
     { // Scope ensures PointsToGrid/MergeGrids/GridHandle destructors run while stream is alive
-    nanovdb::util::cuda::Timer gpuTimer(stream);
+        nanovdb::util::cuda::Timer gpuTimer(stream);
 
-    gpuTimer.start("Building input grid");
-    auto inputBuffer =
-        BufferT::create(inputPoints.size() * sizeof(nanovdb::Coord), nullptr, 0, stream);
-    cudaCheck(cudaMemcpyAsync(inputBuffer.deviceData(),
-                              inputPoints.data(),
-                              inputPoints.size() * sizeof(nanovdb::Coord),
-                              cudaMemcpyHostToDevice,
-                              stream));
-    cudaCheck(cudaStreamSynchronize(stream));
-    nanovdb::tools::cuda::PointsToGrid<BuildT> converter(1.0, nanovdb::Vec3d(0.0), stream);
-    converter.setChecksum(nanovdb::CheckMode::Default);
-    auto inputHandle = converter.getHandle<nanovdb::Coord *, BufferT>(
-        static_cast<nanovdb::Coord *>(inputBuffer.deviceData()), inputPoints.size());
-    auto inputGridDev = inputHandle.deviceGrid<BuildT>();
-    gpuTimer.stop();
+        gpuTimer.start("Building input grid");
+        auto inputBuffer =
+            BufferT::create(inputPoints.size() * sizeof(nanovdb::Coord), nullptr, 0, stream);
+        cudaCheck(cudaMemcpyAsync(inputBuffer.deviceData(),
+                                  inputPoints.data(),
+                                  inputPoints.size() * sizeof(nanovdb::Coord),
+                                  cudaMemcpyHostToDevice,
+                                  stream));
+        cudaCheck(cudaStreamSynchronize(stream));
+        nanovdb::tools::cuda::PointsToGrid<BuildT> converter(1.0, nanovdb::Vec3d(0.0), stream);
+        converter.setChecksum(nanovdb::CheckMode::Default);
+        auto inputHandle = converter.getHandle<nanovdb::Coord *, BufferT>(
+            static_cast<nanovdb::Coord *>(inputBuffer.deviceData()), inputPoints.size());
+        auto inputGridDev = inputHandle.deviceGrid<BuildT>();
+        gpuTimer.stop();
 
-    std::cout << "Input Grid Diagnostics:" << std::endl;
-    printGridDiagnostics(inputHandle);
+        std::cout << "Input Grid Diagnostics:" << std::endl;
+        printGridDiagnostics(inputHandle);
 
-    gpuTimer.start("Building output grid");
-    auto outputBuffer =
-        BufferT::create(outputPoints.size() * sizeof(nanovdb::Coord), nullptr, 0, stream);
-    cudaCheck(cudaMemcpyAsync(outputBuffer.deviceData(),
-                              outputPoints.data(),
-                              outputPoints.size() * sizeof(nanovdb::Coord),
-                              cudaMemcpyHostToDevice,
-                              stream));
-    cudaCheck(cudaStreamSynchronize(stream));
-    converter.setChecksum(nanovdb::CheckMode::Default);
-    auto outputHandle = converter.getHandle<nanovdb::Coord *, BufferT>(
-        static_cast<nanovdb::Coord *>(outputBuffer.deviceData()), outputPoints.size());
-    auto outputGridDev = outputHandle.deviceGrid<BuildT>();
-    gpuTimer.stop();
+        gpuTimer.start("Building output grid");
+        auto outputBuffer =
+            BufferT::create(outputPoints.size() * sizeof(nanovdb::Coord), nullptr, 0, stream);
+        cudaCheck(cudaMemcpyAsync(outputBuffer.deviceData(),
+                                  outputPoints.data(),
+                                  outputPoints.size() * sizeof(nanovdb::Coord),
+                                  cudaMemcpyHostToDevice,
+                                  stream));
+        cudaCheck(cudaStreamSynchronize(stream));
+        converter.setChecksum(nanovdb::CheckMode::Default);
+        auto outputHandle = converter.getHandle<nanovdb::Coord *, BufferT>(
+            static_cast<nanovdb::Coord *>(outputBuffer.deviceData()), outputPoints.size());
+        auto outputGridDev = outputHandle.deviceGrid<BuildT>();
+        gpuTimer.stop();
 
-    std::cout << "Output Grid Diagnostics:" << std::endl;
-    printGridDiagnostics(outputHandle);
+        std::cout << "Output Grid Diagnostics:" << std::endl;
+        printGridDiagnostics(outputHandle);
 
-    // Download grids to host for CPU-side index building
-    inputHandle.deviceDownload(0, stream, false);
-    outputHandle.deviceDownload(0, stream, false);
-    cudaCheck(cudaStreamSynchronize(stream));
-    auto inputGridHost  = inputHandle.grid<BuildT>();
-    auto outputGridHost = outputHandle.grid<BuildT>();
+        // Download grids to host for CPU-side index building
+        inputHandle.deviceDownload(0, stream, false);
+        outputHandle.deviceDownload(0, stream, false);
+        cudaCheck(cudaStreamSynchronize(stream));
+        auto inputGridHost  = inputHandle.grid<BuildT>();
+        auto outputGridHost = outputHandle.grid<BuildT>();
 
-    gpuTimer.start("Merging input/output grids (for testing)");
-    nanovdb::tools::cuda::MergeGrids<BuildT> merger(inputGridDev, outputGridDev, stream);
-    merger.setChecksum(nanovdb::CheckMode::Default);
-    merger.setVerbose(0);
-    auto mergedHandle = merger.getHandle();
-    gpuTimer.stop();
+        gpuTimer.start("Merging input/output grids (for testing)");
+        nanovdb::tools::cuda::MergeGrids<BuildT> merger(inputGridDev, outputGridDev, stream);
+        merger.setChecksum(nanovdb::CheckMode::Default);
+        merger.setVerbose(0);
+        auto mergedHandle = merger.getHandle();
+        gpuTimer.stop();
 
-    std::cout << "Merged Grid Diagnostics:" << std::endl;
-    printGridDiagnostics(mergedHandle);
+        std::cout << "Merged Grid Diagnostics:" << std::endl;
+        printGridDiagnostics(mergedHandle);
 
-    // Allocate and initialize benchmark data
+        // Allocate and initialize benchmark data
 
-    std::random_device rd;
-    // std::mt19937 generator(rd());
-    std::mt19937 generator(23456);
-    std::uniform_int_distribution<int> distribution(-256, 256);
+        std::random_device rd;
+        // std::mt19937 generator(rd());
+        std::mt19937 generator(23456);
+        std::uniform_int_distribution<int> distribution(-256, 256);
 
-    gpuTimer.start("Initializing input (activation) data");
-    auto inputValueCount =
-        nanovdb::util::cuda::DeviceGridTraits<BuildT>::getValueCount(inputGridDev);
-    auto inputVoxelCount =
-        nanovdb::util::cuda::DeviceGridTraits<BuildT>::getActiveVoxelCount(inputGridDev);
-    std::vector<float> h_inputData(inputValueCount * Di);
-    auto inputArray = reinterpret_cast<inputArrayT>(*h_inputData.data());
-    for (int i = 0; i < Di; i++)
-        inputArray[0][i] = 0.f;
-#pragma omp parallel for
-    for (size_t v = 0; v <= inputVoxelCount; v++)
+        gpuTimer.start("Initializing input (activation) data");
+        auto inputValueCount =
+            nanovdb::util::cuda::DeviceGridTraits<BuildT>::getValueCount(inputGridDev);
+        auto inputVoxelCount =
+            nanovdb::util::cuda::DeviceGridTraits<BuildT>::getActiveVoxelCount(inputGridDev);
+        std::vector<float> h_inputData(inputValueCount * Di);
+        auto inputArray = reinterpret_cast<inputArrayT>(*h_inputData.data());
         for (int i = 0; i < Di; i++)
-            inputArray[v][i] =
+            inputArray[0][i] = 0.f;
+#pragma omp parallel for
+        for (size_t v = 0; v <= inputVoxelCount; v++)
+            for (int i = 0; i < Di; i++)
+                inputArray[v][i] = ((float)distribution(generator)) /
+                                   256.0f; // Use only up to 7 bits in the mantissa
+        float *d_inputData = nullptr;
+        cudaCheck(cudaMalloc(&d_inputData, h_inputData.size() * sizeof(float)));
+        cudaCheck(cudaMemcpyAsync(d_inputData,
+                                  h_inputData.data(),
+                                  h_inputData.size() * sizeof(float),
+                                  cudaMemcpyHostToDevice,
+                                  stream));
+        gpuTimer.stop();
+
+        gpuTimer.start("Initializing output (including reference) data");
+        auto outputValueCount =
+            nanovdb::util::cuda::DeviceGridTraits<BuildT>::getValueCount(outputGridDev);
+        auto outputVoxelCount =
+            nanovdb::util::cuda::DeviceGridTraits<BuildT>::getActiveVoxelCount(outputGridDev);
+        std::vector<float> h_outputData(outputValueCount * Do);
+        auto outputArray = reinterpret_cast<outputArrayT>(*h_outputData.data());
+        std::vector<float> h_outputReferenceData(outputValueCount * Do);
+        auto outputReferenceArray = reinterpret_cast<outputArrayT>(*h_outputReferenceData.data());
+#pragma omp parallel for
+        for (size_t v = 1; v <= inputValueCount; v++)
+            for (int i = 0; i < Di; i++)
+                outputArray[v][i] = outputReferenceArray[v][i] = 0.f;
+        for (int i = 0; i < Di; i++)
+            outputArray[0][i] = outputReferenceArray[0][i] =
                 ((float)distribution(generator)) / 256.0f; // Use only up to 7 bits in the mantissa
-    float *d_inputData = nullptr;
-    cudaCheck(cudaMalloc(&d_inputData, h_inputData.size() * sizeof(float)));
-    cudaCheck(cudaMemcpyAsync(d_inputData,
-                              h_inputData.data(),
-                              h_inputData.size() * sizeof(float),
-                              cudaMemcpyHostToDevice,
-                              stream));
-    gpuTimer.stop();
+        float *d_outputData = nullptr;
+        cudaCheck(cudaMalloc(&d_outputData, h_outputData.size() * sizeof(float)));
+        cudaCheck(cudaMemcpyAsync(d_outputData,
+                                  h_outputData.data(),
+                                  h_outputData.size() * sizeof(float),
+                                  cudaMemcpyHostToDevice,
+                                  stream));
+        float *d_outputReferenceData = nullptr;
+        cudaCheck(cudaMalloc(&d_outputReferenceData, h_outputReferenceData.size() * sizeof(float)));
+        cudaCheck(cudaMemcpyAsync(d_outputReferenceData,
+                                  h_outputReferenceData.data(),
+                                  h_outputReferenceData.size() * sizeof(float),
+                                  cudaMemcpyHostToDevice,
+                                  stream));
+        gpuTimer.stop();
 
-    gpuTimer.start("Initializing output (including reference) data");
-    auto outputValueCount =
-        nanovdb::util::cuda::DeviceGridTraits<BuildT>::getValueCount(outputGridDev);
-    auto outputVoxelCount =
-        nanovdb::util::cuda::DeviceGridTraits<BuildT>::getActiveVoxelCount(outputGridDev);
-    std::vector<float> h_outputData(outputValueCount * Do);
-    auto outputArray = reinterpret_cast<outputArrayT>(*h_outputData.data());
-    std::vector<float> h_outputReferenceData(outputValueCount * Do);
-    auto outputReferenceArray = reinterpret_cast<outputArrayT>(*h_outputReferenceData.data());
+        gpuTimer.start("Initializing filter data");
+        const size_t filterElemCount = 3 * 3 * 3 * Do * Di;
+        std::vector<float> h_filterData(filterElemCount);
+        auto filter = reinterpret_cast<filterT>(*h_filterData.data());
 #pragma omp parallel for
-    for (size_t v = 1; v <= inputValueCount; v++)
-        for (int i = 0; i < Di; i++)
-            outputArray[v][i] = outputReferenceArray[v][i] = 0.f;
-    for (int i = 0; i < Di; i++)
-        outputArray[0][i] = outputReferenceArray[0][i] =
-            ((float)distribution(generator)) / 256.0f; // Use only up to 7 bits in the mantissa
-    float *d_outputData = nullptr;
-    cudaCheck(cudaMalloc(&d_outputData, h_outputData.size() * sizeof(float)));
-    cudaCheck(cudaMemcpyAsync(d_outputData,
-                              h_outputData.data(),
-                              h_outputData.size() * sizeof(float),
-                              cudaMemcpyHostToDevice,
-                              stream));
-    float *d_outputReferenceData = nullptr;
-    cudaCheck(cudaMalloc(&d_outputReferenceData, h_outputReferenceData.size() * sizeof(float)));
-    cudaCheck(cudaMemcpyAsync(d_outputReferenceData,
-                              h_outputReferenceData.data(),
-                              h_outputReferenceData.size() * sizeof(float),
-                              cudaMemcpyHostToDevice,
-                              stream));
-    gpuTimer.stop();
+        for (size_t i = 0; i < filterElemCount; i++)
+            h_filterData[i] =
+                ((float)distribution(generator)) / 256.0f; // Use only up to 7 bits in the mantissa
+        float *d_filterData = nullptr;
+        cudaCheck(cudaMalloc(&d_filterData, filterElemCount * sizeof(float)));
+        cudaCheck(cudaMemcpyAsync(d_filterData,
+                                  h_filterData.data(),
+                                  filterElemCount * sizeof(float),
+                                  cudaMemcpyHostToDevice,
+                                  stream));
+        gpuTimer.stop();
 
-    gpuTimer.start("Initializing filter data");
-    const size_t filterElemCount = 3 * 3 * 3 * Do * Di;
-    std::vector<float> h_filterData(filterElemCount);
-    auto filter = reinterpret_cast<filterT>(*h_filterData.data());
-#pragma omp parallel for
-    for (size_t i = 0; i < filterElemCount; i++)
-        h_filterData[i] =
-            ((float)distribution(generator)) / 256.0f; // Use only up to 7 bits in the mantissa
-    float *d_filterData = nullptr;
-    cudaCheck(cudaMalloc(&d_filterData, filterElemCount * sizeof(float)));
-    cudaCheck(cudaMemcpyAsync(d_filterData,
-                              h_filterData.data(),
-                              filterElemCount * sizeof(float),
-                              cudaMemcpyHostToDevice,
-                              stream));
-    gpuTimer.stop();
+        gpuTimer.start("Initializing scatter indices");
+        auto outputLeafCount = outputGridHost->tree().nodeCount(0);
+        auto blockCount =
+            outputLeafCount * IGEMM_Geometry::Bx * IGEMM_Geometry::By * IGEMM_Geometry::Bz;
 
-    gpuTimer.start("Initializing scatter indices");
-    auto outputLeafCount = outputGridHost->tree().nodeCount(0);
-    auto blockCount =
-        outputLeafCount * IGEMM_Geometry::Bx * IGEMM_Geometry::By * IGEMM_Geometry::Bz;
-
-    using ConvOp = AmperePredicatedFprop<IGEMM_Geometry>;
+        using ConvOp = AmperePredicatedFprop<IGEMM_Geometry>;
 #ifdef USE_HIERARCHICAL_BLOCK_TRAVERSAL
-    auto leafShape =
-        make_shape(Int<IGEMM_Geometry::Bx>{}, Int<IGEMM_Geometry::By>{}, Int<IGEMM_Geometry::Bz>{});
-    auto blockedLeafShape  = shape(zipped_divide(make_layout(leafShape), ConvOp::Tiler_N{}));
-    auto blockedLeafLayout = make_ordered_layout(
-        blockedLeafShape, make_tuple(make_tuple(_2{}, _1{}, _0{}), make_tuple(_5{}, _4{}, _3{})));
+        auto leafShape = make_shape(
+            Int<IGEMM_Geometry::Bx>{}, Int<IGEMM_Geometry::By>{}, Int<IGEMM_Geometry::Bz>{});
+        auto blockedLeafShape  = shape(zipped_divide(make_layout(leafShape), ConvOp::Tiler_N{}));
+        auto blockedLeafLayout = make_ordered_layout(
+            blockedLeafShape,
+            make_tuple(make_tuple(_2{}, _1{}, _0{}), make_tuple(_5{}, _4{}, _3{})));
 #endif
 
-    auto outputVoxelsPerBlock = IGEMM_Geometry::Z * IGEMM_Geometry::P * IGEMM_Geometry::Q;
-    using ScatterIndexLegacyT = uint64_t[IGEMM_Geometry::Z][IGEMM_Geometry::P][IGEMM_Geometry::Q];
+        auto outputVoxelsPerBlock = IGEMM_Geometry::Z * IGEMM_Geometry::P * IGEMM_Geometry::Q;
+        using ScatterIndexLegacyT =
+            uint64_t[IGEMM_Geometry::Z][IGEMM_Geometry::P][IGEMM_Geometry::Q];
 #ifndef USE_HIERARCHICAL_BLOCK_TRAVERSAL
-    using ScatterIndexArrayLegacyT =
-        ScatterIndexLegacyT[IGEMM_Geometry::Bx][IGEMM_Geometry::By][IGEMM_Geometry::Bz];
+        using ScatterIndexArrayLegacyT =
+            ScatterIndexLegacyT[IGEMM_Geometry::Bx][IGEMM_Geometry::By][IGEMM_Geometry::Bz];
 #else
-    using ScatterIndexArrayLegacyT =
-        ScatterIndexLegacyT[IGEMM_Geometry::Bx * IGEMM_Geometry::By * IGEMM_Geometry::Bz];
+        using ScatterIndexArrayLegacyT =
+            ScatterIndexLegacyT[IGEMM_Geometry::Bx * IGEMM_Geometry::By * IGEMM_Geometry::Bz];
 #endif
-    std::vector<uint64_t> scatterIndexDataLegacy(blockCount * outputVoxelsPerBlock);
-    auto scatterIndexArrayLegacy =
-        reinterpret_cast<ScatterIndexArrayLegacyT *>(scatterIndexDataLegacy.data());
+        std::vector<uint64_t> scatterIndexDataLegacy(blockCount * outputVoxelsPerBlock);
+        auto scatterIndexArrayLegacy =
+            reinterpret_cast<ScatterIndexArrayLegacyT *>(scatterIndexDataLegacy.data());
 
-    using ScatterIndexArrayT = uint64_t[8][8][8];
-    std::vector<uint64_t> scatterIndexData(outputLeafCount * 512);
-    auto scatterIndexArray = reinterpret_cast<ScatterIndexArrayT *>(scatterIndexData.data());
+        using ScatterIndexArrayT = uint64_t[8][8][8];
+        std::vector<uint64_t> scatterIndexData(outputLeafCount * 512);
+        auto scatterIndexArray = reinterpret_cast<ScatterIndexArrayT *>(scatterIndexData.data());
 
 #pragma omp parallel for
-    for (uint32_t l = 0; l < outputLeafCount; l++) {
-        auto &leaf = outputGridHost->tree().getFirstLeaf()[l];
+        for (uint32_t l = 0; l < outputLeafCount; l++) {
+            auto &leaf = outputGridHost->tree().getFirstLeaf()[l];
 #ifndef USE_HIERARCHICAL_BLOCK_TRAVERSAL
-        for (int bi = 0; bi < IGEMM_Geometry::Bx; bi++)
-            for (int bj = 0; bj < IGEMM_Geometry::By; bj++)
-                for (int bk = 0; bk < IGEMM_Geometry::Bz; bk++) {
+            for (int bi = 0; bi < IGEMM_Geometry::Bx; bi++)
+                for (int bj = 0; bj < IGEMM_Geometry::By; bj++)
+                    for (int bk = 0; bk < IGEMM_Geometry::Bz; bk++) {
 #else
-        for (int bbi = 0; bbi < shape<1, 0>(blockedLeafLayout); ++bbi)
-            for (int bbj = 0; bbj < shape<1, 1>(blockedLeafLayout); ++bbj)
-                for (int bbk = 0; bbk < shape<1, 2>(blockedLeafLayout); ++bbk)
-                    for (int bii = 0; bii < shape<0, 0>(blockedLeafLayout); ++bii)
-                        for (int bjj = 0; bjj < shape<0, 1>(blockedLeafLayout); ++bjj)
-                            for (int bkk = 0; bkk < shape<0, 2>(blockedLeafLayout); ++bkk) {
-                                int bi = bbi * shape<0, 0>(blockedLeafLayout) + bii;
-                                int bj = bbj * shape<0, 1>(blockedLeafLayout) + bjj;
-                                int bk = bbk * shape<0, 2>(blockedLeafLayout) + bkk;
+            for (int bbi = 0; bbi < shape<1, 0>(blockedLeafLayout); ++bbi)
+                for (int bbj = 0; bbj < shape<1, 1>(blockedLeafLayout); ++bbj)
+                    for (int bbk = 0; bbk < shape<1, 2>(blockedLeafLayout); ++bbk)
+                        for (int bii = 0; bii < shape<0, 0>(blockedLeafLayout); ++bii)
+                            for (int bjj = 0; bjj < shape<0, 1>(blockedLeafLayout); ++bjj)
+                                for (int bkk = 0; bkk < shape<0, 2>(blockedLeafLayout); ++bkk) {
+                                    int bi = bbi * shape<0, 0>(blockedLeafLayout) + bii;
+                                    int bj = bbj * shape<0, 1>(blockedLeafLayout) + bjj;
+                                    int bk = bbk * shape<0, 2>(blockedLeafLayout) + bkk;
 #endif
-                    nanovdb::Coord blockOffset(
-                        bi * IGEMM_Geometry::Z, bj * IGEMM_Geometry::P, bk * IGEMM_Geometry::Q);
-                    for (int i = 0; i < IGEMM_Geometry::Z; i++)
-                        for (int j = 0; j < IGEMM_Geometry::P; j++)
-                            for (int k = 0; k < IGEMM_Geometry::Q; k++) {
-                                auto localCoord = blockOffset.offsetBy(i, j, k);
+                        nanovdb::Coord blockOffset(
+                            bi * IGEMM_Geometry::Z, bj * IGEMM_Geometry::P, bk * IGEMM_Geometry::Q);
+                        for (int i = 0; i < IGEMM_Geometry::Z; i++)
+                            for (int j = 0; j < IGEMM_Geometry::P; j++)
+                                for (int k = 0; k < IGEMM_Geometry::Q; k++) {
+                                    auto localCoord = blockOffset.offsetBy(i, j, k);
 #ifndef USE_HIERARCHICAL_BLOCK_TRAVERSAL
-                                scatterIndexArrayLegacy[l][bi][bj][bk][i][j][k] =
-                                    leaf.getValue(localCoord);
+                                    scatterIndexArrayLegacy[l][bi][bj][bk][i][j][k] =
+                                        leaf.getValue(localCoord);
 #else
-                                            scatterIndexArrayLegacy[l][blockedLeafLayout(
-                                                make_tuple(bii, bjj, bkk),
-                                                make_tuple(bbi, bbj, bbk))][i][j][k] =
-                                                leaf.getValue(localCoord);
+                                                scatterIndexArrayLegacy[l][blockedLeafLayout(
+                                                    make_tuple(bii, bjj, bkk),
+                                                    make_tuple(bbi, bbj, bbk))][i][j][k] =
+                                                    leaf.getValue(localCoord);
 #endif
-                            }
-                }
-        for (int i = 0; i < 8; i++)
-            for (int j = 0; j < 8; j++)
-                for (int k = 0; k < 8; k++) {
-                    scatterIndexArray[l][i][j][k] = leaf.getValue(nanovdb::Coord(i, j, k));
-                }
-    }
-    gpuTimer.stop();
+                                }
+                    }
+            for (int i = 0; i < 8; i++)
+                for (int j = 0; j < 8; j++)
+                    for (int k = 0; k < 8; k++) {
+                        scatterIndexArray[l][i][j][k] = leaf.getValue(nanovdb::Coord(i, j, k));
+                    }
+        }
+        gpuTimer.stop();
 
-    gpuTimer.start("Initializing gather indices");
-    auto inputVoxelsPerBlock = IGEMM_Geometry::D * IGEMM_Geometry::H * IGEMM_Geometry::W;
-    using GatherIndexLegacyT = uint64_t[IGEMM_Geometry::D][IGEMM_Geometry::H][IGEMM_Geometry::W];
+        gpuTimer.start("Initializing gather indices");
+        auto inputVoxelsPerBlock = IGEMM_Geometry::D * IGEMM_Geometry::H * IGEMM_Geometry::W;
+        using GatherIndexLegacyT =
+            uint64_t[IGEMM_Geometry::D][IGEMM_Geometry::H][IGEMM_Geometry::W];
 #ifndef USE_HIERARCHICAL_BLOCK_TRAVERSAL
-    using GatherIndexArrayLegacyT =
-        GatherIndexLegacyT[IGEMM_Geometry::Bx][IGEMM_Geometry::By][IGEMM_Geometry::Bz];
+        using GatherIndexArrayLegacyT =
+            GatherIndexLegacyT[IGEMM_Geometry::Bx][IGEMM_Geometry::By][IGEMM_Geometry::Bz];
 #else
-    using GatherIndexArrayLegacyT =
-        GatherIndexLegacyT[IGEMM_Geometry::Bx * IGEMM_Geometry::By * IGEMM_Geometry::Bz];
+        using GatherIndexArrayLegacyT =
+            GatherIndexLegacyT[IGEMM_Geometry::Bx * IGEMM_Geometry::By * IGEMM_Geometry::Bz];
 #endif
-    std::vector<uint64_t> gatherIndexDataLegacy(blockCount * inputVoxelsPerBlock);
-    auto gatherIndexArrayLegacy =
-        reinterpret_cast<GatherIndexArrayLegacyT *>(gatherIndexDataLegacy.data());
+        std::vector<uint64_t> gatherIndexDataLegacy(blockCount * inputVoxelsPerBlock);
+        auto gatherIndexArrayLegacy =
+            reinterpret_cast<GatherIndexArrayLegacyT *>(gatherIndexDataLegacy.data());
 
-    using GatherIndexArrayT = uint64_t[IGEMM_Geometry::Hx][IGEMM_Geometry::Hy][IGEMM_Geometry::Hz];
-    std::vector<uint64_t> gatherIndexData(
-        outputLeafCount * IGEMM_Geometry::Hx * IGEMM_Geometry::Hy * IGEMM_Geometry::Hz);
-    auto gatherIndexArray = reinterpret_cast<GatherIndexArrayT *>(gatherIndexData.data());
+        using GatherIndexArrayT =
+            uint64_t[IGEMM_Geometry::Hx][IGEMM_Geometry::Hy][IGEMM_Geometry::Hz];
+        std::vector<uint64_t> gatherIndexData(outputLeafCount * IGEMM_Geometry::Hx *
+                                              IGEMM_Geometry::Hy * IGEMM_Geometry::Hz);
+        auto gatherIndexArray = reinterpret_cast<GatherIndexArrayT *>(gatherIndexData.data());
 
 #pragma omp parallel for
-    for (uint32_t l = 0; l < outputLeafCount; l++) {
-        auto &outputLeaf  = outputGridHost->tree().getFirstLeaf()[l];
-        const auto origin = outputLeaf.origin();
+        for (uint32_t l = 0; l < outputLeafCount; l++) {
+            auto &outputLeaf  = outputGridHost->tree().getFirstLeaf()[l];
+            const auto origin = outputLeaf.origin();
 #ifndef USE_HIERARCHICAL_BLOCK_TRAVERSAL
-        for (int bi = 0; bi < IGEMM_Geometry::Bx; bi++)
-            for (int bj = 0; bj < IGEMM_Geometry::By; bj++)
-                for (int bk = 0; bk < IGEMM_Geometry::Bz; bk++) {
+            for (int bi = 0; bi < IGEMM_Geometry::Bx; bi++)
+                for (int bj = 0; bj < IGEMM_Geometry::By; bj++)
+                    for (int bk = 0; bk < IGEMM_Geometry::Bz; bk++) {
 #else
-        for (int bbi = 0; bbi < shape<1, 0>(blockedLeafLayout); ++bbi)
-            for (int bbj = 0; bbj < shape<1, 1>(blockedLeafLayout); ++bbj)
-                for (int bbk = 0; bbk < shape<1, 2>(blockedLeafLayout); ++bbk)
-                    for (int bii = 0; bii < shape<0, 0>(blockedLeafLayout); ++bii)
-                        for (int bjj = 0; bjj < shape<0, 1>(blockedLeafLayout); ++bjj)
-                            for (int bkk = 0; bkk < shape<0, 2>(blockedLeafLayout); ++bkk) {
-                                int bi = bbi * shape<0, 0>(blockedLeafLayout) + bii;
-                                int bj = bbj * shape<0, 1>(blockedLeafLayout) + bjj;
-                                int bk = bbk * shape<0, 2>(blockedLeafLayout) + bkk;
+            for (int bbi = 0; bbi < shape<1, 0>(blockedLeafLayout); ++bbi)
+                for (int bbj = 0; bbj < shape<1, 1>(blockedLeafLayout); ++bbj)
+                    for (int bbk = 0; bbk < shape<1, 2>(blockedLeafLayout); ++bbk)
+                        for (int bii = 0; bii < shape<0, 0>(blockedLeafLayout); ++bii)
+                            for (int bjj = 0; bjj < shape<0, 1>(blockedLeafLayout); ++bjj)
+                                for (int bkk = 0; bkk < shape<0, 2>(blockedLeafLayout); ++bkk) {
+                                    int bi = bbi * shape<0, 0>(blockedLeafLayout) + bii;
+                                    int bj = bbj * shape<0, 1>(blockedLeafLayout) + bjj;
+                                    int bk = bbk * shape<0, 2>(blockedLeafLayout) + bkk;
 #endif
-                    nanovdb::Coord blockOffset(
-                        bi * IGEMM_Geometry::Z, bj * IGEMM_Geometry::P, bk * IGEMM_Geometry::Q);
-                    for (int i = 0; i < IGEMM_Geometry::D; i++)
-                        for (int j = 0; j < IGEMM_Geometry::H; j++)
-                            for (int k = 0; k < IGEMM_Geometry::W; k++) {
-                                auto localCoord  = blockOffset.offsetBy(i + IGEMM_Geometry::Dx,
-                                                                       j + IGEMM_Geometry::Dy,
-                                                                       k + IGEMM_Geometry::Dz);
-                                auto globalCoord = origin + localCoord;
+                        nanovdb::Coord blockOffset(
+                            bi * IGEMM_Geometry::Z, bj * IGEMM_Geometry::P, bk * IGEMM_Geometry::Q);
+                        for (int i = 0; i < IGEMM_Geometry::D; i++)
+                            for (int j = 0; j < IGEMM_Geometry::H; j++)
+                                for (int k = 0; k < IGEMM_Geometry::W; k++) {
+                                    auto localCoord  = blockOffset.offsetBy(i + IGEMM_Geometry::Dx,
+                                                                           j + IGEMM_Geometry::Dy,
+                                                                           k + IGEMM_Geometry::Dz);
+                                    auto globalCoord = origin + localCoord;
 #ifndef USE_HIERARCHICAL_BLOCK_TRAVERSAL
-                                gatherIndexArrayLegacy[l][bi][bj][bk][i][j][k] =
-                                    inputGridHost->tree().getValue(globalCoord);
+                                    gatherIndexArrayLegacy[l][bi][bj][bk][i][j][k] =
+                                        inputGridHost->tree().getValue(globalCoord);
 #else
-                                            gatherIndexArrayLegacy[l][blockedLeafLayout(
-                                                make_tuple(bii, bjj, bkk),
-                                                make_tuple(bbi, bbj, bbk))][i][j][k] =
-                                                inputGridHost->tree().getValue(globalCoord);
+                                                gatherIndexArrayLegacy[l][blockedLeafLayout(
+                                                    make_tuple(bii, bjj, bkk),
+                                                    make_tuple(bbi, bbj, bbk))][i][j][k] =
+                                                    inputGridHost->tree().getValue(globalCoord);
 #endif
-                            }
-                }
+                                }
+                    }
 
-        auto offsetOrigin =
-            origin.offsetBy(IGEMM_Geometry::Dx, IGEMM_Geometry::Dy, IGEMM_Geometry::Dz);
-        for (int i = 0; i < IGEMM_Geometry::Hx; ++i)
-            for (int j = 0; j < IGEMM_Geometry::Hy; ++j)
-                for (int k = 0; k < IGEMM_Geometry::Hz; ++k)
-                    gatherIndexArray[l][i][j][k] =
-                        inputGridHost->tree().getValue(offsetOrigin + nanovdb::Coord(i, j, k));
-    }
-    gpuTimer.stop();
+            auto offsetOrigin =
+                origin.offsetBy(IGEMM_Geometry::Dx, IGEMM_Geometry::Dy, IGEMM_Geometry::Dz);
+            for (int i = 0; i < IGEMM_Geometry::Hx; ++i)
+                for (int j = 0; j < IGEMM_Geometry::Hy; ++j)
+                    for (int k = 0; k < IGEMM_Geometry::Hz; ++k)
+                        gatherIndexArray[l][i][j][k] =
+                            inputGridHost->tree().getValue(offsetOrigin + nanovdb::Coord(i, j, k));
+        }
+        gpuTimer.stop();
 
-    cudaCheck(cudaStreamSynchronize(stream));
+        cudaCheck(cudaStreamSynchronize(stream));
 
-    gpuTimer.start("Reference (GPU) execution");
-    SparseConvolveCudaReference<IGEMM_Geometry, Di, Do>(
-        outputLeafCount,
-        inputGridDev,
-        outputGridDev,
-        reinterpret_cast<const float(*)[IGEMM_Geometry::R][IGEMM_Geometry::S][Do][Di]>(
-            d_filterData),
-        reinterpret_cast<const float(*)[Di]>(d_inputData),
-        reinterpret_cast<float(*)[Do]>(d_outputReferenceData),
-        stream);
-    gpuTimer.stop();
+        gpuTimer.start("Reference (GPU) execution");
+        SparseConvolveCudaReference<IGEMM_Geometry, Di, Do>(
+            outputLeafCount,
+            inputGridDev,
+            outputGridDev,
+            reinterpret_cast<const float(*)[IGEMM_Geometry::R][IGEMM_Geometry::S][Do][Di]>(
+                d_filterData),
+            reinterpret_cast<const float(*)[Di]>(d_inputData),
+            reinterpret_cast<float(*)[Do]>(d_outputReferenceData),
+            stream);
+        gpuTimer.stop();
 
 #if 0
     // CPU version; may be extremely slow for all but the smallest resolutions
@@ -1643,46 +1646,50 @@ mainSparseConvolutionIGEMM(const std::vector<nanovdb::Coord> &inputPoints,
     );
 #endif
 
-    IGEMM_Layouts<IGEMM_Geometry> layouts;
+        IGEMM_Layouts<IGEMM_Geometry> layouts;
 
-    Tensor tFilter = make_tensor(make_gmem_ptr(d_filterData), layouts.filterLayout());
+        Tensor tFilter = make_tensor(make_gmem_ptr(d_filterData), layouts.filterLayout());
 
-    constexpr size_t smem_size =
-        sizeof(typename AmperePredicatedFprop<IGEMM_Geometry>::SharedStorage);
-    std::cout << "smem_size = " << smem_size << std::endl;
+        constexpr size_t smem_size =
+            sizeof(typename AmperePredicatedFprop<IGEMM_Geometry>::SharedStorage);
+        std::cout << "smem_size = " << smem_size << std::endl;
 
-    cudaCheck(cudaFuncSetAttribute(
-        kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>, BuildT, decltype(tFilter)>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        smem_size));
+        cudaCheck(
+            cudaFuncSetAttribute(kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>,
+                                                          BuildT,
+                                                          decltype(tFilter)>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 smem_size));
 
-    int num_iterations = 10;
-    for (int i = 0; i < num_iterations; ++i) {
-        gpuTimer.start("Scatter-Gather Cutlass IGEMM (GPU) execution");
-        kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>, BuildT, decltype(tFilter)>
-            <<<outputLeafCount,
-               AmperePredicatedFprop<IGEMM_Geometry>::MaxThreadsPerBlock,
-               smem_size,
-               stream>>>(tFilter, inputGridDev, outputGridDev, d_inputData, d_outputData);
-        gpuTimer.stop();
-    }
+        int num_iterations = 10;
+        for (int i = 0; i < num_iterations; ++i) {
+            gpuTimer.start("Scatter-Gather Cutlass IGEMM (GPU) execution");
+            kernel_entrypoint_custom<AmperePredicatedFprop<IGEMM_Geometry>,
+                                     BuildT,
+                                     decltype(tFilter)>
+                <<<outputLeafCount,
+                   AmperePredicatedFprop<IGEMM_Geometry>::MaxThreadsPerBlock,
+                   smem_size,
+                   stream>>>(tFilter, inputGridDev, outputGridDev, d_inputData, d_outputData);
+            gpuTimer.stop();
+        }
 
-    cudaCheck(cudaStreamSynchronize(stream));
-    cudaCheck(cudaMemcpy(h_outputData.data(),
-                         d_outputData,
-                         h_outputData.size() * sizeof(float),
-                         cudaMemcpyDeviceToHost));
-    cudaCheck(cudaMemcpy(h_outputReferenceData.data(),
-                         d_outputReferenceData,
-                         h_outputReferenceData.size() * sizeof(float),
-                         cudaMemcpyDeviceToHost));
+        cudaCheck(cudaStreamSynchronize(stream));
+        cudaCheck(cudaMemcpy(h_outputData.data(),
+                             d_outputData,
+                             h_outputData.size() * sizeof(float),
+                             cudaMemcpyDeviceToHost));
+        cudaCheck(cudaMemcpy(h_outputReferenceData.data(),
+                             d_outputReferenceData,
+                             h_outputReferenceData.size() * sizeof(float),
+                             cudaMemcpyDeviceToHost));
 
-    ResultCompare<Do>(outputValueCount, outputArray, outputReferenceArray);
+        ResultCompare<Do>(outputValueCount, outputArray, outputReferenceArray);
 
-    cudaCheck(cudaFree(d_inputData));
-    cudaCheck(cudaFree(d_outputData));
-    cudaCheck(cudaFree(d_outputReferenceData));
-    cudaCheck(cudaFree(d_filterData));
+        cudaCheck(cudaFree(d_inputData));
+        cudaCheck(cudaFree(d_outputData));
+        cudaCheck(cudaFree(d_outputReferenceData));
+        cudaCheck(cudaFree(d_filterData));
     } // CUDA objects destroyed here, stream still alive
     cudaCheck(cudaStreamSynchronize(stream));
     cudaCheck(cudaStreamDestroy(stream));
@@ -1809,4 +1816,28 @@ sifakisRefSparseConv(uint32_t outputLeafCount,
         reinterpret_cast<const float(*)[G::C]>(d_inputData),
         reinterpret_cast<float(*)[G::K]>(d_outputData),
         stream);
+}
+
+void
+sifakisIGemmConv(uint32_t outputLeafCount,
+                 const nanovdb::NanoGrid<nanovdb::ValueOnIndex> *inputGrid,
+                 const nanovdb::NanoGrid<nanovdb::ValueOnIndex> *outputGrid,
+                 const float *d_filterData,
+                 const float *d_inputData,
+                 float *d_outputData,
+                 cudaStream_t stream) {
+    using BuildT = nanovdb::ValueOnIndex;
+    using ConvOp = AmperePredicatedFprop<IGEMM_Geometry>;
+
+    IGEMM_Layouts<IGEMM_Geometry> layouts;
+    auto tFilter = make_tensor(make_gmem_ptr(d_filterData), layouts.filterLayout());
+
+    constexpr size_t smem_size = sizeof(typename ConvOp::SharedStorage);
+    cudaFuncSetAttribute(kernel_entrypoint_custom<ConvOp, BuildT, decltype(tFilter)>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         smem_size);
+
+    kernel_entrypoint_custom<ConvOp, BuildT, decltype(tFilter)>
+        <<<outputLeafCount, ConvOp::MaxThreadsPerBlock, smem_size, stream>>>(
+            tFilter, inputGrid, outputGrid, d_inputData, d_outputData);
 }
