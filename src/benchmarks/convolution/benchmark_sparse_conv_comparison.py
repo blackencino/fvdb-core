@@ -2,21 +2,22 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Python-level benchmark comparing fVDB sparse convolution against other sparse
-# convolution libraries (spconv, torchsparse, MinkowskiEngine) and dense PyTorch
-# conv3d.  All libraries receive identical voxel coordinates and features so the
-# comparison is apples-to-apples.
+# convolution libraries (spconv, torchsparse, MinkowskiEngine).  All libraries
+# receive identical GridBatch / JaggedTensor inputs so the comparison reflects
+# the production pipeline where data lives in fVDB grids.
+#
+# The benchmark measures four phases per iteration:
+#   1. build_topology  - create convolution plan / kernel map / native structures
+#   2. pre_execute     - convert features/weights to library-native format
+#   3. execute         - run the actual convolution kernel
+#   4. post_execute    - convert output back to common format
+#
+# Primary metric:   e2e          (all 4 phases)
+# Secondary metric: all_execute  (phases 2-4, topology excluded)
 #
 # Usage:
-#   # Install optional competitors into the current conda env
-#   python benchmark_sparse_conv_comparison.py --install-deps
-#
-#   # Run the full benchmark suite (benchmarks whatever is installed)
 #   python benchmark_sparse_conv_comparison.py --output comparison_results.json
-#
-#   # Run a specific suite
 #   python benchmark_sparse_conv_comparison.py --suite sparsity --output sparsity_results.json
-#
-#   # List available backends
 #   python benchmark_sparse_conv_comparison.py --list-backends
 #
 
@@ -34,7 +35,6 @@ from datetime import datetime, timezone
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 
 # ---------------------------------------------------------------------------
 # Dependency installation
@@ -98,14 +98,42 @@ def generate_sparse_coords(bbox_dim: int, occupancy_pct: int, seed: int = 42) ->
     return ijk
 
 
+def prepare_benchmark_inputs(
+    ijk: torch.Tensor,
+    in_channels: int,
+    out_channels: int,
+    kernel_size: int,
+    device: torch.device,
+) -> tuple:
+    """Build GridBatch, JaggedTensor features, and weight tensor from raw ijk.
+
+    The GridBatch construction happens *outside* the timed region -- it is a
+    given input that all adapters receive identically.
+
+    Returns ``(grid, features, weights)`` where *grid* serves as both src and
+    dst for sub-manifold (stride=1) convolution.
+    """
+    import fvdb
+
+    ijk_dev = ijk.to(device)
+    grid = fvdb.GridBatch.from_ijk(fvdb.JaggedTensor(ijk_dev), voxel_sizes=1, origins=0, device=device)
+    torch.manual_seed(0)
+    features = grid.jagged_like(torch.randn(grid.total_voxels, in_channels, device=device))
+    weights = torch.randn(out_channels, in_channels, kernel_size, kernel_size, kernel_size, device=device)
+    return grid, features, weights
+
+
 # ---------------------------------------------------------------------------
 # Abstract backend adapter
 # ---------------------------------------------------------------------------
 
 
 class BackendAdapter(abc.ABC):
-    """Thin adapter translating common (ijk, features, weights) into a
-    library-specific sparse convolution call."""
+    """Phased adapter for library-specific sparse convolution.
+
+    All adapters receive the same ``(GridBatch, JaggedTensor, Tensor)`` inputs,
+    ensuring the comparison reflects the production pipeline.
+    """
 
     @property
     @abc.abstractmethod
@@ -116,42 +144,94 @@ class BackendAdapter(abc.ABC):
     def available() -> bool: ...
 
     @abc.abstractmethod
-    def setup(
+    def build_topology(
         self,
-        ijk: torch.Tensor,
-        in_channels: int,
-        out_channels: int,
         kernel_size: int,
-        device: torch.device,
-        bbox_dim: int,
+        stride: int,
+        src: Any,  # fvdb.GridBatch
+        dst: Any,  # fvdb.GridBatch
+        channels_in: int,
+        channels_out: int,
     ) -> None:
-        """Build library-native structures.  *ijk* is (N, 3) int32 CPU."""
+        """Phase 1: build internal structures from GridBatch topology."""
         ...
 
+    def pre_execute(self, features: Any, weights: torch.Tensor) -> tuple[Any, Any]:
+        """Phase 2a: convert features/weights to library-native format."""
+        return features, weights
+
     @abc.abstractmethod
-    def forward(self) -> torch.Tensor:
-        """Run one forward convolution, return output tensor."""
+    def execute(self, features: Any, weights: Any) -> Any:
+        """Phase 2b: run the convolution kernel."""
         ...
+
+    def post_execute(self, output: Any) -> Any:
+        """Phase 2c: convert output back (default: identity)."""
+        return output
 
     def teardown(self) -> None:
         """Release resources (optional)."""
         pass
 
-    def setup_time_ms(self) -> float:
-        """Return the time spent in setup(), measured by the harness."""
-        return self._setup_time_ms
-
-    @property
-    def num_voxels(self) -> int:
-        return self._num_voxels
-
 
 # ---------------------------------------------------------------------------
-# fVDB adapter
+# fVDB plan-based adapter (base for all ConvolutionPlan backends)
 # ---------------------------------------------------------------------------
 
 
-class FVDBAdapter(BackendAdapter):
+class _FVDBPlanAdapter(BackendAdapter):
+    """Shared implementation for all fVDB ConvolutionPlan-based backends.
+
+    Subclasses only need to set ``name``, ``available()``, and the three
+    class-level knobs: ``_expert_config``, ``_dtype``, ``_channel_alignment``.
+    """
+
+    _expert_config: dict[str, Any] = {"backend": "default"}
+    _dtype: torch.dtype = torch.float32
+    _channel_alignment: int = 1
+
+    def build_topology(self, kernel_size, stride, src, dst, channels_in, channels_out):
+        import fvdb
+
+        a = self._channel_alignment
+        if a > 1 and (channels_in % a != 0 or channels_out % a != 0):
+            raise ValueError(f"{self.name} requires channels divisible by {a}")
+        backend_name = self._expert_config.get("backend", "default")
+        target = None if backend_name == "dense" else dst
+        self._plan = fvdb.ConvolutionPlan.from_grid_batch(
+            kernel_size=kernel_size,
+            stride=stride,
+            source_grid=src,
+            target_grid=target,
+            expert_config=self._expert_config,
+        )
+
+    def pre_execute(self, features, weights):
+        if self._dtype == torch.float32:
+            return features, weights
+        import fvdb
+
+        feat_data = features.jdata
+        if feat_data.dtype != self._dtype:
+            features = fvdb.JaggedTensor(feat_data.to(self._dtype))
+        if weights.dtype != self._dtype:
+            weights = weights.to(self._dtype)
+        return features, weights
+
+    def execute(self, features, weights):
+        return self._plan.execute(features, weights)
+
+    def teardown(self):
+        if hasattr(self, "_plan"):
+            del self._plan
+
+
+# ---------------------------------------------------------------------------
+# Concrete fVDB adapters
+# ---------------------------------------------------------------------------
+
+
+class FVDBAdapter(_FVDBPlanAdapter):
     name = "fVDB"
 
     @staticmethod
@@ -163,38 +243,12 @@ class FVDBAdapter(BackendAdapter):
         except ImportError:
             return False
 
-    def setup(self, ijk, in_channels, out_channels, kernel_size, device, bbox_dim):
-        import fvdb
 
-        self._num_voxels = ijk.shape[0]
-        ijk_dev = ijk.to(device)
-        jt = fvdb.JaggedTensor(ijk_dev)
-        self._grid = fvdb.GridBatch.from_ijk(jt, voxel_sizes=1, origins=0, device=device)
-        self._plan = fvdb.ConvolutionPlan.from_grid_batch(
-            kernel_size=kernel_size,
-            stride=1,
-            source_grid=self._grid,
-            target_grid=self._grid,
-        )
-        torch.manual_seed(0)
-        n = self._grid.total_voxels
-        self._features = torch.randn(n, in_channels, device=device)
-        self._weights = torch.randn(out_channels, in_channels, kernel_size, kernel_size, kernel_size, device=device)
-
-    def forward(self):
-        return self._plan.execute(self._features, self._weights)
-
-    def teardown(self):
-        del self._plan, self._grid, self._features, self._weights
-
-
-# ---------------------------------------------------------------------------
-# fVDB CUTLASS grouped-GEMM adapter
-# ---------------------------------------------------------------------------
-
-
-class FVDBCutlassAdapter(BackendAdapter):
+class FVDBCutlassAdapter(_FVDBPlanAdapter):
     name = "fVDB (CUTLASS)"
+    _expert_config = {"backend": "cutlass"}
+    _dtype = torch.float16
+    _channel_alignment = 32
 
     @staticmethod
     def available() -> bool:
@@ -206,44 +260,12 @@ class FVDBCutlassAdapter(BackendAdapter):
         except (ImportError, AttributeError):
             return False
 
-    def setup(self, ijk, in_channels, out_channels, kernel_size, device, bbox_dim):
-        if in_channels % 32 != 0 or out_channels % 32 != 0:
-            raise ValueError("CUTLASS requires channels divisible by 32")
 
-        import fvdb
-
-        self._num_voxels = ijk.shape[0]
-        ijk_dev = ijk.to(device)
-        jt = fvdb.JaggedTensor(ijk_dev)
-        self._grid = fvdb.GridBatch.from_ijk(jt, voxel_sizes=1, origins=0, device=device)
-        self._plan = fvdb.ConvolutionPlan.from_grid_batch(
-            kernel_size=kernel_size,
-            stride=1,
-            source_grid=self._grid,
-            target_grid=self._grid,
-            expert_config={"backend": "cutlass"},
-        )
-        torch.manual_seed(0)
-        n = self._grid.total_voxels
-        self._features = torch.randn(n, in_channels, device=device, dtype=torch.float16)
-        self._weights = torch.randn(
-            out_channels, in_channels, kernel_size, kernel_size, kernel_size, device=device, dtype=torch.float16
-        )
-
-    def forward(self):
-        return self._plan.execute(self._features, self._weights)
-
-    def teardown(self):
-        del self._plan, self._grid, self._features, self._weights
-
-
-# ---------------------------------------------------------------------------
-# fVDB implicit GEMM adapter (CUTLASS 3.x gather-GEMM-scatter)
-# ---------------------------------------------------------------------------
-
-
-class FVDBImplicitGemmAdapter(BackendAdapter):
+class FVDBImplicitGemmAdapter(_FVDBPlanAdapter):
     name = "fVDB (ImplicitGEMM)"
+    _expert_config = {"backend": "implicit_gemm"}
+    _dtype = torch.float16
+    _channel_alignment = 8
 
     @staticmethod
     def available() -> bool:
@@ -257,44 +279,11 @@ class FVDBImplicitGemmAdapter(BackendAdapter):
         except (ImportError, AttributeError):
             return False
 
-    def setup(self, ijk, in_channels, out_channels, kernel_size, device, bbox_dim):
-        if in_channels % 8 != 0 or out_channels % 8 != 0:
-            raise ValueError("Implicit GEMM (fp16) requires channels divisible by 8")
 
-        import fvdb
-
-        self._num_voxels = ijk.shape[0]
-        ijk_dev = ijk.to(device)
-        jt = fvdb.JaggedTensor(ijk_dev)
-        self._grid = fvdb.GridBatch.from_ijk(jt, voxel_sizes=1, origins=0, device=device)
-        self._plan = fvdb.ConvolutionPlan.from_grid_batch(
-            kernel_size=kernel_size,
-            stride=1,
-            source_grid=self._grid,
-            target_grid=self._grid,
-            expert_config={"backend": "implicit_gemm"},
-        )
-        torch.manual_seed(0)
-        n = self._grid.total_voxels
-        self._features = torch.randn(n, in_channels, device=device, dtype=torch.float16)
-        self._weights = torch.randn(
-            out_channels, in_channels, kernel_size, kernel_size, kernel_size, device=device, dtype=torch.float16
-        )
-
-    def forward(self):
-        return self._plan.execute(self._features, self._weights)
-
-    def teardown(self):
-        del self._plan, self._grid, self._features, self._weights
-
-
-# ---------------------------------------------------------------------------
-# fVDB superblock GEMM adapter (compacted active-voxel GEMM)
-# ---------------------------------------------------------------------------
-
-
-class FVDBSuperblockAdapter(BackendAdapter):
+class FVDBSuperblockAdapter(_FVDBPlanAdapter):
     name = "fVDB (Superblock)"
+    _expert_config = {"backend": "superblock"}
+    _channel_alignment = 32
 
     @staticmethod
     def available() -> bool:
@@ -308,35 +297,19 @@ class FVDBSuperblockAdapter(BackendAdapter):
         except (ImportError, AttributeError):
             return False
 
-    def setup(self, ijk, in_channels, out_channels, kernel_size, device, bbox_dim):
-        if in_channels % 32 != 0 or out_channels % 32 != 0:
-            raise ValueError("Superblock requires channels divisible by 32")
 
-        import fvdb
+class FVDBDenseAdapter(_FVDBPlanAdapter):
+    name = "fVDB (Dense)"
+    _expert_config = {"backend": "dense"}
 
-        self._num_voxels = ijk.shape[0]
-        ijk_dev = ijk.to(device)
-        jt = fvdb.JaggedTensor(ijk_dev)
-        self._grid = fvdb.GridBatch.from_ijk(jt, voxel_sizes=1, origins=0, device=device)
-        self._plan = fvdb.ConvolutionPlan.from_grid_batch(
-            kernel_size=kernel_size,
-            stride=1,
-            source_grid=self._grid,
-            target_grid=self._grid,
-            expert_config={"backend": "superblock"},
-        )
-        torch.manual_seed(0)
-        n = self._grid.total_voxels
-        self._features = torch.randn(n, in_channels, device=device, dtype=torch.float32)
-        self._weights = torch.randn(
-            out_channels, in_channels, kernel_size, kernel_size, kernel_size, device=device, dtype=torch.float32
-        )
+    @staticmethod
+    def available() -> bool:
+        try:
+            import fvdb  # noqa: F401
 
-    def forward(self):
-        return self._plan.execute(self._features, self._weights)
-
-    def teardown(self):
-        del self._plan, self._grid, self._features, self._weights
+            return True
+        except ImportError:
+            return False
 
 
 # ---------------------------------------------------------------------------
@@ -356,26 +329,38 @@ class SpconvAdapter(BackendAdapter):
         except ImportError:
             return False
 
-    def setup(self, ijk, in_channels, out_channels, kernel_size, device, bbox_dim):
+    def build_topology(self, kernel_size, stride, src, dst, channels_in, channels_out):
         import spconv.pytorch as spconv
 
-        self._num_voxels = ijk.shape[0]
-        batch_idx = torch.zeros(ijk.shape[0], 1, dtype=torch.int32)
-        indices = torch.cat([batch_idx, ijk], dim=1).to(device)
-        torch.manual_seed(0)
-        features = torch.randn(ijk.shape[0], in_channels, device=device)
-        spatial_shape = [bbox_dim] * 3
-        self._input = spconv.SparseConvTensor(features, indices, spatial_shape, batch_size=1)
-        self._conv = spconv.SubMConv3d(in_channels, out_channels, kernel_size, bias=False, indice_key="bench").to(
-            device
-        )
+        ijk_flat = src.ijk.jdata
+        batch_idx = src.jidx.int()
 
-    def forward(self):
-        self._input.indice_dict = {}
-        return self._conv(self._input).features
+        # Shift coordinates to non-negative (spconv requirement)
+        ijk_min = ijk_flat.min(dim=0).values
+        shifted_ijk = (ijk_flat - ijk_min).int()
+
+        self._indices = torch.cat([batch_idx.unsqueeze(1), shifted_ijk], dim=1)
+        spatial_max = shifted_ijk.max(dim=0).values + 1
+        self._spatial_shape = spatial_max.cpu().tolist()
+        self._batch_size = src.grid_count
+        self._conv = spconv.SubMConv3d(channels_in, channels_out, kernel_size, bias=False).to(ijk_flat.device)
+
+    def pre_execute(self, features, weights):
+        import spconv.pytorch as spconv
+
+        inp = spconv.SparseConvTensor(features.jdata, self._indices, self._spatial_shape, batch_size=self._batch_size)
+        return inp, weights
+
+    def execute(self, sparse_input, weights):
+        return self._conv(sparse_input)
+
+    def post_execute(self, output):
+        return output.features
 
     def teardown(self):
-        del self._conv, self._input
+        for attr in ("_conv", "_indices"):
+            if hasattr(self, attr):
+                delattr(self, attr)
 
 
 # ---------------------------------------------------------------------------
@@ -392,26 +377,53 @@ class TorchSparseAdapter(BackendAdapter):
             import torchsparse  # noqa: F401
 
             return True
-        except ImportError:
+        except (ImportError, RuntimeError):
             return False
 
-    def setup(self, ijk, in_channels, out_channels, kernel_size, device, bbox_dim):
-        import torchsparse
+    @staticmethod
+    def _clear_caches() -> None:
+        """Best-effort clearing of all torchsparse kmap / hash caches."""
+        try:
+            import torchsparse.backends
+
+            for attr_name in dir(torchsparse.backends):
+                backend = getattr(torchsparse.backends, attr_name, None)
+                if backend is not None and hasattr(backend, "kmap_cache"):
+                    backend.kmap_cache.clear()
+        except Exception:
+            pass
+
+    def build_topology(self, kernel_size, stride, src, dst, channels_in, channels_out):
         import torchsparse.nn as spnn
 
-        self._num_voxels = ijk.shape[0]
-        batch_idx = torch.zeros(ijk.shape[0], 1, dtype=torch.int32)
-        coords = torch.cat([ijk, batch_idx], dim=1).int()
-        torch.manual_seed(0)
-        features = torch.randn(ijk.shape[0], in_channels, device=device)
-        self._input = torchsparse.SparseTensor(feats=features, coords=coords.to(device))
-        self._conv = spnn.Conv3d(in_channels, out_channels, kernel_size=kernel_size, stride=1, bias=False).to(device)
+        self._clear_caches()
+        ijk_flat = src.ijk.jdata
+        batch_idx = src.jidx.int()
 
-    def forward(self):
-        return self._conv(self._input).feats
+        # torchsparse coords: [i, j, k, batch_idx]
+        self._coords = torch.cat([ijk_flat.int(), batch_idx.unsqueeze(1)], dim=1)
+        self._conv = spnn.Conv3d(channels_in, channels_out, kernel_size=kernel_size, stride=stride, bias=False).to(
+            ijk_flat.device
+        )
+
+    def pre_execute(self, features, weights):
+        import torchsparse
+
+        self._clear_caches()
+        inp = torchsparse.SparseTensor(feats=features.jdata, coords=self._coords)
+        return inp, weights
+
+    def execute(self, sparse_input, weights):
+        return self._conv(sparse_input)
+
+    def post_execute(self, output):
+        return output.feats
 
     def teardown(self):
-        del self._conv, self._input
+        for attr in ("_conv", "_coords"):
+            if hasattr(self, attr):
+                delattr(self, attr)
+        self._clear_caches()
 
 
 # ---------------------------------------------------------------------------
@@ -431,55 +443,44 @@ class MinkowskiAdapter(BackendAdapter):
         except ImportError:
             return False
 
-    def setup(self, ijk, in_channels, out_channels, kernel_size, device, bbox_dim):
+    def build_topology(self, kernel_size, stride, src, dst, channels_in, channels_out):
         import MinkowskiEngine as ME
 
-        self._num_voxels = ijk.shape[0]
-        batch_idx = torch.zeros(ijk.shape[0], 1, dtype=torch.int32)
-        coords = torch.cat([batch_idx, ijk], dim=1).int()
-        torch.manual_seed(0)
-        features = torch.randn(ijk.shape[0], in_channels, device=device)
-        self._input = ME.SparseTensor(features=features, coordinates=coords, device=device)
+        ijk_flat = src.ijk.jdata
+        batch_idx = src.jidx.int()
+
+        # ME coords: [batch_idx, i, j, k]
+        self._coords = torch.cat([batch_idx.unsqueeze(1), ijk_flat.int()], dim=1)
+        self._device = ijk_flat.device
         self._conv = ME.MinkowskiConvolution(
-            in_channels=in_channels,
-            out_channels=out_channels,
+            in_channels=channels_in,
+            out_channels=channels_out,
             kernel_size=kernel_size,
-            stride=1,
+            stride=stride,
             bias=False,
             dimension=3,
-        ).to(device)
+        ).to(self._device)
 
-    def forward(self):
-        return self._conv(self._input).F
+    def pre_execute(self, features, weights):
+        import MinkowskiEngine as ME
 
-    def teardown(self):
-        del self._conv, self._input
+        try:
+            ME.clear_global_coords_man()
+        except Exception:
+            pass
+        inp = ME.SparseTensor(features=features.jdata, coordinates=self._coords, device=self._device)
+        return inp, weights
 
+    def execute(self, sparse_input, weights):
+        return self._conv(sparse_input)
 
-# ---------------------------------------------------------------------------
-# Dense PyTorch conv3d adapter
-# ---------------------------------------------------------------------------
-
-
-class DenseAdapter(BackendAdapter):
-    name = "Dense (conv3d)"
-
-    @staticmethod
-    def available() -> bool:
-        return True
-
-    def setup(self, ijk, in_channels, out_channels, kernel_size, device, bbox_dim):
-        self._num_voxels = bbox_dim**3
-        torch.manual_seed(0)
-        self._input = torch.randn(1, in_channels, bbox_dim, bbox_dim, bbox_dim, device=device)
-        self._weight = torch.randn(out_channels, in_channels, kernel_size, kernel_size, kernel_size, device=device)
-        self._padding = kernel_size // 2
-
-    def forward(self):
-        return F.conv3d(self._input, self._weight, padding=self._padding)
+    def post_execute(self, output):
+        return output.F
 
     def teardown(self):
-        del self._input, self._weight
+        for attr in ("_conv", "_coords"):
+            if hasattr(self, attr):
+                delattr(self, attr)
 
 
 # ---------------------------------------------------------------------------
@@ -491,10 +492,10 @@ ALL_ADAPTERS: list[type[BackendAdapter]] = [
     FVDBCutlassAdapter,
     FVDBImplicitGemmAdapter,
     FVDBSuperblockAdapter,
+    FVDBDenseAdapter,
     SpconvAdapter,
     TorchSparseAdapter,
     MinkowskiAdapter,
-    DenseAdapter,
 ]
 
 
@@ -513,13 +514,27 @@ class BenchmarkResult:
     suite: str
     params: dict[str, Any]
     num_voxels: int
-    setup_ms: float
-    mean_ms: float
-    std_ms: float
-    min_ms: float
-    max_ms: float
     num_iters: int
-    times_ms: list[float] = field(default_factory=list)
+    # Per-phase means
+    topology_mean_ms: float
+    pre_execute_mean_ms: float
+    execute_mean_ms: float
+    post_execute_mean_ms: float
+    # Aggregate: all_execute = pre + execute + post (secondary metric)
+    all_execute_mean_ms: float
+    all_execute_std_ms: float
+    all_execute_min_ms: float
+    all_execute_max_ms: float
+    # Aggregate: e2e = topology + all_execute (primary metric)
+    e2e_mean_ms: float
+    e2e_std_ms: float
+    e2e_min_ms: float
+    e2e_max_ms: float
+    # Per-iteration raw data
+    times_topology_ms: list[float] = field(default_factory=list)
+    times_pre_execute_ms: list[float] = field(default_factory=list)
+    times_execute_ms: list[float] = field(default_factory=list)
+    times_post_execute_ms: list[float] = field(default_factory=list)
 
 
 def _sync() -> None:
@@ -529,59 +544,109 @@ def _sync() -> None:
 
 def benchmark_one(
     adapter_cls: type[BackendAdapter],
-    ijk: torch.Tensor,
-    in_channels: int,
-    out_channels: int,
     kernel_size: int,
-    device: torch.device,
-    bbox_dim: int,
+    stride: int,
+    src: Any,
+    dst: Any,
+    features: Any,
+    weights: torch.Tensor,
     suite_name: str,
     params: dict[str, Any],
     warmup: int = 3,
     num_iters: int = 20,
 ) -> BenchmarkResult | None:
+    """Run a full phased benchmark for one adapter on one configuration.
+
+    Each timed iteration executes all four phases (build_topology,
+    pre_execute, execute, post_execute) with per-phase timing calipers.
+    """
     adapter = adapter_cls()
+    c_in = weights.shape[1]
+    c_out = weights.shape[0]
+
+    # Verify the adapter can handle this configuration
     try:
         _sync()
-        t0 = time.perf_counter()
-        adapter.setup(ijk, in_channels, out_channels, kernel_size, device, bbox_dim)
+        adapter.build_topology(kernel_size, stride, src, dst, c_in, c_out)
         _sync()
-        setup_ms = (time.perf_counter() - t0) * 1e3
     except Exception as e:
-        print(f"  [{adapter.name}] setup failed: {e}")
+        print(f"  [{adapter.name}] build_topology failed: {e}")
         return None
 
     try:
+        # Warmup: run all phases
         for _ in range(warmup):
-            adapter.forward()
+            adapter.build_topology(kernel_size, stride, src, dst, c_in, c_out)
+            native_feat, native_w = adapter.pre_execute(features, weights)
+            output = adapter.execute(native_feat, native_w)
+            adapter.post_execute(output)
             _sync()
 
-        times: list[float] = []
+        # Timed iterations with per-phase calipers
+        t_topo: list[float] = []
+        t_pre: list[float] = []
+        t_exec: list[float] = []
+        t_post: list[float] = []
+
         for _ in range(num_iters):
             _sync()
+
             t0 = time.perf_counter()
-            adapter.forward()
+            adapter.build_topology(kernel_size, stride, src, dst, c_in, c_out)
             _sync()
-            times.append((time.perf_counter() - t0) * 1e3)
+            t1 = time.perf_counter()
+
+            native_feat, native_w = adapter.pre_execute(features, weights)
+            _sync()
+            t2 = time.perf_counter()
+
+            output = adapter.execute(native_feat, native_w)
+            _sync()
+            t3 = time.perf_counter()
+
+            adapter.post_execute(output)
+            _sync()
+            t4 = time.perf_counter()
+
+            t_topo.append((t1 - t0) * 1e3)
+            t_pre.append((t2 - t1) * 1e3)
+            t_exec.append((t3 - t2) * 1e3)
+            t_post.append((t4 - t3) * 1e3)
 
         import numpy as np
 
-        arr = np.array(times)
+        a_topo = np.array(t_topo)
+        a_pre = np.array(t_pre)
+        a_exec = np.array(t_exec)
+        a_post = np.array(t_post)
+        a_all_exec = a_pre + a_exec + a_post
+        a_e2e = a_topo + a_all_exec
+
         result = BenchmarkResult(
             library=adapter.name,
             suite=suite_name,
             params=params,
-            num_voxels=adapter.num_voxels,
-            setup_ms=setup_ms,
-            mean_ms=float(arr.mean()),
-            std_ms=float(arr.std()),
-            min_ms=float(arr.min()),
-            max_ms=float(arr.max()),
+            num_voxels=src.total_voxels,
             num_iters=num_iters,
-            times_ms=[float(t) for t in times],
+            topology_mean_ms=float(a_topo.mean()),
+            pre_execute_mean_ms=float(a_pre.mean()),
+            execute_mean_ms=float(a_exec.mean()),
+            post_execute_mean_ms=float(a_post.mean()),
+            all_execute_mean_ms=float(a_all_exec.mean()),
+            all_execute_std_ms=float(a_all_exec.std()),
+            all_execute_min_ms=float(a_all_exec.min()),
+            all_execute_max_ms=float(a_all_exec.max()),
+            e2e_mean_ms=float(a_e2e.mean()),
+            e2e_std_ms=float(a_e2e.std()),
+            e2e_min_ms=float(a_e2e.min()),
+            e2e_max_ms=float(a_e2e.max()),
+            times_topology_ms=[float(t) for t in t_topo],
+            times_pre_execute_ms=[float(t) for t in t_pre],
+            times_execute_ms=[float(t) for t in t_exec],
+            times_post_execute_ms=[float(t) for t in t_post],
         )
     except Exception as e:
-        print(f"  [{adapter.name}] forward failed: {e}")
+        print(f"  [{adapter.name}] failed: {e}")
         return None
     finally:
         adapter.teardown()
@@ -610,12 +675,17 @@ def suite_grid_size(
     K = 3
     for dim in dims:
         ijk = generate_dense_coords(dim)
+        grid, features, weights = prepare_benchmark_inputs(ijk, C, C, K, device)
         params = {"grid_dim": dim, "voxels": dim**3, "channels": C, "kernel_size": K}
         print(f"\n[grid_size] dim={dim} ({dim**3} voxels), C={C}, K={K}")
         for acls in adapters:
-            r = benchmark_one(acls, ijk, C, C, K, device, dim, "grid_size", params, warmup, num_iters)
+            r = benchmark_one(acls, K, 1, grid, grid, features, weights, "grid_size", params, warmup, num_iters)
             if r:
-                print(f"  {r.library:20s}  mean={r.mean_ms:8.3f} ms  std={r.std_ms:6.3f}  setup={r.setup_ms:8.3f} ms")
+                print(
+                    f"  {r.library:20s}  e2e={r.e2e_mean_ms:8.3f} ms"
+                    f"  exec={r.all_execute_mean_ms:8.3f} ms"
+                    f"  topo={r.topology_mean_ms:8.3f} ms"
+                )
                 results.append(r)
     return results
 
@@ -638,6 +708,7 @@ def suite_sparsity(
     for bbox_dim, occupancies in configs:
         for occ in occupancies:
             ijk = generate_dense_coords(bbox_dim) if occ >= 100 else generate_sparse_coords(bbox_dim, occ)
+            grid, features, weights = prepare_benchmark_inputs(ijk, C, C, K, device)
             n_voxels = ijk.shape[0]
             params = {
                 "bbox_dim": bbox_dim,
@@ -648,17 +719,11 @@ def suite_sparsity(
             }
             print(f"\n[sparsity] bbox={bbox_dim}, occ={occ}% ({n_voxels} voxels), C={C}, K={K}")
             for acls in adapters:
-                # Skip dense baseline at occupancies < 100 -- it always uses the full grid
-                if acls is DenseAdapter and occ < 100:
-                    r = benchmark_one(acls, ijk, C, C, K, device, bbox_dim, "sparsity", params, warmup, num_iters)
-                elif acls is DenseAdapter:
-                    r = benchmark_one(acls, ijk, C, C, K, device, bbox_dim, "sparsity", params, warmup, num_iters)
-                else:
-                    r = benchmark_one(acls, ijk, C, C, K, device, bbox_dim, "sparsity", params, warmup, num_iters)
+                r = benchmark_one(acls, K, 1, grid, grid, features, weights, "sparsity", params, warmup, num_iters)
                 if r:
                     print(
-                        f"  {r.library:20s}  mean={r.mean_ms:8.3f} ms  std={r.std_ms:6.3f}"
-                        f"  setup={r.setup_ms:8.3f} ms"
+                        f"  {r.library:20s}  e2e={r.e2e_mean_ms:8.3f} ms"
+                        f"  exec={r.all_execute_mean_ms:8.3f} ms"
                     )
                     results.append(r)
     return results
@@ -675,14 +740,18 @@ def suite_channels(
     dim = 16
     K = 3
     channels = [4, 16, 32, 64, 128, 256]
-    ijk = generate_dense_coords(dim)
     for C in channels:
+        ijk = generate_dense_coords(dim)
+        grid, features, weights = prepare_benchmark_inputs(ijk, C, C, K, device)
         params = {"grid_dim": dim, "voxels": dim**3, "channels": C, "kernel_size": K}
         print(f"\n[channels] dim={dim}, C={C}, K={K}")
         for acls in adapters:
-            r = benchmark_one(acls, ijk, C, C, K, device, dim, "channels", params, warmup, num_iters)
+            r = benchmark_one(acls, K, 1, grid, grid, features, weights, "channels", params, warmup, num_iters)
             if r:
-                print(f"  {r.library:20s}  mean={r.mean_ms:8.3f} ms  std={r.std_ms:6.3f}  setup={r.setup_ms:8.3f} ms")
+                print(
+                    f"  {r.library:20s}  e2e={r.e2e_mean_ms:8.3f} ms"
+                    f"  exec={r.all_execute_mean_ms:8.3f} ms"
+                )
                 results.append(r)
     return results
 

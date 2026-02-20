@@ -490,8 +490,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            fvdb::Vec3iOrScalar kernelSize,
            fvdb::Vec3iOrScalar stride) -> std::tuple<torch::Tensor, torch::Tensor> {
             return fvdb::GridBatch::superblockConvolutionBackward(
-                grad_output, features, weights, feature_grid, output_grid,
-                kernelSize, stride);
+                grad_output, features, weights, feature_grid, output_grid, kernelSize, stride);
         },
         "Superblock GEMM backward sparse convolution (Sm80+, fp16/fp32, stride=1 only).",
         py::arg("grad_output"),

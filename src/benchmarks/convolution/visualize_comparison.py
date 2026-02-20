@@ -7,6 +7,11 @@
 # benchmark_sparse_conv_narrowband.py and produces publication-quality
 # plots.  Handles all suite types from both benchmarks.
 #
+# The benchmark results contain per-phase timing (build_topology,
+# pre_execute, execute, post_execute) with two aggregate metrics:
+#   - e2e:          all 4 phases (primary)
+#   - all_execute:  pre + execute + post (secondary, topology excluded)
+#
 # Usage:
 #   python visualize_comparison.py --file comparison_results.json
 #   python visualize_comparison.py --file results.json --filter "fVDB spconv"
@@ -26,16 +31,17 @@ from matplotlib.ticker import FuncFormatter
 # 1. Loading
 # =============================================================================
 
-# Consistent color and marker assignments for each library so they are
-# instantly recognizable across all plots.
 LIBRARY_STYLE = {
-    "fVDB": {"color": "#1f77b4", "marker": "o", "linestyle": "-"},
-    "fVDB (CUTLASS)": {"color": "#17becf", "marker": "p", "linestyle": "--"},
-    "fVDB (ImplicitGEMM)": {"color": "#1b4f72", "marker": "*", "linestyle": "-."},
-    "spconv": {"color": "#ff7f0e", "marker": "s", "linestyle": "--"},
-    "torchsparse": {"color": "#2ca02c", "marker": "^", "linestyle": "-."},
-    "MinkowskiEngine": {"color": "#9467bd", "marker": "D", "linestyle": ":"},
-    "Dense (conv3d)": {"color": "#d62728", "marker": "x", "linestyle": ":"},
+    "fVDB": {"color": "#1f77b4", "marker": "o", "linestyle": "-"},  # blue
+    "fVDB (CUTLASS)": {"color": "#9467bd", "marker": "p", "linestyle": "--"},  # purple
+    "fVDB (ImplicitGEMM)": {"color": "#17becf", "marker": "*", "linestyle": "-."},  # cyan
+    "fVDB (Superblock)": {"color": "#e377c2", "marker": "h", "linestyle": "-"},  # pink
+    "fVDB (Dense)": {"color": "#d62728", "marker": "x", "linestyle": ":"},  # red
+    "spconv": {"color": "#ff7f0e", "marker": "s", "linestyle": "--"},  # orange
+    "torchsparse": {"color": "#2ca02c", "marker": "^", "linestyle": "-."},  # green
+    "MinkowskiEngine": {"color": "#8c564b", "marker": "D", "linestyle": ":"},  # brown
+    # Legacy name kept for backward compatibility with old result files
+    "Dense (conv3d)": {"color": "#d62728", "marker": "x", "linestyle": ":"},  # red
 }
 
 
@@ -44,7 +50,12 @@ def _style_for(library: str) -> dict:
 
 
 def load_results(path: str) -> pd.DataFrame:
-    """Load comparison benchmark JSON into a DataFrame."""
+    """Load benchmark JSON into a DataFrame.
+
+    Handles both the new phased format (topology_mean_ms, e2e_mean_ms, ...)
+    and the legacy format (setup_ms, mean_ms, std_ms, ...) for backward
+    compatibility with older result files.
+    """
     with open(path, "r") as f:
         data = json.load(f)
 
@@ -54,12 +65,29 @@ def load_results(path: str) -> pd.DataFrame:
             "library": b["library"],
             "suite": b["suite"],
             "num_voxels": b["num_voxels"],
-            "setup_ms": b["setup_ms"],
-            "mean_ms": b["mean_ms"],
-            "std_ms": b["std_ms"],
-            "min_ms": b["min_ms"],
-            "max_ms": b["max_ms"],
         }
+
+        # New phased format
+        if "e2e_mean_ms" in b:
+            rec["topology_mean_ms"] = b["topology_mean_ms"]
+            rec["pre_execute_mean_ms"] = b["pre_execute_mean_ms"]
+            rec["execute_mean_ms"] = b["execute_mean_ms"]
+            rec["post_execute_mean_ms"] = b["post_execute_mean_ms"]
+            rec["all_execute_mean_ms"] = b["all_execute_mean_ms"]
+            rec["all_execute_std_ms"] = b["all_execute_std_ms"]
+            rec["e2e_mean_ms"] = b["e2e_mean_ms"]
+            rec["e2e_std_ms"] = b["e2e_std_ms"]
+        else:
+            # Legacy format: map old fields into new column names
+            rec["topology_mean_ms"] = b.get("setup_ms", 0.0)
+            rec["pre_execute_mean_ms"] = 0.0
+            rec["execute_mean_ms"] = b.get("mean_ms", 0.0)
+            rec["post_execute_mean_ms"] = 0.0
+            rec["all_execute_mean_ms"] = b.get("mean_ms", 0.0)
+            rec["all_execute_std_ms"] = b.get("std_ms", 0.0)
+            rec["e2e_mean_ms"] = b.get("setup_ms", 0.0) + b.get("mean_ms", 0.0)
+            rec["e2e_std_ms"] = b.get("std_ms", 0.0)
+
         rec.update(b.get("params", {}))
         records.append(rec)
 
@@ -94,7 +122,9 @@ def format_ms(x, _pos):
 # =============================================================================
 
 
-def plot_grid_size_scaling(df: pd.DataFrame) -> None:
+def plot_grid_size_scaling(
+    df: pd.DataFrame, metric: str = "e2e_mean_ms", title_suffix: str = "", file_suffix: str = ""
+) -> None:
     """Time vs voxel count, one line per library.  Log-log axes.
 
     Handles both the ``grid_size`` suite (dense grids from the comparison
@@ -107,6 +137,7 @@ def plot_grid_size_scaling(df: pd.DataFrame) -> None:
         return
 
     is_narrowband = "scale" in suite_df["suite"].values
+    std_col = metric.replace("_mean_ms", "_std_ms")
 
     sns.set_theme(style="whitegrid", context="talk")
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -114,10 +145,11 @@ def plot_grid_size_scaling(df: pd.DataFrame) -> None:
     for lib in suite_df["library"].unique():
         sub = suite_df[suite_df["library"] == lib].sort_values("num_voxels")
         s = _style_for(lib)
+        yerr = sub[std_col] if std_col in sub.columns else None
         ax.errorbar(
             sub["num_voxels"],
-            sub["mean_ms"],
-            yerr=sub["std_ms"],
+            sub[metric],
+            yerr=yerr,
             marker=s["marker"],
             color=s["color"],
             linestyle=s["linestyle"],
@@ -132,62 +164,67 @@ def plot_grid_size_scaling(df: pd.DataFrame) -> None:
     ax.xaxis.set_major_formatter(FuncFormatter(format_voxels))
     ax.yaxis.set_major_formatter(FuncFormatter(format_ms))
     ax.set_xlabel("Voxels")
-    ax.set_ylabel("Forward Time")
-    title = "Narrow-Band Sphere Scaling (C=32, K=3x3x3)" if is_narrowband else "Grid-Size Scaling (C=32, K=3x3x3)"
-    ax.set_title(title)
+    metric_label = "E2E Time" if "e2e" in metric else "Execute Time"
+    ax.set_ylabel(metric_label)
+    base = "Narrow-Band Sphere Scaling (C=32, K=3x3x3)" if is_narrowband else "Grid-Size Scaling (C=32, K=3x3x3)"
+    ax.set_title(f"{base}{title_suffix}")
     ax.legend(loc="upper left", fontsize=10)
     ax.grid(True, which="both", alpha=0.3)
     plt.tight_layout()
 
-    out = "comparison_grid_size.png"
+    tag = metric.split("_")[0]
+    out = f"comparison_grid_size_{tag}{file_suffix}.png"
     print(f"Saving {out}")
     plt.savefig(out, bbox_inches="tight", dpi=150)
     plt.show()
 
 
-def plot_sparsity_breakeven(df: pd.DataFrame) -> None:
+def plot_sparsity_breakeven(
+    df: pd.DataFrame, metric: str = "e2e_mean_ms", title_suffix: str = "", file_suffix: str = ""
+) -> None:
     """Time vs occupancy at each bbox size -- the key comparison plot.
 
-    Sparse libraries appear as lines; dense conv3d appears as a horizontal
-    reference showing the cost of processing the full bounding box.
+    The fVDB (Dense) backend appears as a reference line showing the cost
+    of processing via the dense convolution path.
     """
     suite_df = df[df["suite"] == "sparsity"].copy()
     if suite_df.empty:
         print("No sparsity data to plot.")
         return
 
+    std_col = metric.replace("_mean_ms", "_std_ms")
     bbox_sizes = sorted(suite_df["bbox_dim"].unique())
     sns.set_theme(style="whitegrid", context="talk")
     n_panels = len(bbox_sizes)
     fig, axes = plt.subplots(1, n_panels, figsize=(8 * n_panels, 6), squeeze=False)
 
-    for col, bbox_dim in enumerate(bbox_sizes):
-        ax = axes[0][col]
-        bbox_df = suite_df[suite_df["bbox_dim"] == bbox_dim]
+    dense_names = {"fVDB (Dense)", "Dense (conv3d)"}
 
-        # Dense reference line (100% occupancy from the Dense adapter, or
-        # the dense adapter at the first available occupancy since it always
-        # processes the full grid).
-        dense_df = bbox_df[bbox_df["library"] == "Dense (conv3d)"]
+    for col, bbox_val in enumerate(bbox_sizes):
+        ax = axes[0][col]
+        bbox_df = suite_df[suite_df["bbox_dim"] == bbox_val]
+
+        dense_df = bbox_df[bbox_df["library"].isin(dense_names)]
         if not dense_df.empty:
-            dense_time = dense_df["mean_ms"].iloc[0]
+            dense_time = dense_df[metric].iloc[0]
+            lib_name = dense_df["library"].iloc[0]
             ax.axhline(
                 y=dense_time,
-                color=_style_for("Dense (conv3d)")["color"],
+                color=_style_for(lib_name)["color"],
                 linestyle="--",
                 linewidth=2,
-                label=f"Dense conv3d ({dense_time:.2f} ms)",
+                label=f"{lib_name} ({dense_time:.2f} ms)",
             )
 
-        # Sparse libraries
-        sparse_libs = [lib for lib in bbox_df["library"].unique() if lib != "Dense (conv3d)"]
+        sparse_libs = [lib for lib in bbox_df["library"].unique() if lib not in dense_names]
         for lib in sparse_libs:
             sub = bbox_df[bbox_df["library"] == lib].sort_values("occupancy_pct")
             s = _style_for(lib)
+            yerr = sub[std_col] if std_col in sub.columns else None
             ax.errorbar(
                 sub["occupancy_pct"],
-                sub["mean_ms"],
-                yerr=sub["std_ms"],
+                sub[metric],
+                yerr=yerr,
                 marker=s["marker"],
                 color=s["color"],
                 linestyle=s["linestyle"],
@@ -197,29 +234,36 @@ def plot_sparsity_breakeven(df: pd.DataFrame) -> None:
                 label=lib,
             )
 
-        total = int(bbox_dim) ** 3
+        total = int(bbox_val) ** 3
         ax.set_xlabel("Occupancy (%)")
-        ax.set_ylabel("Forward Time")
+        metric_label = "E2E Time" if "e2e" in metric else "Execute Time"
+        ax.set_ylabel(metric_label)
         ax.set_yscale("log")
         ax.yaxis.set_major_formatter(FuncFormatter(format_ms))
-        ax.set_title(f"bbox={bbox_dim}^3 ({total:,} cells)")
+        ax.set_title(f"bbox={bbox_val}^3 ({total:,} cells)")
         ax.legend(loc="upper left", fontsize=9)
         ax.grid(True, which="both", alpha=0.3)
 
-    fig.suptitle("Sparsity Breakeven (C=32, K=3x3x3)", fontsize=14, fontweight="bold")
+    metric_label = "E2E" if "e2e" in metric else "Execute"
+    fig.suptitle(f"Sparsity Breakeven -- {metric_label} (C=32, K=3x3x3){title_suffix}", fontsize=14, fontweight="bold")
     plt.tight_layout()
-    out = "comparison_sparsity_breakeven.png"
+    tag = metric.split("_")[0]
+    out = f"comparison_sparsity_breakeven_{tag}{file_suffix}.png"
     print(f"Saving {out}")
     plt.savefig(out, bbox_inches="tight", dpi=150)
     plt.show()
 
 
-def plot_channel_scaling(df: pd.DataFrame) -> None:
+def plot_channel_scaling(
+    df: pd.DataFrame, metric: str = "e2e_mean_ms", title_suffix: str = "", file_suffix: str = ""
+) -> None:
     """Time vs channel count, one line per library.  Log-log axes."""
     suite_df = df[df["suite"] == "channels"].copy()
     if suite_df.empty:
         print("No channel data to plot.")
         return
+
+    std_col = metric.replace("_mean_ms", "_std_ms")
 
     sns.set_theme(style="whitegrid", context="talk")
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -227,10 +271,11 @@ def plot_channel_scaling(df: pd.DataFrame) -> None:
     for lib in suite_df["library"].unique():
         sub = suite_df[suite_df["library"] == lib].sort_values("channels")
         s = _style_for(lib)
+        yerr = sub[std_col] if std_col in sub.columns else None
         ax.errorbar(
             sub["channels"],
-            sub["mean_ms"],
-            yerr=sub["std_ms"],
+            sub[metric],
+            yerr=yerr,
             marker=s["marker"],
             color=s["color"],
             linestyle=s["linestyle"],
@@ -240,10 +285,9 @@ def plot_channel_scaling(df: pd.DataFrame) -> None:
             label=lib,
         )
 
-    # O(C) and O(C^2) reference slopes
     chan_vals = np.sort(suite_df["channels"].unique())
     if len(chan_vals) >= 2:
-        ref_t = suite_df[suite_df["channels"] == chan_vals[0]]["mean_ms"].mean()
+        ref_t = suite_df[suite_df["channels"] == chan_vals[0]][metric].mean()
         y_lin = ref_t * (chan_vals / chan_vals[0])
         y_quad = ref_t * (chan_vals / chan_vals[0]) ** 2
         ax.plot(chan_vals, y_lin, ":", alpha=0.4, color="gray", label="O(C) ref")
@@ -256,7 +300,8 @@ def plot_channel_scaling(df: pd.DataFrame) -> None:
     ax.set_xticklabels([str(int(c)) for c in chan_vals_sorted])
     ax.minorticks_off()
     ax.set_xlabel("Channels (C)")
-    ax.set_ylabel("Forward Time")
+    metric_label = "E2E Time" if "e2e" in metric else "Execute Time"
+    ax.set_ylabel(metric_label)
     ax.yaxis.set_major_formatter(FuncFormatter(format_ms))
     n_vox = suite_df["num_voxels"].iloc[0] if not suite_df.empty else 0
     if "grid_dim" in suite_df.columns and suite_df["grid_dim"].notna().any():
@@ -264,26 +309,31 @@ def plot_channel_scaling(df: pd.DataFrame) -> None:
         subtitle = f"{dim}^3 grid"
     else:
         subtitle = f"~{n_vox:,} voxels"
-    ax.set_title(f"Channel Scaling ({subtitle}, K=3x3x3)")
+    ax.set_title(f"Channel Scaling ({subtitle}, K=3x3x3){title_suffix}")
     ax.legend(loc="upper left", fontsize=10)
     ax.grid(True, which="both", alpha=0.3)
     plt.tight_layout()
 
-    out = "comparison_channel_scaling.png"
+    tag = metric.split("_")[0]
+    out = f"comparison_channel_scaling_{tag}{file_suffix}.png"
     print(f"Saving {out}")
     plt.savefig(out, bbox_inches="tight", dpi=150)
     plt.show()
 
 
-def plot_topology_overhead(df: pd.DataFrame) -> None:
-    """Stacked bar chart: setup cost vs forward cost per library.
+def plot_phase_breakdown(df: pd.DataFrame, title_suffix: str = "", file_suffix: str = "") -> None:
+    """Stacked bar chart showing the 4-phase breakdown per library.
 
-    Uses the largest grid size from the grid_size suite to make the
-    comparison visually clear.
+    Uses the largest grid size from the grid_size suite.
     """
     suite_df = df[df["suite"] == "grid_size"].copy()
     if suite_df.empty:
-        print("No grid_size data for topology overhead plot.")
+        print("No grid_size data for phase breakdown plot.")
+        return
+
+    phase_cols = ["topology_mean_ms", "pre_execute_mean_ms", "execute_mean_ms", "post_execute_mean_ms"]
+    if not all(c in suite_df.columns for c in phase_cols):
+        print("Phase breakdown columns not found (legacy data?). Skipping.")
         return
 
     max_dim = suite_df["grid_dim"].max()
@@ -292,41 +342,51 @@ def plot_topology_overhead(df: pd.DataFrame) -> None:
         return
 
     sns.set_theme(style="whitegrid", context="talk")
-    fig, ax = plt.subplots(figsize=(10, 5))
+    fig, ax = plt.subplots(figsize=(12, 5))
 
     libs = list(subset["library"])
-    setup = list(subset["setup_ms"])
-    forward = list(subset["mean_ms"])
+    topo = list(subset["topology_mean_ms"])
+    pre = list(subset["pre_execute_mean_ms"])
+    exe = list(subset["execute_mean_ms"])
+    post = list(subset["post_execute_mean_ms"])
 
     x = np.arange(len(libs))
     bar_width = 0.5
 
-    bars_setup = ax.bar(x, setup, bar_width, label="Setup (topology)", color="#7fcdbb")
-    bars_fwd = ax.bar(x, forward, bar_width, bottom=setup, label="Forward", color="#2c7fb8")
+    bottom = np.zeros(len(libs))
+    colors = ["#7fcdbb", "#41b6c4", "#2c7fb8", "#253494"]
+    labels = ["build_topology", "pre_execute", "execute", "post_execute"]
+    for vals, color, label in zip([topo, pre, exe, post], colors, labels):
+        arr = np.array(vals)
+        ax.bar(x, arr, bar_width, bottom=bottom, label=label, color=color)
+        bottom += arr
 
-    for i, (s, f) in enumerate(zip(setup, forward)):
-        total = s + f
-        ax.text(i, total + max(forward) * 0.02, f"{total:.1f} ms", ha="center", va="bottom", fontsize=10)
+    for i, total in enumerate(bottom):
+        ax.text(i, total + max(bottom) * 0.02, f"{total:.1f} ms", ha="center", va="bottom", fontsize=10)
 
     ax.set_xticks(x)
     ax.set_xticklabels(libs, rotation=15, ha="right")
     ax.set_ylabel("Time (ms)")
-    ax.set_title(f"Setup + Forward Cost ({int(max_dim)}^3 grid, C=32, K=3x3x3)")
+    ax.set_title(f"Phase Breakdown ({int(max_dim)}^3 grid, C=32, K=3x3x3){title_suffix}")
     ax.legend(loc="upper left", fontsize=10)
     ax.grid(axis="y", alpha=0.3)
     plt.tight_layout()
 
-    out = "comparison_topology_overhead.png"
+    out = f"comparison_phase_breakdown{file_suffix}.png"
     print(f"Saving {out}")
     plt.savefig(out, bbox_inches="tight", dpi=150)
     plt.show()
 
 
-def plot_extent(df: pd.DataFrame) -> None:
+def plot_extent(
+    df: pd.DataFrame, metric: str = "e2e_mean_ms", title_suffix: str = "", file_suffix: str = ""
+) -> None:
     """Time vs sphere separation -- shows behavior at huge spatial extents."""
     suite_df = df[df["suite"] == "extent"].copy()
     if suite_df.empty:
         return
+
+    std_col = metric.replace("_mean_ms", "_std_ms")
 
     sns.set_theme(style="whitegrid", context="talk")
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -334,10 +394,11 @@ def plot_extent(df: pd.DataFrame) -> None:
     for lib in suite_df["library"].unique():
         sub = suite_df[suite_df["library"] == lib].sort_values("separation")
         s = _style_for(lib)
+        yerr = sub[std_col] if std_col in sub.columns else None
         ax.errorbar(
             sub["separation"],
-            sub["mean_ms"],
-            yerr=sub["std_ms"],
+            sub[metric],
+            yerr=yerr,
             marker=s["marker"],
             color=s["color"],
             linestyle=s["linestyle"],
@@ -351,14 +412,16 @@ def plot_extent(df: pd.DataFrame) -> None:
     ax.set_yscale("log")
     ax.yaxis.set_major_formatter(FuncFormatter(format_ms))
     ax.set_xlabel("Sphere Separation (voxels)")
-    ax.set_ylabel("Forward Time")
+    metric_label = "E2E Time" if "e2e" in metric else "Execute Time"
+    ax.set_ylabel(metric_label)
     n_vox = suite_df["num_voxels"].iloc[0] if not suite_df.empty else 0
-    ax.set_title(f"Spatial Extent Scaling (~{n_vox:,} voxels, C=32, K=3x3x3)")
+    ax.set_title(f"Spatial Extent Scaling (~{n_vox:,} voxels, C=32, K=3x3x3){title_suffix}")
     ax.legend(loc="upper left", fontsize=10)
     ax.grid(True, which="both", alpha=0.3)
     plt.tight_layout()
 
-    out = "comparison_extent.png"
+    tag = metric.split("_")[0]
+    out = f"comparison_extent_{tag}{file_suffix}.png"
     print(f"Saving {out}")
     plt.savefig(out, bbox_inches="tight", dpi=150)
     plt.show()
@@ -369,13 +432,14 @@ def plot_extent(df: pd.DataFrame) -> None:
 # =============================================================================
 
 
-def print_summary(df: pd.DataFrame) -> None:
+def print_summary(df: pd.DataFrame, title_suffix: str = "") -> None:
     """Print a text summary of benchmark results."""
     print("\n" + "=" * 72)
-    print("  Sparse Convolution Comparison Summary")
+    print(f"  Sparse Convolution Comparison Summary{title_suffix}")
     print("=" * 72)
 
     libs = sorted(df["library"].unique())
+    has_phases = "topology_mean_ms" in df.columns
 
     # Grid-size results
     grid_df = df[df["suite"] == "grid_size"]
@@ -391,7 +455,7 @@ def print_summary(df: pd.DataFrame) -> None:
             for lib in libs:
                 sub = grid_df[(grid_df["grid_dim"] == dim) & (grid_df["library"] == lib)]
                 if not sub.empty:
-                    row += f"  {sub['mean_ms'].values[0]:>13.3f}ms"
+                    row += f"  {sub['e2e_mean_ms'].values[0]:>13.3f}ms"
                 else:
                     row += f"  {'--':>16s}"
             print(row)
@@ -399,10 +463,10 @@ def print_summary(df: pd.DataFrame) -> None:
     # Sparsity results
     sparse_df = df[df["suite"] == "sparsity"]
     if not sparse_df.empty:
-        for bbox_dim in sorted(sparse_df["bbox_dim"].unique()):
-            bbox_sub = sparse_df[sparse_df["bbox_dim"] == bbox_dim]
-            total = int(bbox_dim) ** 3
-            print(f"\n--- Sparsity (bbox={int(bbox_dim)}, {total:,} cells, C=32) ---")
+        for bbox_val in sorted(sparse_df["bbox_dim"].unique()):
+            bbox_sub = sparse_df[sparse_df["bbox_dim"] == bbox_val]
+            total = int(bbox_val) ** 3
+            print(f"\n--- Sparsity (bbox={int(bbox_val)}, {total:,} cells, C=32) ---")
             header = f"  {'Occ%':>6s}  {'Voxels':>10s}"
             for lib in libs:
                 header += f"  {lib:>16s}"
@@ -414,7 +478,7 @@ def print_summary(df: pd.DataFrame) -> None:
                 for lib in libs:
                     lsub = occ_sub[occ_sub["library"] == lib]
                     if not lsub.empty:
-                        row += f"  {lsub['mean_ms'].values[0]:>13.3f}ms"
+                        row += f"  {lsub['e2e_mean_ms'].values[0]:>13.3f}ms"
                     else:
                         row += f"  {'--':>16s}"
                 print(row)
@@ -434,7 +498,7 @@ def print_summary(df: pd.DataFrame) -> None:
             for lib in libs:
                 sub = r_sub[r_sub["library"] == lib]
                 if not sub.empty:
-                    row += f"  {sub['mean_ms'].values[0]:>13.3f}ms"
+                    row += f"  {sub['e2e_mean_ms'].values[0]:>13.3f}ms"
                 else:
                     row += f"  {'--':>16s}"
             print(row)
@@ -453,7 +517,7 @@ def print_summary(df: pd.DataFrame) -> None:
             for lib in libs:
                 sub = chan_df[(chan_df["channels"] == c) & (chan_df["library"] == lib)]
                 if not sub.empty:
-                    row += f"  {sub['mean_ms'].values[0]:>13.3f}ms"
+                    row += f"  {sub['e2e_mean_ms'].values[0]:>13.3f}ms"
                 else:
                     row += f"  {'--':>16s}"
             print(row)
@@ -474,10 +538,28 @@ def print_summary(df: pd.DataFrame) -> None:
             for lib in libs:
                 sub = sep_sub[sep_sub["library"] == lib]
                 if not sub.empty:
-                    row += f"  {sub['mean_ms'].values[0]:>13.3f}ms"
+                    row += f"  {sub['e2e_mean_ms'].values[0]:>13.3f}ms"
                 else:
                     row += f"  {'--':>16s}"
             print(row)
+
+    # Phase breakdown for the largest grid (if phase data available)
+    if has_phases and not grid_df.empty:
+        max_dim = grid_df["grid_dim"].max()
+        phase_sub = grid_df[grid_df["grid_dim"] == max_dim]
+        if not phase_sub.empty:
+            print(f"\n--- Phase Breakdown ({int(max_dim)}^3 grid, C=32) ---")
+            header = f"  {'Library':>20s}  {'Topology':>10s}  {'PreExec':>10s}  {'Execute':>10s}  {'PostExec':>10s}  {'E2E':>10s}"
+            print(header)
+            for _, row in phase_sub.iterrows():
+                print(
+                    f"  {row['library']:>20s}"
+                    f"  {row['topology_mean_ms']:>8.3f}ms"
+                    f"  {row['pre_execute_mean_ms']:>8.3f}ms"
+                    f"  {row['execute_mean_ms']:>8.3f}ms"
+                    f"  {row['post_execute_mean_ms']:>8.3f}ms"
+                    f"  {row['e2e_mean_ms']:>8.3f}ms"
+                )
 
     print()
 
@@ -485,6 +567,24 @@ def print_summary(df: pd.DataFrame) -> None:
 # =============================================================================
 # 5. Main
 # =============================================================================
+
+
+def _run_plots(df: pd.DataFrame, title_suffix: str = "", file_suffix: str = "") -> None:
+    """Generate all applicable plots for the given DataFrame."""
+    # Primary metric: e2e
+    plot_grid_size_scaling(df, "e2e_mean_ms", title_suffix, file_suffix)
+    plot_sparsity_breakeven(df, "e2e_mean_ms", title_suffix, file_suffix)
+    plot_channel_scaling(df, "e2e_mean_ms", title_suffix, file_suffix)
+    plot_extent(df, "e2e_mean_ms", title_suffix, file_suffix)
+
+    # Secondary metric: all_execute (topology excluded)
+    plot_grid_size_scaling(df, "all_execute_mean_ms", " (Execute Only)", "_exec" + file_suffix)
+    plot_sparsity_breakeven(df, "all_execute_mean_ms", " (Execute Only)", "_exec" + file_suffix)
+    plot_channel_scaling(df, "all_execute_mean_ms", " (Execute Only)", "_exec" + file_suffix)
+    plot_extent(df, "all_execute_mean_ms", " (Execute Only)", "_exec" + file_suffix)
+
+    # Phase breakdown
+    plot_phase_breakdown(df, title_suffix, file_suffix)
 
 
 def main() -> None:
@@ -513,12 +613,7 @@ def main() -> None:
         sys.exit(0)
 
     print_summary(df)
-
-    plot_grid_size_scaling(df)
-    plot_sparsity_breakeven(df)
-    plot_channel_scaling(df)
-    plot_topology_overhead(df)
-    plot_extent(df)
+    _run_plots(df)
 
 
 if __name__ == "__main__":

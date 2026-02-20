@@ -126,13 +126,13 @@ BM_SuperblockConv_Forward_CUDA(benchmark::State &state) {
     auto out = ops::superblockConv(features, weights, *grid, *grid, ks, stride);
     torch::cuda::synchronize();
 
-    for (auto _ : state) {
+    for (auto _: state) {
         auto o = ops::superblockConv(features, weights, *grid, *grid, ks, stride);
         torch::cuda::synchronize();
         benchmark::DoNotOptimize(o.data_ptr<float>());
     }
     state.SetItemsProcessed(state.iterations() * N);
-    state.counters["voxels"]  = static_cast<double>(N);
+    state.counters["voxels"]   = static_cast<double>(N);
     state.counters["channels"] = static_cast<double>(C);
 }
 
@@ -159,19 +159,19 @@ BM_SuperblockConv_Backward_CUDA(benchmark::State &state) {
     auto weights     = torch::randn({C, C, 3, 3, 3}, topts(device));
     auto grad_output = torch::randn({N, C}, topts(device));
 
-    auto [gf, gw] = ops::superblockConvBackward(
-        grad_output, features, weights, *grid, *grid, ks, stride);
+    auto [gf, gw] =
+        ops::superblockConvBackward(grad_output, features, weights, *grid, *grid, ks, stride);
     torch::cuda::synchronize();
 
-    for (auto _ : state) {
-        auto [g1, g2] = ops::superblockConvBackward(
-            grad_output, features, weights, *grid, *grid, ks, stride);
+    for (auto _: state) {
+        auto [g1, g2] =
+            ops::superblockConvBackward(grad_output, features, weights, *grid, *grid, ks, stride);
         torch::cuda::synchronize();
         benchmark::DoNotOptimize(g1.data_ptr<float>());
         benchmark::DoNotOptimize(g2.data_ptr<float>());
     }
     state.SetItemsProcessed(state.iterations() * N);
-    state.counters["voxels"]  = static_cast<double>(N);
+    state.counters["voxels"]   = static_cast<double>(N);
     state.counters["channels"] = static_cast<double>(C);
 }
 
@@ -201,13 +201,13 @@ BM_Comparison_GatherScatter_Forward_CUDA(benchmark::State &state) {
     auto out = ops::gatherScatterDefaultSparseConv(features, weights, topo);
     torch::cuda::synchronize();
 
-    for (auto _ : state) {
+    for (auto _: state) {
         auto o = ops::gatherScatterDefaultSparseConv(features, weights, topo);
         torch::cuda::synchronize();
         benchmark::DoNotOptimize(o.data_ptr<float>());
     }
     state.SetItemsProcessed(state.iterations() * N);
-    state.counters["voxels"]  = static_cast<double>(N);
+    state.counters["voxels"]   = static_cast<double>(N);
     state.counters["channels"] = static_cast<double>(C);
 }
 
@@ -232,13 +232,13 @@ BM_Comparison_Superblock_Forward_CUDA(benchmark::State &state) {
     auto out = ops::superblockConv(features, weights, *grid, *grid, ks, stride);
     torch::cuda::synchronize();
 
-    for (auto _ : state) {
+    for (auto _: state) {
         auto o = ops::superblockConv(features, weights, *grid, *grid, ks, stride);
         torch::cuda::synchronize();
         benchmark::DoNotOptimize(o.data_ptr<float>());
     }
     state.SetItemsProcessed(state.iterations() * N);
-    state.counters["voxels"]  = static_cast<double>(N);
+    state.counters["voxels"]   = static_cast<double>(N);
     state.counters["channels"] = static_cast<double>(C);
 }
 
@@ -267,7 +267,7 @@ BM_SuperblockConv_Sparsity_CUDA(benchmark::State &state) {
     auto out = ops::superblockConv(features, weights, *grid, *grid, ks, stride);
     torch::cuda::synchronize();
 
-    for (auto _ : state) {
+    for (auto _: state) {
         auto o = ops::superblockConv(features, weights, *grid, *grid, ks, stride);
         torch::cuda::synchronize();
         benchmark::DoNotOptimize(o.data_ptr<float>());

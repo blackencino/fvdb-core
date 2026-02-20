@@ -262,8 +262,8 @@ TEST_P(SuperblockConvTest, AsymmetricChannelsForward) {
 
 TEST_P(SuperblockConvTest, BackwardGradFeaturesMatchesReference) {
     auto [dtype, C, K] = GetParam();
-    auto device = makeDevice();
-    int dim     = 8;
+    auto device        = makeDevice();
+    int dim            = 8;
 
     auto grid = makeDenseTestGrid(dim, device);
     int64_t N = grid->totalVoxels();
@@ -300,8 +300,8 @@ TEST_P(SuperblockConvTest, BackwardGradFeaturesMatchesReference) {
 
 TEST_P(SuperblockConvTest, BackwardGradWeightsMatchesReference) {
     auto [dtype, C, K] = GetParam();
-    auto device = makeDevice();
-    int dim     = 8;
+    auto device        = makeDevice();
+    int dim            = 8;
 
     auto grid = makeDenseTestGrid(dim, device);
     int64_t N = grid->totalVoxels();
@@ -362,19 +362,16 @@ TEST(SuperblockConvAdjoint, ForwardAdjointIdentity) {
     auto y        = ops::superblockConv(x, W, *grid, *grid, ks, stride);
     auto [gx, gW] = ops::superblockConvBackward(gy, x, W, *grid, *grid, ks, stride);
 
-    auto lhs = (gy.cpu().to(torch::kFloat64).flatten() *
-                y.cpu().to(torch::kFloat64).flatten())
+    auto lhs = (gy.cpu().to(torch::kFloat64).flatten() * y.cpu().to(torch::kFloat64).flatten())
                    .sum()
                    .item<double>();
-    auto rhs = (gx.cpu().to(torch::kFloat64).flatten() *
-                x.cpu().to(torch::kFloat64).flatten())
+    auto rhs = (gx.cpu().to(torch::kFloat64).flatten() * x.cpu().to(torch::kFloat64).flatten())
                    .sum()
                    .item<double>();
 
     double rel_err = std::abs(lhs - rhs) / (std::abs(lhs) + 1e-12);
-    EXPECT_LT(rel_err, 1e-3)
-        << "Feature adjoint identity violated: <gy, L(x)>=" << lhs
-        << " vs <L*(gy), x>=" << rhs << ", rel_err=" << rel_err;
+    EXPECT_LT(rel_err, 1e-3) << "Feature adjoint identity violated: <gy, L(x)>=" << lhs
+                             << " vs <L*(gy), x>=" << rhs << ", rel_err=" << rel_err;
 }
 
 // =============================================================================
@@ -391,8 +388,7 @@ TEST_P(SuperblockConvTest, TransposedForwardMatchesReference) {
 
     nanovdb::Coord ks(K, K, K);
     nanovdb::Coord stride(1, 1, 1);
-    auto topo =
-        ops::gatherScatterDefaultSparseConvTransposeTopology(*grid, *grid, ks, stride);
+    auto topo = ops::gatherScatterDefaultSparseConvTransposeTopology(*grid, *grid, ks, stride);
 
     torch::manual_seed(400);
     auto features = torch::randn({N, C}, topts(device, dtype));
@@ -468,8 +464,7 @@ TEST(SuperblockConvEdge, SingleVoxel) {
     auto test_f64 = test.cpu().to(torch::kFloat64);
 
     EXPECT_TRUE(torch::allclose(test_f64, ref_f64, 1e-1, 1e-1))
-        << "Single voxel mismatch, max diff="
-        << (test_f64 - ref_f64).abs().max().item<double>();
+        << "Single voxel mismatch, max diff=" << (test_f64 - ref_f64).abs().max().item<double>();
 }
 
 TEST(SuperblockConvEdge, MultiLeafSparse) {
@@ -498,8 +493,7 @@ TEST(SuperblockConvEdge, MultiLeafSparse) {
     auto test_f64 = test.cpu().to(torch::kFloat64);
 
     EXPECT_TRUE(torch::allclose(test_f64, ref_f64, 1e-1, 1e-1))
-        << "MultiLeafSparse mismatch, max diff="
-        << (test_f64 - ref_f64).abs().max().item<double>();
+        << "MultiLeafSparse mismatch, max diff=" << (test_f64 - ref_f64).abs().max().item<double>();
 }
 
 // =============================================================================

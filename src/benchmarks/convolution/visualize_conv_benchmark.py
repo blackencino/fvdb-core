@@ -1,7 +1,10 @@
 # Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: Apache-2.0
 #
-# Visualization for GatherScatterDefault sparse convolution benchmarks.
+# Visualization for GatherScatterDefault sparse convolution C++ benchmarks.
+#
+# This script reads Google Benchmark JSON output from the C++ benchmark binary,
+# NOT the Python-level comparison benchmark (see visualize_comparison.py for that).
 #
 # Usage:
 #   python visualize_conv_benchmark.py --run ./gather_scatter_conv_benchmark
@@ -201,7 +204,7 @@ def plot_throughput_vs_grid_size(df):
     Plot 1: Time vs grid size for Forward, Backward, DenseBaseline, TopologyBuild.
     Separate panels per device.
     """
-    groups = ["Forward", "Backward", "DenseBaseline", "TopologyBuild"]
+    groups = ["Forward", "Backward", "DenseBaseline", "TopologyBuild"]  # C++ benchmark phase names
     plot_df = df[df["Group"].isin(groups) & (df["Param"] > 0)].copy()
 
     if plot_df.empty:
@@ -215,6 +218,7 @@ def plot_throughput_vs_grid_size(df):
 
     palette = sns.color_palette("husl", len(groups))
     color_map = dict(zip(groups, palette))
+    # TopologyBuild in the C++ benchmark corresponds to the build_topology phase
     style_map = {"Forward": "-", "Backward": "--", "DenseBaseline": ":", "TopologyBuild": "-."}
 
     for device in devices:
@@ -639,7 +643,7 @@ def print_summary(df):
 # =============================================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Visualize GatherScatterDefault sparse convolution benchmark results.")
+    parser = argparse.ArgumentParser(description="Visualize GatherScatterDefault sparse convolution C++ benchmark results.")
 
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--run", type=str, help="Path to the benchmark executable to run")

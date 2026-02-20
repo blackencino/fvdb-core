@@ -1227,9 +1227,12 @@ GridBatch::implicitGemmConvolution(torch::Tensor features,
                                    const GridBatch &output_grid,
                                    const Vec3iOrScalar &kernelSize,
                                    const Vec3iOrScalar &stride) {
-    return detail::ops::implicitGemmConv(
-        features, weights, *feature_grid.mImpl, *output_grid.mImpl, kernelSize.value(),
-        stride.value());
+    return detail::ops::implicitGemmConv(features,
+                                         weights,
+                                         *feature_grid.mImpl,
+                                         *output_grid.mImpl,
+                                         kernelSize.value(),
+                                         stride.value());
 }
 
 torch::Tensor
@@ -1239,9 +1242,12 @@ GridBatch::superblockConvolution(torch::Tensor features,
                                  const GridBatch &output_grid,
                                  const Vec3iOrScalar &kernelSize,
                                  const Vec3iOrScalar &stride) {
-    return detail::ops::superblockConv(
-        features, weights, *feature_grid.mImpl, *output_grid.mImpl, kernelSize.value(),
-        stride.value());
+    return detail::ops::superblockConv(features,
+                                       weights,
+                                       *feature_grid.mImpl,
+                                       *output_grid.mImpl,
+                                       kernelSize.value(),
+                                       stride.value());
 }
 
 std::tuple<torch::Tensor, torch::Tensor>
@@ -1252,9 +1258,13 @@ GridBatch::superblockConvolutionBackward(torch::Tensor grad_output,
                                          const GridBatch &output_grid,
                                          const Vec3iOrScalar &kernelSize,
                                          const Vec3iOrScalar &stride) {
-    return detail::ops::superblockConvBackward(
-        grad_output, features, weights, *feature_grid.mImpl, *output_grid.mImpl,
-        kernelSize.value(), stride.value());
+    return detail::ops::superblockConvBackward(grad_output,
+                                               features,
+                                               weights,
+                                               *feature_grid.mImpl,
+                                               *output_grid.mImpl,
+                                               kernelSize.value(),
+                                               stride.value());
 }
 
 torch::Tensor
@@ -1264,9 +1274,12 @@ GridBatch::superblockConvolutionTranspose(torch::Tensor features,
                                           const GridBatch &target_grid,
                                           const Vec3iOrScalar &kernelSize,
                                           const Vec3iOrScalar &stride) {
-    return detail::ops::superblockConvTranspose(
-        features, weights, *source_grid.mImpl, *target_grid.mImpl, kernelSize.value(),
-        stride.value());
+    return detail::ops::superblockConvTranspose(features,
+                                                weights,
+                                                *source_grid.mImpl,
+                                                *target_grid.mImpl,
+                                                kernelSize.value(),
+                                                stride.value());
 }
 
 } // namespace fvdb

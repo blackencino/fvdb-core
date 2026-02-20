@@ -16,12 +16,12 @@
 
 #include <fvdb/detail/ops/convolution/ImplicitGemmConv.h>
 
+#include <nanovdb/NanoVDB.h>
+
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/torch.h>
-
-#include <nanovdb/NanoVDB.h>
 
 #include <cute/algorithm/gemm.hpp>
 #include <cute/atom/copy_atom.hpp>
@@ -73,14 +73,14 @@ template <int T_, int R_, int S_> struct LeafConvGeometry {
 template <typename Scalar> struct MmaConfig;
 
 template <> struct MmaConfig<float> {
-    using MmaElement = cute::tfloat32_t;
-    using MmaAtom    = cute::SM80_16x8x8_F32TF32TF32F32_TN;
+    using MmaElement            = cute::tfloat32_t;
+    using MmaAtom               = cute::SM80_16x8x8_F32TF32TF32F32_TN;
     static constexpr int TILE_K = 8;
 };
 
 template <> struct MmaConfig<c10::Half> {
-    using MmaElement = cute::half_t;
-    using MmaAtom    = cute::SM80_16x8x16_F32F16F16F32_TN;
+    using MmaElement            = cute::half_t;
+    using MmaAtom               = cute::SM80_16x8x16_F32F16F16F32_TN;
     static constexpr int TILE_K = 16;
 };
 
@@ -122,9 +122,9 @@ leaf_fused_conv_kernel(GridBatchImpl::Accessor feat_acc,
     constexpr int TILE_N = 32;
     constexpr int TILE_K = Cfg::TILE_K;
 
-    using TiledMma =
-        TiledMMA<MMA_Atom<typename Cfg::MmaAtom>, Layout<Shape<_2, _2, _1>>,
-                 Tile<Int<TILE_M>, Int<TILE_N>, Int<TILE_K>>>;
+    using TiledMma = TiledMMA<MMA_Atom<typename Cfg::MmaAtom>,
+                              Layout<Shape<_2, _2, _1>>,
+                              Tile<Int<TILE_M>, Int<TILE_N>, Int<TILE_K>>>;
 
     extern __shared__ char smem_raw[];
     auto &smem = *reinterpret_cast<LeafConvSmem<Geom> *>(smem_raw);
@@ -154,9 +154,9 @@ leaf_fused_conv_kernel(GridBatchImpl::Accessor feat_acc,
     nanovdb::Coord halo_base = origin.offsetBy(Geom::Dx, Geom::Dy, Geom::Dz);
 
     for (int h = tid; h < Geom::HaloVol; h += nthreads) {
-        int const hi = h / (Geom::Hy * Geom::Hz);
-        int const hj = (h / Geom::Hz) % Geom::Hy;
-        int const hk = h % Geom::Hz;
+        int const hi         = h / (Geom::Hy * Geom::Hz);
+        int const hj         = (h / Geom::Hz) % Geom::Hy;
+        int const hk         = h % Geom::Hz;
         nanovdb::Coord coord = halo_base.offsetBy(hi, hj, hk);
         if (feat_tree_acc.isActive(coord)) {
             smem.gather_map[h] = feat_vo + static_cast<int64_t>(feat_tree_acc.getValue(coord)) - 1;
@@ -182,7 +182,8 @@ leaf_fused_conv_kernel(GridBatchImpl::Accessor feat_acc,
     int const K_total = C_in * Geom::KernVol;
 
     auto *tile_A_ptr = reinterpret_cast<MmaElement *>(smem.tile_buf);
-    auto *tile_B_ptr = reinterpret_cast<MmaElement *>(smem.tile_buf + TILE_M * TILE_K * sizeof(MmaElement));
+    auto *tile_B_ptr =
+        reinterpret_cast<MmaElement *>(smem.tile_buf + TILE_M * TILE_K * sizeof(MmaElement));
 
     auto sA = make_tensor(make_smem_ptr(tile_A_ptr),
                           make_layout(make_shape(Int<TILE_M>{}, Int<TILE_K>{}),
@@ -210,8 +211,8 @@ leaf_fused_conv_kernel(GridBatchImpl::Accessor feat_acc,
             for (int k0 = 0; k0 < K_total; k0 += TILE_K) {
                 // ---- Load weight tile A[TILE_M, TILE_K] into smem ----
                 for (int i = tid; i < AB_ELEMS; i += nthreads) {
-                    int m_local = i % TILE_M;
-                    int k_local = i / TILE_M;
+                    int m_local   = i % TILE_M;
+                    int k_local   = i / TILE_M;
                     tile_A_ptr[i] = wt_mma[(k0 + k_local) * C_out + (m0 + m_local)];
                 }
 
@@ -227,14 +228,14 @@ leaf_fused_conv_kernel(GridBatchImpl::Accessor feat_acc,
                     int dj       = (kern_pos / Geom::S) % Geom::R;
                     int dk       = kern_pos % Geom::S;
 
-                    int voxel   = n0 + n_local;
-                    int vi      = voxel >> 6;
-                    int vj      = (voxel >> 3) & 7;
-                    int vk      = voxel & 7;
+                    int voxel = n0 + n_local;
+                    int vi    = voxel >> 6;
+                    int vj    = (voxel >> 3) & 7;
+                    int vk    = voxel & 7;
                     int halo_idx =
                         (vi + di) * Geom::Hy * Geom::Hz + (vj + dj) * Geom::Hz + (vk + dk);
 
-                    int64_t g_idx  = smem.gather_map[halo_idx];
+                    int64_t g_idx = smem.gather_map[halo_idx];
                     tile_B_ptr[i] = (g_idx >= 0) ? feat_mma[g_idx * C_in + cin] : MmaElement{};
                 }
 
@@ -258,12 +259,12 @@ leaf_fused_conv_kernel(GridBatchImpl::Accessor feat_acc,
 
             // ---- Epilogue: accumulator -> smem -> gmem (with scatter) ----
             auto *smem_C = reinterpret_cast<float *>(smem.tile_buf);
-            auto sC      = make_tensor(
-                make_smem_ptr(smem_C),
-                make_layout(make_shape(Int<TILE_M>{}, Int<TILE_N>{}),
-                                 make_stride(Int<1>{}, Int<TILE_M>{})));
+            auto sC      = make_tensor(make_smem_ptr(smem_C),
+                                  make_layout(make_shape(Int<TILE_M>{}, Int<TILE_N>{}),
+                                              make_stride(Int<1>{}, Int<TILE_M>{})));
 
-            auto smem_copy_c     = make_tiled_copy_C(Copy_Atom<UniversalCopy<uint32_t>, float>{}, tiled_mma);
+            auto smem_copy_c =
+                make_tiled_copy_C(Copy_Atom<UniversalCopy<uint32_t>, float>{}, tiled_mma);
             auto smem_thr_copy_c = smem_copy_c.get_thread_slice(tid);
             auto tCrC_copy       = smem_thr_copy_c.retile_S(accum);
             auto tCsC            = smem_thr_copy_c.partition_D(sC);
@@ -325,14 +326,14 @@ launchLeafFusedConv(GridBatchImpl const &feature_grid,
     // where K_total = KernVol * C_in, with stride-1 along C_out for coalesced MMA loads.
     auto W = weights.permute({2, 3, 4, 1, 0}).contiguous().view({Geom::KernVol * C_in, C_out});
 
-    leaf_fused_conv_kernel<Geom, Scalar>
-        <<<static_cast<int>(num_leaves), THREADS, SMEM, stream>>>(feat_acc,
-                                                                  out_acc,
-                                                                  features.template data_ptr<Scalar>(),
-                                                                  W.template data_ptr<Scalar>(),
-                                                                  output.template data_ptr<Scalar>(),
-                                                                  C_in,
-                                                                  C_out);
+    leaf_fused_conv_kernel<Geom, Scalar><<<static_cast<int>(num_leaves), THREADS, SMEM, stream>>>(
+        feat_acc,
+        out_acc,
+        features.template data_ptr<Scalar>(),
+        W.template data_ptr<Scalar>(),
+        output.template data_ptr<Scalar>(),
+        C_in,
+        C_out);
 }
 
 // ============================================================================

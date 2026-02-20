@@ -856,12 +856,12 @@ struct GridBatch : torch::CustomClassHolder {
     /// Superblock GEMM sparse convolution (backward).
     static std::tuple<torch::Tensor, torch::Tensor>
     superblockConvolutionBackward(torch::Tensor grad_output,
-                                 torch::Tensor features,
-                                 torch::Tensor weights,
-                                 const GridBatch &feature_grid,
-                                 const GridBatch &output_grid,
-                                 const Vec3iOrScalar &kernelSize,
-                                 const Vec3iOrScalar &stride);
+                                  torch::Tensor features,
+                                  torch::Tensor weights,
+                                  const GridBatch &feature_grid,
+                                  const GridBatch &output_grid,
+                                  const Vec3iOrScalar &kernelSize,
+                                  const Vec3iOrScalar &stride);
 
     /// Superblock GEMM transposed sparse convolution (forward direction).
     static torch::Tensor superblockConvolutionTranspose(torch::Tensor features,

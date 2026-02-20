@@ -27,8 +27,9 @@ import torch
 from benchmark_sparse_conv_comparison import (
     ALL_ADAPTERS,
     BenchmarkResult,
-    DenseAdapter,
+    FVDBDenseAdapter,
     benchmark_one,
+    prepare_benchmark_inputs,
     save_results,
 )
 
@@ -36,7 +37,7 @@ from benchmark_sparse_conv_comparison import (
 # Sparse-only adapter list
 # ---------------------------------------------------------------------------
 
-SPARSE_ADAPTERS = [a for a in ALL_ADAPTERS if a is not DenseAdapter]
+SPARSE_ADAPTERS = [a for a in ALL_ADAPTERS if a is not FVDBDenseAdapter]
 
 
 def get_available_sparse_adapters():
@@ -113,12 +114,16 @@ def suite_scale(
         ijk = generate_sphere_narrowband(r)
         n = ijk.shape[0]
         bd = bbox_dim(ijk)
+        grid, features, weights = prepare_benchmark_inputs(ijk, C, C, K, device)
         params = {"radius": r, "voxels": n, "bbox_dim": bd, "channels": C, "kernel_size": K}
         print(f"\n[scale] radius={r}, {n:,} voxels, bbox={bd}, C={C}, K={K}")
         for acls in adapters:
-            res = benchmark_one(acls, ijk, C, C, K, device, bd, "scale", params, warmup, num_iters)
+            res = benchmark_one(acls, K, 1, grid, grid, features, weights, "scale", params, warmup, num_iters)
             if res:
-                print(f"  {res.library:20s}  mean={res.mean_ms:8.3f} ms  std={res.std_ms:6.3f}")
+                print(
+                    f"  {res.library:20s}  e2e={res.e2e_mean_ms:8.3f} ms"
+                    f"  exec={res.all_execute_mean_ms:8.3f} ms"
+                )
                 results.append(res)
     return results
 
@@ -138,12 +143,16 @@ def suite_channels(
     channels = [16, 32, 64, 128]
     K = 3
     for C in channels:
+        grid, features, weights = prepare_benchmark_inputs(ijk, C, C, K, device)
         params = {"radius": r, "voxels": n, "bbox_dim": bd, "channels": C, "kernel_size": K}
         print(f"\n[channels] radius={r} ({n:,} voxels), C={C}, K={K}")
         for acls in adapters:
-            res = benchmark_one(acls, ijk, C, C, K, device, bd, "channels", params, warmup, num_iters)
+            res = benchmark_one(acls, K, 1, grid, grid, features, weights, "channels", params, warmup, num_iters)
             if res:
-                print(f"  {res.library:20s}  mean={res.mean_ms:8.3f} ms  std={res.std_ms:6.3f}")
+                print(
+                    f"  {res.library:20s}  e2e={res.e2e_mean_ms:8.3f} ms"
+                    f"  exec={res.all_execute_mean_ms:8.3f} ms"
+                )
                 results.append(res)
     return results
 
@@ -164,6 +173,7 @@ def suite_extent(
         ijk = generate_two_spheres_narrowband(r, sep)
         n = ijk.shape[0]
         bd = bbox_dim(ijk)
+        grid, features, weights = prepare_benchmark_inputs(ijk, C, C, K, device)
         params = {
             "radius": r,
             "separation": sep,
@@ -174,9 +184,12 @@ def suite_extent(
         }
         print(f"\n[extent] 2 x sphere r={r}, sep={sep}, {n:,} voxels, bbox={bd}, C={C}, K={K}")
         for acls in adapters:
-            res = benchmark_one(acls, ijk, C, C, K, device, bd, "extent", params, warmup, num_iters)
+            res = benchmark_one(acls, K, 1, grid, grid, features, weights, "extent", params, warmup, num_iters)
             if res:
-                print(f"  {res.library:20s}  mean={res.mean_ms:8.3f} ms  std={res.std_ms:6.3f}")
+                print(
+                    f"  {res.library:20s}  e2e={res.e2e_mean_ms:8.3f} ms"
+                    f"  exec={res.all_execute_mean_ms:8.3f} ms"
+                )
                 results.append(res)
     return results
 
@@ -214,6 +227,7 @@ def main() -> None:
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
     all_results: list[BenchmarkResult] = []
+
     for name, fn in SUITES.items():
         print(f"\n{'=' * 60}")
         print(f"  Suite: {name}")

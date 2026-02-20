@@ -62,14 +62,13 @@ torch::Tensor superblockConv(torch::Tensor features,
 /// @param stride       Convolution stride (must be 1x1x1).
 /// @return             Tuple of (grad_features [feature_total_voxels, C_in],
 ///                               grad_weights  [C_out, C_in, k0, k1, k2]).
-std::tuple<torch::Tensor, torch::Tensor>
-superblockConvBackward(torch::Tensor grad_output,
-                       torch::Tensor features,
-                       torch::Tensor weights,
-                       GridBatchImpl const &feature_grid,
-                       GridBatchImpl const &output_grid,
-                       nanovdb::Coord kernel_size,
-                       nanovdb::Coord stride);
+std::tuple<torch::Tensor, torch::Tensor> superblockConvBackward(torch::Tensor grad_output,
+                                                                torch::Tensor features,
+                                                                torch::Tensor weights,
+                                                                GridBatchImpl const &feature_grid,
+                                                                GridBatchImpl const &output_grid,
+                                                                nanovdb::Coord kernel_size,
+                                                                nanovdb::Coord stride);
 
 /// Superblock GEMM transposed sparse convolution (forward direction of transpose).
 ///
