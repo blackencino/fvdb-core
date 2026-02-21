@@ -79,3 +79,5 @@ fvdb_tile/benchmarks/_generated/
 # Ignore generated files in fvdb_tile/tests/_generated
 fvdb_tile/tests/_generated/
 
+*_results.json
+comparison_*.png
