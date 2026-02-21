@@ -35,6 +35,8 @@ from .dsl_ast import (
     FindNode,
     FlattenNode,
     FloorDivNode,
+    FnCallNode,
+    FnDefNode,
     FuseNode,
     GatherNode,
     GENode,
@@ -224,6 +226,27 @@ def eval_node(node: Node, env: EvalEnv) -> Value:
 
     if isinstance(node, RefNode):
         return env.lookup(node.name)
+
+    # -- User-defined functions --
+
+    if isinstance(node, FnDefNode):
+        return Value(Type(Shape(), FnType(len(node.params), "<lambda>")), node)
+
+    if isinstance(node, FnCallNode):
+        fn_val = env.lookup(node.fn_name)
+        fn_def = fn_val.data
+        if not isinstance(fn_def, FnDefNode):
+            raise TypeError(f"{node.fn_name!r} is not a function definition")
+        if len(node.args) != len(fn_def.params):
+            raise TypeError(
+                f"{node.fn_name} expects {len(fn_def.params)} args, got {len(node.args)}"
+            )
+        arg_vals = [eval_node(a, env) for a in node.args]
+        child_env = EvalEnv(env.inputs, env.bindings, env.hooks)
+        child_env.locals = dict(env.locals)
+        for pname, aval in zip(fn_def.params, arg_vals):
+            child_env.locals[pname] = aval
+        return eval_node(fn_def.body, child_env)
 
     # -- Functions as values --
 

@@ -42,6 +42,8 @@ from .dsl_ast import (
     FindNode,
     FlattenNode,
     FloorDivNode,
+    FnCallNode,
+    FnDefNode,
     FuseNode,
     GatherNode,
     GENode,
@@ -263,8 +265,57 @@ class Parser:
     def parse_assignment(self) -> tuple[str, Node]:
         name = self.expect("NAME")
         self.expect("ASSIGN")
+        if self._is_fn_def():
+            fn_node = self._parse_fn_def()
+            return name, fn_node
         expr = self.parse_expr()
         return name, expr
+
+    def _is_fn_def(self) -> bool:
+        """Check if the current position starts a function definition: (params) => body."""
+        if not self.peek_kind("LPAREN"):
+            return False
+        depth = 0
+        i = self.pos
+        while i < len(self.tokens):
+            kind = self.tokens[i][0]
+            if kind == "LPAREN":
+                depth += 1
+            elif kind == "RPAREN":
+                depth -= 1
+                if depth == 0:
+                    return (
+                        i + 1 < len(self.tokens)
+                        and self.tokens[i + 1][0] == "ARROW"
+                    )
+            i += 1
+        return False
+
+    def _parse_fn_def(self) -> FnDefNode:
+        """Parse (param1, param2, ...) => body."""
+        self.expect("LPAREN")
+        params = []
+        if self.peek_kind("NAME"):
+            params.append(self.advance()[1])
+            while self.peek_kind("COMMA"):
+                self.advance()
+                params.append(self.expect("NAME"))
+        self.expect("RPAREN")
+        self.expect("ARROW")
+        body = self.parse_expr()
+        return FnDefNode(params=tuple(params), body=body)
+
+    def _parse_fn_call(self, fn_name: str) -> FnCallNode:
+        """Parse fn_name(arg1, arg2, ...)."""
+        self.expect("LPAREN")
+        args = []
+        if self.peek_not_kind("RPAREN"):
+            args.append(self.parse_expr())
+            while self.peek_kind("COMMA"):
+                self.advance()
+                args.append(self.parse_expr())
+        self.expect("RPAREN")
+        return FnCallNode(fn_name=fn_name, args=tuple(args))
 
     # -- Expressions --
 
@@ -285,8 +336,9 @@ class Parser:
                 return RefNode(name)
         elif kind == "NAME":
             name = self.advance()[1]
-            if name in self.bindings:
-                return RefNode(name)
+            if name in self.bindings and isinstance(self.bindings[name], FnDefNode):
+                if self.peek_kind("LPAREN"):
+                    return self._parse_fn_call(name)
             return RefNode(name)
         elif kind == "INT":
             return self.parse_int_literal()

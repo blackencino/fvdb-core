@@ -159,6 +159,42 @@ def main():
     _run("cross_boundary_neighbor", test_cross_boundary_neighbor)
     _run("batch_cross_leaf", test_batch_cross_leaf)
 
+    # -- named functions --
+    print()
+    print("=" * 60)
+    print("Named Functions: parse, type, eval, pipeline")
+    print("=" * 60)
+    from fvdb_tile.tests.test_named_functions import (
+        test_parse_fn_def,
+        test_parse_fn_call,
+        test_parse_multi_param,
+        test_type_inference,
+        test_type_inference_with_inputs,
+        test_eval_simple,
+        test_eval_multi_param,
+        test_eval_with_tensor_input,
+        test_reuse_function,
+        test_function_calling_function,
+        test_pipeline_no_barrier,
+        test_pipeline_barrier_in_body,
+        test_pipeline_execution,
+        test_gather_in_function,
+    )
+    _run("parse_fn_def", test_parse_fn_def)
+    _run("parse_fn_call", test_parse_fn_call)
+    _run("parse_multi_param", test_parse_multi_param)
+    _run("type_inference", test_type_inference)
+    _run("type_inference_with_inputs", test_type_inference_with_inputs)
+    _run("eval_simple", test_eval_simple)
+    _run("eval_multi_param", test_eval_multi_param)
+    _run("eval_with_tensor_input", test_eval_with_tensor_input)
+    _run("reuse_function", test_reuse_function)
+    _run("function_calling_function", test_function_calling_function)
+    _run("pipeline_no_barrier", test_pipeline_no_barrier)
+    _run("pipeline_barrier_in_body", test_pipeline_barrier_in_body)
+    _run("pipeline_execution", test_pipeline_execution)
+    _run("gather_in_function", test_gather_in_function)
+
     # -- hash map + dialect lowering --
     print()
     print("=" * 60)

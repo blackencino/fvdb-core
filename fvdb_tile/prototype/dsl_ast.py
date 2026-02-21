@@ -1363,6 +1363,59 @@ class MaskToCoordsNode(Node):
 
 
 # ---------------------------------------------------------------------------
+# User-defined functions
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FnDefNode(Node):
+    """Named function definition: name = (params) => body.
+
+    Stored as a binding value (not applied to data). Type is deferred
+    until the function is called with concrete argument types.
+    """
+
+    params: tuple[str, ...]
+    body: Node
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        return Type(Shape(), FnType(len(self.params), "<lambda>"))
+
+    def __repr__(self) -> str:
+        return f"({', '.join(self.params)}) => {self.body}"
+
+
+@dataclass(frozen=True)
+class FnCallNode(Node):
+    """Call a user-defined function by name with arguments.
+
+    Resolved at type-inference and evaluation time by looking up the
+    FnDefNode from the binding environment.
+    """
+
+    fn_name: str
+    args: tuple[Node, ...]
+
+    def infer_type(self, env: Env, inputs: InputDecls) -> Type:
+        fn_ast = env.get(f"__ast__{self.fn_name}")
+        if fn_ast is None or not isinstance(fn_ast, FnDefNode):
+            raise TypeError(f"Cannot resolve function {self.fn_name!r} for type inference")
+        if len(self.args) != len(fn_ast.params):
+            raise TypeError(
+                f"{self.fn_name} expects {len(fn_ast.params)} args, got {len(self.args)}"
+            )
+        arg_types = [a.infer_type(env, inputs) for a in self.args]
+        inner_env = dict(env)
+        for pname, aty in zip(fn_ast.params, arg_types):
+            inner_env[pname] = aty
+        return fn_ast.body.infer_type(inner_env, inputs)
+
+    def __repr__(self) -> str:
+        arg_strs = ", ".join(repr(a) for a in self.args)
+        return f"{self.fn_name}({arg_strs})"
+
+
+# ---------------------------------------------------------------------------
 # Program: a sequence of let-bindings + an output
 # ---------------------------------------------------------------------------
 

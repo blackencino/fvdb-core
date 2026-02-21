@@ -1273,7 +1273,7 @@ File inventory:
 | `prototype/types.py` | core | Extent kinds (Static/Dynamic/Jagged), Shape, Type, ScalarType, FnType |
 | `prototype/layouts.py` | core | Layout wrappers (lowercase): cut, indexed, tuple, struct, flip, jagged, masked, fuse, flatten, permute |
 | `prototype/ops.py` | core | Python-level operations + CPU-only reference hashmap; FnValue + VERBS registry |
-| `prototype/dsl_ast.py` | core | AST node classes (~30 nodes) with `infer_type` methods |
+| `prototype/dsl_ast.py` | core | AST node classes (~30 nodes + FnDefNode/FnCallNode) with `infer_type` methods |
 | `prototype/dsl_parse.py` | core | Recursive-descent parser: string -> AST |
 | `prototype/dsl_eval.py` | core | Tree-walk evaluator with hooks: type-check pass then torch execution |
 | `prototype/dsl_pipeline.py` | core | Barrier-aware pipeline planner, GPU collective dispatch, cutile segment compilation |
@@ -1298,6 +1298,7 @@ File inventory:
 | `tests/test_pipeline.py` | | Pipeline planning, collective dispatch, cutile segments |
 | `tests/test_conv_grid.py` | | conv_grid correctness, stride semantics |
 | `tests/test_conv_grid_leafwise.py` | | Leafwise conv_grid CPU + GPU correctness |
+| `tests/test_named_functions.py` | | Named function definition, calling, type inference, pipeline transparency |
 | `tests/test_hashmap.py` | | Hash map primitives, bitwise ops, dialect lowering |
 | `tests/test_adverbs.py` | | Nested adverbs, outer product, function values |
 | `tests/test_layouts_advanced.py` | | fuse, flatten, permute, EachBoth, dot product |
@@ -1318,7 +1319,7 @@ File inventory:
 
 ### Current state
 
-The DSL has ~25 keywords. **Layouts use lowercase** (`cut`, `reshape`,
+The DSL has ~25 keywords plus user-defined named functions. **Layouts use lowercase** (`cut`, `reshape`,
 `field`, `masked`) -- they reinterpret types without moving data.
 **Operations use PascalCase** (`Map`, `Each`, `Where`, `Gather`, `Over`,
 `Scan`, `Add`, etc.) -- they do computational work. This convention makes the cost model visible
@@ -1464,6 +1465,13 @@ Key semantic rules (see Leading Shape Theory section for full details):
 49. cuTile fallback: cutile segments that fail compilation gracefully
     fall back to the evaluator. cuTile is an optimisation; the
     evaluator's torch ops are device-agnostic and correct on CUDA.
+51. Named functions in DSL: `name = (params) => body` defines reusable
+    functions.  Function calls `f(arg1, arg2)` are transparent to the
+    pipeline planner (barrier detection inlines function bodies).  Type
+    inference is concrete -- deferred until call site, then inferred from
+    argument types.  Functions can call other functions.  14 tests cover
+    parsing, type inference, evaluation, reuse, composition, and
+    pipeline transparency.
 50. Adverb cuTile emission: composed adverb chains
     (`EachLeft(EachRight(EachBoth(Add)))`) compile directly to cuTile
     GPU kernels. The adverb chain is the scheduling specification:
@@ -1582,94 +1590,83 @@ Vectorized CPU loops over tensor data in CIG construction and evaluator
 unique.  Added `is_cuda` guards on CPU-only reference hashmap.  Added
 `# DSL status:` / `# OUT_OF_DSL:` markers to all application files.
 
-### The OUT_OF_DSL problem
+### Thesis boundaries
 
-Two remaining components bypass the DSL/AST pipeline.  A third
-(`conv_grid_leafwise`) has been resolved.
+**What does NOT break the thesis:**
 
-**1. `conv_grid_leafwise.py` -- RESOLVED.**  Now DSL-driven via
-`DilateLeafMasksNode`, a typed 8x8x8 leaf primitive.  The DSL pipeline
-has three phases: torch collectives (hash map build), DilateLeafMasks
-(dispatched to the fused CUDA kernel via hook), torch collectives
-(MaskToCoords).  The hand-written CUDA kernel is the backend, not an
-escape hatch.  See Phase 4 of the OUT_OF_DSL compliance work.
+- **Multiple kernel launches.**  Sequential pipeline segments with torch
+  collectives between them are the intended compilation model, not a
+  deficiency.  Some operations (global sort, unique, prefix sum) are
+  inherently collective and always map to optimised library calls.  The
+  DSL program specifies the algorithm; the pipeline segments are the
+  schedule.  This is the Halide analogy: algorithm and schedule are
+  separate concerns.
 
-**2. `cig.py` -- CIG construction.**  `build_compressed_cig3` is
+- **Hashmap/dict as a built-in type.**  APL/J/K have `dict` and `table`
+  as core grammar types, with `!` (key), `?` (find), and associated
+  vocabulary.  Our `HashMapBuild`, `HashMapLookup`, `HashMapOccupied`
+  are the same pattern -- built-in types with dedicated GPU backends.
+  The DSL wraps them as typed nodes; the GPU kernels (atomicCAS build,
+  probe loop lookup) are intrinsic implementations of those types.
+  This does not weaken the thesis; it matches the precedent of every
+  successful array language.
+
+- **Domain types** like "8x8x8 bitmask leaf node" and "8x8x8xC feature
+  leaf."  These describe any tiled sparse structure with a tile size
+  parameter, not just NanoVDB.  The tile size (8^3, 16^3, 32^3) is a
+  configuration, not a hard-coded assumption.
+
+- **`DilateLeafMasks`** as a typed primitive with a fused GPU backend.
+  It is a domain verb (shift + scatter-OR over leaf masks), not an
+  escape hatch.  The 8x8x8 leaf mask is a core type in the domain;
+  operating on it is analogous to operating on APL's boolean vectors.
+
+- **conv_grid and conv_grid_leafwise.**  These are the thesis in action:
+  real topology algorithms expressed as small DSL compositions (5 and 13
+  bindings respectively), beating fVDB performance at scale (1.5-1.7x
+  at 100K+ voxels with k=5).  The algorithms are DSL program strings;
+  the pipeline planner segments them automatically; the executor
+  dispatches to GPU.
+
+**What WOULD break the thesis:**
+
+- Hard-coding the 3-4-5 NanoVDB tree structure as a required grid shape.
+- Making `conv_grid` map to a hand-written kernel sequence that assumes
+  the full NanoVDB node hierarchy.
+- Adding NanoVDB-specific traversal algorithms as DSL primitives
+  (vs composing from generic operations like Decompose + chained Gather).
+
+**Mild concern (acceptable):**
+
+- `HierarchicalKey` / `HierarchicalKeyDecode` are somewhat specific to
+  NanoVDB-style grids.  However, they generalise over tile size and
+  number of layers (the bit-widths are parameters, not hard-coded).  The
+  operation itself (interleaved multi-level linearisation) is generic to
+  any hierarchical tiled structure.  Monitor but do not remove.
+
+### Remaining OUT_OF_DSL
+
+One component bypasses the DSL/AST pipeline.  Two previously
+out-of-DSL components (conv_grid, conv_grid_leafwise) have been
+resolved.
+
+**`cig.py` -- CIG construction.**  `build_compressed_cig3` is
 imperative torch code (sort + unique + scatter).  The query path is
 fully DSL-driven; construction is not.  Construction is structurally a
-sequence of Sort + Unique + scatter operations -- the same pattern the
-pipeline already handles for conv_grid -- but with bitmask packing that
-needs vectorized scatter-OR.
+sequence of Decompose + Unique + ScatterOr + Scan(Add) operations --
+the same pipeline pattern used by conv_grid.  The path forward is to
+express it as a DSL program with named functions (the
+`build_masked_level` pattern repeats three times) and new keyword-level
+primitives (`HammingWeight`, `ScatterOr`, `ScatterAdd`).
 
-**3. `hashmap_cuda.py` -- GPU hash map kernels.**  Build, lookup,
+**`hashmap_cuda.py` -- GPU hash map kernels.**  Build, lookup,
 scatter_reduce, and conv_grid_dilate are hand-written NVRTC CUDA.  The
 dialect mechanism (`dialect_hashmap.py`) wraps build/lookup as DSL
-nodes, so pipeline programs can reference them.  But the actual compute
-is opaque to the emitter.
+nodes, so pipeline programs can reference them.  The actual GPU compute
+is opaque to the emitter -- this is the correct pattern, matching
+APL/J/K's built-in dictionary operations with dedicated implementations.
 
-### Approaches to resolving OUT_OF_DSL
-
-Several paths exist, with different trade-offs.  These need to be
-weighed before committing to an implementation.
-
-**Approach A: AST-level fusion.**  Express the full algorithm in the
-DSL.  Add a fusion pass that recognises patterns spanning multiple
-pipeline segments and emits a single fused kernel.  The DSL program is
-the source of truth; the fused kernel is a compiler optimisation.
-
-- Pro: purest validation of the thesis.  The DSL can express the
-  algorithm and the compiler can make it fast.
-- Con: requires a non-trivial fusion pass.  The conv_grid_leafwise
-  kernel fuses across collective barriers (hash map + scatter-reduce),
-  which means the fusion pass must reason about atomics and cross-thread
-  coordination.
-- Candidate: conv_grid_leafwise, since the DSL program already exists
-  in the docstring and the hand-fused kernel serves as ground truth.
-
-**Approach B: Intrinsic dialect expansion.**  Promote the hash map
-and scatter-reduce operations to first-class DSL primitives with
-dedicated GPU backends.  The emitter generates code that calls into
-the existing CUDA kernels as intrinsics.
-
-- Pro: reuses proven kernels.  Minimal emitter changes.
-- Con: the DSL vocabulary grows with implementation-specific operations
-  (HashMapBuild, ScatterReduce(OR), etc.).  The "minimal coding"
-  thesis weakens.
-- This is partially done: `dialect_hashmap.py` already wraps
-  HashMapBuild/Lookup.
-
-**Approach C: Hybrid with idiom recognition.**  Express the algorithm
-in the DSL using generic primitives (Sort, Unique, Gather,
-ScatterReduce).  The emitter recognises the specific pattern
-(expand + scatter_reduce(OR) + hash_probe) and replaces the segment
-sequence with the fused kernel.  Similar to how the emitter already
-fuses `Gather(Gather(A, i), j)` into a single 4D gather.
-
-- Pro: the DSL stays generic; fusion is an optimisation, not a language
-  feature.  Idiom recognition is already a proven pattern in the emitter
-  (three idioms exist: chained Gather, masked Gather, Find).
-- Con: the idiom needs to span pipeline segment boundaries (the hash map
-  build is a barrier).  This is harder than intra-segment idiom
-  recognition.
-
-**Approach D: Construction via pipeline.**  Express CIG construction
-as a DSL pipeline program (like conv_grid).  The sort + unique +
-scatter pattern maps directly to existing pipeline primitives.  The
-bitmask packing step becomes a new `PackMask` or `ScatterBitOr` node.
-
-- Pro: construction and query share the same DSL infrastructure.
-- Con: CIG construction is a one-time cost and the current imperative
-  torch code works.  Lower priority than the hot-path dilation kernel.
-
-**Recommended sequence:**  Start with Approach C (hybrid idiom
-recognition) targeting `conv_grid_leafwise`.  The DSL program already
-exists.  The pattern -- expand pairs, scatter-reduce with fused hash
-probe -- is specific enough for reliable idiom detection.  If the
-fusion pass generalises cleanly, apply it to CIG construction
-(Approach D) and then to the hash map kernels themselves.  Approach A
-is the long-term goal; Approach C is the pragmatic bridge.
-
-### Kernel fusion: current state and cross-barrier challenge
+### Intra-segment fusion
 
 The emitter already performs **intra-segment fusion** -- merging adjacent
 AST nodes within a single pipeline segment into one block of generated
@@ -1687,62 +1684,46 @@ These are all **intra-segment**: the fusion happens inside the emitter's
 tree-walk over a single segment's AST.  The pipeline planner is not
 involved -- it sees one segment, the emitter fuses internally.
 
-The unsolved problem is **cross-barrier fusion**.  The pipeline planner
-splits the AST at barrier nodes (Sort, Unique, HashMapBuild,
-HashMapLookup, ShiftLeafMask, MaskToCoords).  Each segment becomes a
-separate kernel launch or torch op.  The `conv_grid_leafwise` problem
-requires fusing across these barriers:
+Cross-barrier fusion (merging adjacent segments where atomics can
+replace sequential dependencies) is a future performance optimisation,
+not a thesis requirement.  The repertoire of fusible idioms will grow
+as we encounter more patterns.
 
-```
-Segment 1 (collective): HashMapBuild(unique_keys)       -- build output leaf map
-Segment 2 (fused):      for each (leaf, offset) pair:
-                           shift mask, decompose boundary,
-                           hash-probe target leaf,
-                           atomicOr shifted bits into output -- accumulate masks
-Segment 3 (cutile):     MaskToCoords(output_masks)       -- extract voxel coords
-```
+### Next steps
 
-The hand-fused `conv_grid_dilate_kernel` combines segments 1-2 into a
-single kernel where each thread does its own hash probe (open addressing)
-and `atomicOr` into the output.  This works because OR is commutative
-and associative, so concurrent writes produce the same result as
-sequential scatter-reduce.
+**1. Named functions in the DSL.**  The parser currently supports
+`v => body` only inside `Map`/`Each`.  Add a general function
+definition form: `name = (args) => body`.  This enables reuse of
+patterns like `build_masked_level` in CIG construction.  The syntax is
+intentionally pedantic -- one step desugared from a possible K-esque
+ultra-compact form.  A future sugaring layer can add APL/J/K "default
+argument name" conventions; for now, explicit parameter names are
+correct.
 
-**What cross-barrier fusion requires:**
+**2. Preamble management.**  A system for pre-defined DSL bindings
+available to all programs.  Starts near-empty, grows organically as
+patterns emerge across algorithms.  Analogous to K's `q.k` standard
+library.
 
-- A **fusion analysis pass** that examines adjacent segments and
-  determines whether the inter-segment data dependency can be replaced
-  by atomic operations.
-- For `ScatterReduce(op, ...)` where `op` is commutative+associative
-  (OR, ADD, MAX), the build-then-scatter pattern can become
-  probe-and-atomic in a single kernel.
-- The hash map itself must be pre-built (or built with `atomicCAS` in
-  the same kernel -- which is what `gpu_hash_map_build` already does).
-- The fusion pass recognises the pattern: `HashMapBuild(keys)` followed
-  by element-wise work that scatters into the map with a commutative
-  reducer, and replaces the two segments with a single fused kernel that
-  combines hash probe and atomic scatter.
+**3. CIG3 construction as a DSL program.**  Express
+`build_compressed_cig3` as a DSL program string.  Requires: named
+functions (for the repeated `build_masked_level` pattern), plus new
+keyword-level primitives: `HammingWeight` (popcount), `ScatterOr`
+(bitmask accumulation), `ScatterAdd` (child counting), and `Scan(Add)`
+as a collective barrier dispatched to `torch.cumsum`.  All defensible
+additions to the DSL vocabulary.
 
-This is the compiler-mechanics counterpart of Approach C above.
-Approach C describes the product strategy (express in DSL, fuse via
-idiom recognition); this section describes the specific compiler pass
-that makes it work.  The existing intra-segment idiom detection is the
-proof that pattern-based fusion works; the challenge is extending it
-across segment boundaries where atomics replace sequential dependencies.
-
-### Other recommended steps
-
-**1. Close the query performance gap (16-21% vs NanoVDB).**  The
+**4. Close the query performance gap (16-21% vs NanoVDB).**  The
 3-level CIG is within 16-21% of NanoVDB at 20-30x less memory.
 Investigate hardware popcount via `CUDA_TILE_LOGS=CUTILEIR`.  If
 cuTile does not lower the Hamming weight pattern to `__popcll()`, add
 a `Popc` DSL primitive that maps to the hardware intrinsic.
 
-**2. Next fVDB operations.**  `neighbor_indexes`, `dilated_grid`,
+**5. Next fVDB operations.**  `neighbor_indexes`, `dilated_grid`,
 `sample_trilinear`, `inject_from`/`inject_to`.  The cross-leaf pattern
 (v5/v6) and pipeline architecture already support these.
 
-**3. Batch dimension.**  One kernel launch per grid (simplest), jagged
+**6. Batch dimension.**  One kernel launch per grid (simplest), jagged
 outer `Each` (DSL-native), or packed contiguous storage.
 
 ### cuTile backend notes
@@ -1830,11 +1811,15 @@ extension.
 
 ### Medium-term items
 
-- **Cross-barrier fusion** (generalise the DilateLeafMasks pattern):
-  the current `DilateLeafMasksNode` is a hand-specified fused primitive.
-  The next step is automatic fusion: the planner recognises adjacent
-  segments where atomics can replace sequential dependencies and emits
-  a single fused CUDA kernel.  See "Kernel fusion" section above.
+- **DSL sugaring layer**: ultra-compact K-esque syntax that desugars to
+  the current pedantic form.  Default argument names, tacit composition,
+  train notation.  The current DSL is the "one step desugared" form;
+  the sugar is the user-facing layer.
+- **Cross-barrier fusion** (performance optimisation, not thesis
+  concern): expand the repertoire of fusible idiom combinations.  The
+  existing three intra-segment idioms prove pattern-based fusion works;
+  extending across segment boundaries where atomics replace sequential
+  dependencies is the next step.
 - **Direct IR emission** (eliminate `_generated/` files): retarget the
   cuTile emitter to TileIR and keep the NVRTC path in-memory.  See
   "Kernel synthesis" section above for the hybrid model and trade-offs.

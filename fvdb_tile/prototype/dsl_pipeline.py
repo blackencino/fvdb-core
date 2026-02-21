@@ -44,6 +44,8 @@ from .dsl_ast import (
     EachNode,
     EqNode,
     FloorDivNode,
+    FnCallNode,
+    FnDefNode,
     FuseNode,
     HashMapBuildNode,
     HashMapLookupNode,
@@ -165,10 +167,19 @@ def _collect_refs(node: Node, bound: set[str] | None = None) -> set[str]:
         refs |= _collect_refs(node.input, bound)
         refs |= _collect_refs(node.body, inner_bound)
         return refs
+    if isinstance(node, FnDefNode):
+        inner_bound = bound | set(node.params)
+        refs |= _collect_refs(node.body, inner_bound)
+        return refs
+    if isinstance(node, FnCallNode):
+        refs.add(node.fn_name)
+        for arg in node.args:
+            refs |= _collect_refs(arg, bound)
+        return refs
     for child in vars(node).values():
         if isinstance(child, Node):
             refs |= _collect_refs(child, bound)
-        elif isinstance(child, list):
+        elif isinstance(child, (list, tuple)):
             for elem in child:
                 if isinstance(elem, Node):
                     refs |= _collect_refs(elem, bound)
@@ -406,6 +417,12 @@ def _node_to_source(node: Node) -> str:
             f"{_node_to_source(node.leaf_coords)}, {_node_to_source(node.offsets)}, "
             f"{_node_to_source(node.hash_map_keys)})"
         )
+    if isinstance(node, FnDefNode):
+        params = ", ".join(node.params)
+        return f"({params}) => {_node_to_source(node.body)}"
+    if isinstance(node, FnCallNode):
+        arg_strs = ", ".join(_node_to_source(a) for a in node.args)
+        return f"{node.fn_name}({arg_strs})"
     raise TypeError(f"Cannot serialize {type(node).__name__} to DSL source")
 
 
@@ -911,11 +928,13 @@ _BARRIER_NODE_TYPES = (
 _CUTILE_EMITTABLE_IN_BODY = (OverNode,)
 
 
-def _contains_barrier(node: Node) -> bool:
-    return _check_barriers(node, in_map_body=False)
+def _contains_barrier(node: Node, fn_defs: dict[str, FnDefNode] | None = None) -> bool:
+    return _check_barriers(node, in_map_body=False, fn_defs=fn_defs)
 
 
-def _check_barriers(node: Node, in_map_body: bool) -> bool:
+def _check_barriers(node: Node, in_map_body: bool, fn_defs: dict[str, FnDefNode] | None = None) -> bool:
+    if fn_defs is None:
+        fn_defs = {}
     if isinstance(node, _BARRIER_NODE_TYPES):
         if in_map_body and isinstance(node, _CUTILE_EMITTABLE_IN_BODY):
             pass  # safe for cuTile: tile-level reduction inside per-element body
@@ -931,14 +950,18 @@ def _check_barriers(node: Node, in_map_body: bool) -> bool:
         and not in_map_body
     ):
         return True
+    if isinstance(node, FnCallNode):
+        fn_def = fn_defs.get(node.fn_name)
+        if fn_def is not None and _check_barriers(fn_def.body, in_map_body, fn_defs):
+            return True
     for name, child in vars(node).items():
         child_in_body = in_map_body or (isinstance(node, (MapNode, EachNode)) and name == "body")
         if isinstance(child, Node):
-            if _check_barriers(child, child_in_body):
+            if _check_barriers(child, child_in_body, fn_defs):
                 return True
-        elif isinstance(child, list):
+        elif isinstance(child, (list, tuple)):
             for elem in child:
-                if isinstance(elem, Node) and _check_barriers(elem, child_in_body):
+                if isinstance(elem, Node) and _check_barriers(elem, child_in_body, fn_defs):
                     return True
     return False
 
@@ -1061,6 +1084,7 @@ def _normalize_adverbs(program: Program) -> Program:
 def plan_program(program: Program) -> PipelinePlan:
     segments: list[PipelineSegment] = []
     pending_cutile: list[PlannedBinding] = []
+    fn_defs: dict[str, FnDefNode] = {}
 
     def flush_cutile():
         if pending_cutile:
@@ -1074,8 +1098,12 @@ def plan_program(program: Program) -> PipelinePlan:
             pending_cutile.clear()
 
     for name, node in program.bindings:
+        if isinstance(node, FnDefNode):
+            fn_defs[name] = node
+            pending_cutile.append(PlannedBinding(name=name, node=node))
+            continue
         binding = PlannedBinding(name=name, node=node)
-        if _contains_barrier(node):
+        if _contains_barrier(node, fn_defs=fn_defs):
             flush_cutile()
             kind = "cutile" if _is_cutile_emittable_adverb(node) else "collective"
             segments.append(
