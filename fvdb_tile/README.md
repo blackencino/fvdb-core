@@ -1691,14 +1691,46 @@ as we encounter more patterns.
 
 ### Next steps
 
-**1. Named functions in the DSL.**  The parser currently supports
-`v => body` only inside `Map`/`Each`.  Add a general function
-definition form: `name = (args) => body`.  This enables reuse of
-patterns like `build_masked_level` in CIG construction.  The syntax is
-intentionally pedantic -- one step desugared from a possible K-esque
-ultra-compact form.  A future sugaring layer can add APL/J/K "default
-argument name" conventions; for now, explicit parameter names are
-correct.
+**What is actually novel.**  Named functions, type inference, nested
+scoping, HM-style type lattices -- these are standard PL machinery.
+Any hobby array language has them.  Most of what we've demonstrated
+could be replicated by Python functions returning thunk objects with a
+final graph-compile step (JAX-style tracing, Triton decorators, PyTorch
+FX).  That would not convince a skeptical reader.
+
+The contribution is the specific interaction between **adverb
+composition** (function transformers that compose freely to build
+abstract iteration specifications) and **nested layouts** (hierarchical
+or irregular data descriptions as metadata over tensors).  When a
+composed adverb chain meets typed data with a nested layout, the
+combination uniquely determines the GPU kernel's iteration structure --
+including correct indexing for jagged, masked, and hierarchical
+domains.  A torch-style computation graph captures `broadcast-add +
+reshape`; it does not capture "for each of N items, expand by K
+offsets, add component-wise."  The structural meaning is lost in the
+broadcasting rules.  The same adverb composition works unchanged across
+different layouts; the same layout can be iterated differently by
+different adverb compositions.
+
+| System | Computation | Iteration structure |
+|--------|-------------|----------------------|
+| Torch/JAX graphs | captured | implicit in broadcast rules |
+| Triton | captured | manual (explicit tile loops) |
+| Halide | algorithm/schedule split | rectangular domains |
+| This system | verbs + adverbs | composed from adverbs, over nested/jagged/masked domains |
+
+Example: `(R/P/:)\:':` in K syntax is a composed function specifying
+an iteration pattern without naming data.  It becomes a concrete
+kernel only when applied to structured data.  No torch equivalent
+exists.  The PL mechanics (named functions, preamble, sugaring) are
+support infrastructure.  The core contribution is already demonstrated
+by conv_grid and conv_grid_leafwise.  Future work should be evaluated
+by whether it exercises the adverb-composition-x-layout axis, not by
+whether it adds more PL features.
+
+**1. Named functions in the DSL -- DONE.**  `name = (params) => body`
+syntax enables reuse of patterns like `build_masked_level` in CIG
+construction.  See `test_named_functions.py`.
 
 **2. Preamble management.**  A system for pre-defined DSL bindings
 available to all programs.  Starts near-empty, grows organically as
