@@ -7,8 +7,10 @@ import unittest
 from typing import List
 
 import numpy as np
+import pytest
 import torch
-import torch_scatter
+
+torch_scatter = pytest.importorskip("torch_scatter")
 from fvdb.types import (
     ListOfListsOfTensors,
     ListOfTensors,

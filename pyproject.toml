@@ -48,6 +48,6 @@ packages = ["fvdb"]
 
 # This is so that the WIP tests are not run
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "fvdb_tile/tests"]
 python_files = ["test_*.py"]
-norecursedirs = ["wip", "fvdb_tile", ".*", "build", "dist"]
+norecursedirs = ["wip", ".*", "build", "dist"]

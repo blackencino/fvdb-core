@@ -42,8 +42,7 @@
     "python.testing.pytestEnabled": true,
     "python.testing.unittestEnabled": false,
     "python.testing.pytestArgs": [
-        "-v",
-        "tests"
+        "-v"
     ],
     "black-formatter.args": [
         "--target-version=py311",
@@ -64,4 +63,5 @@
     },
     "cursorpyright.analysis.typeCheckingMode": "basic",
     "python.REPL.enableREPLSmartSend": false,
+    "python.defaultInterpreterPath": "~/.venvs/fvdb_cutile/bin/python",
 }
