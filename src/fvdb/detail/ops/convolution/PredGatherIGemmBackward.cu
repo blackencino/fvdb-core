@@ -23,15 +23,7 @@
 //   - Batch size 1
 //
 // TODO: remaining performance bottlenecks
-//   1. cp.async pipelining: loads and MMA compute are fully serialized
-//      (single-buffered). Adopting the forward's multi-stage
-//      MainloopSm80CpAsyncPredGatherB pattern would overlap global loads
-//      with tensor-core compute for ~2x on memory-bound tiles.
-//   2. Empty-cluster early exit: sparse leaves waste MMA cycles on
-//      zero-filled 64-voxel clusters. Skipping clusters whose output
-//      rows are all inactive would eliminate ~75% of work at 25%
-//      occupancy and ~90% at 10%.
-//   3. Kernel-offset fusion for dgrad: the current loop does one
+//   1. Kernel-offset fusion for dgrad: the current loop does one
 //      separate GEMM per (cluster, kernel_offset). Fusing multiple
 //      kernel offsets into the K-reduction dimension (as the forward
 //      fuses C*T*R*S) would increase arithmetic intensity per tile and
@@ -224,6 +216,24 @@ weightIndex(int oc, int ic, int t, int r, int s, int C) {
            s;
 }
 
+__device__ __forceinline__ uint8_t
+computeActiveClusterMask(const uint64_t *leaf_idx) {
+    uint8_t mask = 0;
+    for (int cid = 0; cid < kClustersPerLeaf; ++cid) {
+        int bx, by, bz;
+        clusterIdToBase(cid, bx, by, bz);
+        for (int n = 0; n < kClusterVoxels; ++n) {
+            int lx, ly, lz;
+            voxelIdToLocal(n, lx, ly, lz);
+            if (leaf_idx[leafLinearIndex(bx + lx, by + ly, bz + lz)] != 0) {
+                mask |= static_cast<uint8_t>(1 << cid);
+                break;
+            }
+        }
+    }
+    return mask;
+}
+
 // ============================================================================
 // Gather layout utilities for cp.async pipelining
 // ============================================================================
@@ -333,6 +343,8 @@ predGatherIGemmDgradKernel(const nanovdb::NanoGrid<BuildT> *act_grid,
     auto const act_origin =
         nanovdb::Coord(out_origin[0] * Stride, out_origin[1] * Stride, out_origin[2] * Stride);
 
+    uint8_t const active_cluster_mask = computeActiveClusterMask(smem.leaf_idx);
+
     // ---- MMA / copy setup (reused across all iterations) ----
 
     DgradMma tiled_mma;
@@ -371,6 +383,9 @@ predGatherIGemmDgradKernel(const nanovdb::NanoGrid<BuildT> *act_grid,
     // ---- main loop: cluster → kernel_offset → pipelined K-tiles ----
 
     for (int cluster_id = 0; cluster_id < kClustersPerLeaf; ++cluster_id) {
+        if (!(active_cluster_mask & (1 << cluster_id)))
+            continue;
+
         int bx, by, bz;
         clusterIdToBase(cluster_id, bx, by, bz);
 
@@ -580,6 +595,8 @@ predGatherIGemmWgradKernel(const nanovdb::NanoGrid<BuildT> *act_grid,
     auto const act_origin =
         nanovdb::Coord(out_origin[0] * Stride, out_origin[1] * Stride, out_origin[2] * Stride);
 
+    uint8_t const active_cluster_mask = computeActiveClusterMask(smem.leaf_idx);
+
     // ---- MMA / copy setup ----
 
     WgradMma tiled_mma;
@@ -615,6 +632,9 @@ predGatherIGemmWgradKernel(const nanovdb::NanoGrid<BuildT> *act_grid,
         clear(accum);
 
         for (int cluster_id = 0; cluster_id < kClustersPerLeaf; ++cluster_id) {
+            if (!(active_cluster_mask & (1 << cluster_id)))
+                continue;
+
             int bx, by, bz;
             clusterIdToBase(cluster_id, bx, by, bz);
 
