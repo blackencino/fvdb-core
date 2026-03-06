@@ -3,107 +3,42 @@
 //
 // PredGatherIGemmBackward.cu -- Leaf-local no-kmap sparse convolution backward.
 //
-// Backward pass for the PredGatherIGemm forward backend. Unlike the existing
-// GatherScatterDefault fallback, this implementation does not require a global
-// k-map build. Instead, it walks the NanoVDB topology directly inside CUDA
-// kernels, using one output leaf as the locality unit and atomically
-// accumulating:
+// SM80 CuTe TF32 tensor-core backward for the PredGatherIGemm forward.
+// Replaces the original scalar FP32 GEMM with SM80_16x8x8_F32TF32TF32F32_TN
+// MMA atoms with swizzled shared-memory layouts and LDSM register loads.
 //
-//   dX[i, c]                  += dY[o, k] * W[k, c, t, r, s]
-//   dW[k, c, t, r, s]         += X[i, c]  * dY[o, k]
+// dgrad: output-leaf-centered with halo pre-loading.
+//   Per (cluster, kernel_offset): D[M=64,N=32] += dY[64,K] * W^T[K,32]
+//   Atomic scatter-add into dX.
 //
-// where i is the input voxel reached from output voxel o by kernel offset
-// (t, r, s). The implementation is specialized to the same constraints as
-// PredGatherIGemm forward:
-//   - CUDA only
-//   - float32 only
-//   - input / output channels must be multiples of 32
-//   - uniform kernel sizes 3 / 5 / 7
-//   - uniform strides 1 / 2
-//   - batch size 1
+// wgrad: output-leaf-centered with per-offset tree probes.
+//   Per kernel_offset, accumulated over 8 clusters:
+//   D[M=32,N=32] += dY^T[32,spatial=64] * X[32,64]
+//   Atomic reduction into dW.
 //
-// The algorithm is intentionally leaf-local and dense-tile oriented, so its
-// sweet spot matches the forward kernel: leaves that are moderately to highly
-// active. It avoids any global pre-pass or compacted kernel map construction.
+// Constraints (same as forward):
+//   - CUDA SM80+, float32, TF32 working precision
+//   - Input / output channels multiples of 32
+//   - Uniform kernel sizes {3, 5, 7}, uniform strides {1, 2}
+//   - Batch size 1
 //
-// ============================================================================
-// PERFORMANCE STATUS AND OPTIMIZATION ROADMAP
-// ============================================================================
-//
-// This implementation is functionally correct (validated by adjoint identity
-// tests, cross-backend comparison with GatherScatterDefault, and autograd
-// integration tests) but has severe performance problems. Benchmarks on A100
-// (Cin=64, Cout=128, kernel 3x3x3, stride 1):
-//
-//   Config              IGEMM bwd   GS bwd (no topo)  Ratio        IGEMM fwd
-//   1M dense  (75%)     153 ms      48 ms             3.2x slower  5.3 ms
-//   2M dense  (75%)     307 ms      115 ms            2.7x slower  10.2 ms
-//   4M sparse (25%)     590 ms      23 ms             25x slower   24 ms
-//   8M sparse (10%)     1141 ms     8 ms              143x slower  41 ms
-//
-// The backward is 29x slower than the forward for the 1M dense case, which
-// is physically unreasonable -- a well-written backward should be 2-3x the
-// forward cost, not 29x.
-//
-// ROOT CAUSE: Scalar FP32 GEMM
-//
-//   The GEMM inner loops (dgrad: lines ~235-246, wgrad: lines ~377-387) use
-//   scalar `for (kk)` multiply-accumulate instead of tensor core MMA. The
-//   forward uses SM80 TF32 tensor cores via CUTLASS (SM80_16x8x8_F32TF32TF32
-//   F32_TN with 2x2 tiling). GatherScatterDefault backward calls cuBLAS
-//   torch::mm which also uses tensor cores. On A100, FP32 scalar peak is
-//   ~19.5 TFLOPS while TF32 tensor core peak is ~156 TFLOPS -- an 8x
-//   theoretical gap that directly maps to the observed cost.
-//
-// SECONDARY BOTTLENECKS:
-//
-//   1. Tiny GEMM tiles: each (cluster, kernel_offset, k_tile) does a
-//      [64,32] x [32,32] GEMM = 65K FMAs. cuBLAS in GS processes the entire
-//      active-pair set (100K+ rows) per kernel offset -- much higher
-//      arithmetic intensity and utilization.
-//
-//   2. Sequential cluster x kernel_offset loop: each dgrad CTA processes
-//      8 clusters x kernel_volume offsets sequentially (e.g. 216 iterations
-//      for 3x3x3). Creates long-running CTAs with poor tail effects at low
-//      leaf occupancy.
-//
-//   3. Per-offset NanoVDB tree probes: for each kernel offset within each
-//      cluster, act_tree.getValue(probe) is called for all 64 voxels. The
-//      forward avoids this by loading the entire halo region once per
-//      cluster into shared memory.
-//
-//   4. wgrad atomic contention: grid is (leaves, C/32, K/32), so ALL leaf
-//      CTAs for the same (c_tile, k_tile, kernel_offset) atomically reduce
-//      into the same weight element. For 2048+ leaves this is severe and
-//      explains the super-linear performance degradation with leaf count.
-//
-// RECOMMENDED OPTIMIZATION TIERS:
-//
-//   Tier 1 (highest impact, ~5-8x improvement expected):
-//     Replace scalar GEMM with CuTe MMA atoms. Use SM80_16x8x8_F32TF32TF32
-//     F32_TN with 2x2 tiling (matching the forward). Requires restructuring
-//     shared memory with swizzled layouts for LDSM, loading data into MMA
-//     fragments via smem-to-register copy atoms, and replacing the for(kk)
-//     loop with cute::gemm(tiled_mma, ...). Note: this changes backward
-//     precision from FP32 to TF32, matching the forward and cuBLAS behavior.
-//
-//   Tier 2 (moderate impact):
-//     Pre-load the full halo region into shared memory once per cluster
-//     (like the forward does), then index into it for each kernel offset.
-//     Replaces kernel_volume x 64 tree traversals per cluster with one bulk
-//     load of CHx x CHy x CHz voxels (e.g. 6x6x6=216 for ks=3).
-//
-//   Tier 3 (moderate impact):
-//     Restructure wgrad to reduce atomic contention. Options: workspace
-//     buffer for per-leaf partial weight gradients with a final reduction
-//     kernel, or increase the spatial tile per wgrad CTA.
-//
-//   Tier 4 (long-term ideal, largest scope):
-//     Adapt the forward's MainloopSm80CpAsyncPredGatherB for the transposed
-//     GEMM directions. Gives pipelined cp.async loads + tensor core compute
-//     matching the forward architecture exactly.
-// ============================================================================
+// TODO: remaining performance bottlenecks
+//   1. cp.async pipelining: loads and MMA compute are fully serialized
+//      (single-buffered). Adopting the forward's multi-stage
+//      MainloopSm80CpAsyncPredGatherB pattern would overlap global loads
+//      with tensor-core compute for ~2x on memory-bound tiles.
+//   2. Empty-cluster early exit: sparse leaves waste MMA cycles on
+//      zero-filled 64-voxel clusters. Skipping clusters whose output
+//      rows are all inactive would eliminate ~75% of work at 25%
+//      occupancy and ~90% at 10%.
+//   3. Kernel-offset fusion for dgrad: the current loop does one
+//      separate GEMM per (cluster, kernel_offset). Fusing multiple
+//      kernel offsets into the K-reduction dimension (as the forward
+//      fuses C*T*R*S) would increase arithmetic intensity per tile and
+//      reduce loop overhead.
 
+// NOTE: <torch/types.h> MUST precede CuTe / CUTLASS headers to avoid
+// CCCL include-order issues between toolkit versions.
 #include <fvdb/detail/GridBatchImpl.h>
 #include <fvdb/detail/ops/convolution/PredGatherIGemmBackward.h>
 
@@ -113,6 +48,14 @@
 #include <c10/cuda/CUDAException.h>
 #include <torch/types.h>
 
+#include <cute/algorithm/gemm.hpp>
+#include <cute/atom/copy_atom.hpp>
+#include <cute/atom/mma_atom.hpp>
+#include <cute/layout.hpp>
+#include <cute/tensor.hpp>
+
+#include <cutlass/cutlass.h>
+
 #include <tuple>
 
 namespace fvdb {
@@ -120,228 +63,278 @@ namespace detail {
 namespace ops {
 namespace pred_gather_igemm_backward {
 
-constexpr int kLeafX      = 8;
-constexpr int kLeafY      = 8;
-constexpr int kLeafZ      = 8;
-constexpr int kLeafVoxels = kLeafX * kLeafY * kLeafZ; // 512
+using namespace cute;
 
-constexpr int kClusterX      = 4;
-constexpr int kClusterY      = 4;
-constexpr int kClusterZ      = 4;
-constexpr int kClusterVoxels = kClusterX * kClusterY * kClusterZ;                            // 64
+// ============================================================================
+// Constants
+// ============================================================================
 
-constexpr int kClustersPerLeafX = kLeafX / kClusterX;                                        // 2
-constexpr int kClustersPerLeafY = kLeafY / kClusterY;                                        // 2
-constexpr int kClustersPerLeafZ = kLeafZ / kClusterZ;                                        // 2
-constexpr int kClustersPerLeaf  = kClustersPerLeafX * kClustersPerLeafY * kClustersPerLeafZ; // 8
+constexpr int kLeafDim         = 8;
+constexpr int kLeafVoxels      = kLeafDim * kLeafDim * kLeafDim;
+constexpr int kClusterDim      = 4;
+constexpr int kClusterVoxels   = kClusterDim * kClusterDim * kClusterDim;
+constexpr int kClustersPerDim  = kLeafDim / kClusterDim;
+constexpr int kClustersPerLeaf = kClustersPerDim * kClustersPerDim * kClustersPerDim; // 8
+constexpr int kTileC           = 32;
+constexpr int kTileK           = 32;
 
-constexpr int kTileC        = 32;
-constexpr int kTileK        = 32;
-constexpr int kBlockThreads = 256;
+template <int KernelSize, int Stride> struct HaloGeom {
+    static constexpr int CHx         = (kClusterDim - 1) * Stride + KernelSize;
+    static constexpr int CHy         = CHx;
+    static constexpr int CHz         = CHx;
+    static constexpr int kHaloVoxels = CHx * CHy * CHz;
+};
+
+// ============================================================================
+// MMA and smem layout types (matching the forward's atom choices)
+// ============================================================================
+
+using SmemLayoutAtom = decltype(composition(
+    Swizzle<1, 2, 3>{}, Layout<Shape<_8, Shape<_4, _2>>, Stride<_4, Stride<_1, _32>>>{}));
+
+using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, tfloat32_t>;
+using EpiCopyAtom  = Copy_Atom<UniversalCopy<uint32_t>, float>;
+
+using DgradMma = TiledMMA<MMA_Atom<SM80_16x8x8_F32TF32TF32F32_TN>,
+                          Layout<Shape<_2, _2, _1>>,
+                          Tile<_64, _32, Underscore>>;
+
+using WgradMma = TiledMMA<MMA_Atom<SM80_16x8x8_F32TF32TF32F32_TN>,
+                          Layout<Shape<_2, _2, _1>>,
+                          Tile<_32, _32, Underscore>>;
+
+static constexpr int kBlockThreads = size(DgradMma{});
+static_assert(size(DgradMma{}) == size(WgradMma{}));
+static_assert(kBlockThreads == 128);
+
+using SmemLayoutDgradA = decltype(tile_to_shape(SmemLayoutAtom{}, make_shape(_64{}, _32{})));
+using SmemLayoutDgradB = decltype(tile_to_shape(SmemLayoutAtom{}, make_shape(_32{}, _32{})));
+
+using SmemLayoutWgradA = decltype(tile_to_shape(SmemLayoutAtom{}, make_shape(_32{}, _64{})));
+using SmemLayoutWgradB = decltype(tile_to_shape(SmemLayoutAtom{}, make_shape(_32{}, _64{})));
+
+// ============================================================================
+// Shared storage (dynamic smem)
+// ============================================================================
+
+template <int KernelSize, int Stride> struct alignas(128) DgradSmem {
+    using H = HaloGeom<KernelSize, Stride>;
+    union {
+        struct {
+            tfloat32_t sA[cosize_v<SmemLayoutDgradA>];
+            tfloat32_t sB[cosize_v<SmemLayoutDgradB>];
+        };
+        float sC[kClusterVoxels * kTileC];
+    };
+    uint64_t leaf_idx[kLeafVoxels];
+    uint64_t halo_idx[H::kHaloVoxels];
+    uint64_t out_rows[kClusterVoxels];
+    uint64_t in_rows[kClusterVoxels];
+};
+
+template <int KernelSize, int Stride> struct alignas(128) WgradSmem {
+    union {
+        struct {
+            tfloat32_t sA[cosize_v<SmemLayoutWgradA>];
+            tfloat32_t sB[cosize_v<SmemLayoutWgradB>];
+        };
+        float sC[kTileK * kTileC];
+    };
+    uint64_t leaf_idx[kLeafVoxels];
+    uint64_t out_rows[kClusterVoxels];
+    uint64_t in_rows[kClusterVoxels];
+};
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
 __device__ __forceinline__ int
 leafLinearIndex(int x, int y, int z) {
-    return x * 64 + y * 8 + z;
+    return x * (kLeafDim * kLeafDim) + y * kLeafDim + z;
 }
 
 __device__ __forceinline__ void
-clusterIdToCoord(int cluster_id, int &cx, int &cy, int &cz) {
-    constexpr int yz = kClustersPerLeafY * kClustersPerLeafZ; // 4
-    cx               = cluster_id / yz;
-    int rem          = cluster_id % yz;
-    cy               = rem / kClustersPerLeafZ;
-    cz               = rem % kClustersPerLeafZ;
+clusterIdToBase(int id, int &bx, int &by, int &bz) {
+    bx = (id / (kClustersPerDim * kClustersPerDim)) * kClusterDim;
+    by = ((id / kClustersPerDim) % kClustersPerDim) * kClusterDim;
+    bz = (id % kClustersPerDim) * kClusterDim;
 }
 
 __device__ __forceinline__ void
-clusterLinearToCoord(int n, int &x, int &y, int &z) {
-    x       = n / (kClusterY * kClusterZ); // /16
-    int rem = n % (kClusterY * kClusterZ);
-    y       = rem / kClusterZ;             // /4
-    z       = rem % kClusterZ;
-}
-
-template <int KernelSize>
-__device__ __forceinline__ void
-kernelOffsetToCoord(int kernel_offset, int &t, int &r, int &s) {
-    constexpr int ks2 = KernelSize * KernelSize;
-    t                 = kernel_offset / ks2;
-    int rem           = kernel_offset % ks2;
-    r                 = rem / KernelSize;
-    s                 = rem % KernelSize;
+voxelIdToLocal(int n, int &lx, int &ly, int &lz) {
+    lx      = n / (kClusterDim * kClusterDim);
+    int rem = n % (kClusterDim * kClusterDim);
+    ly      = rem / kClusterDim;
+    lz      = rem % kClusterDim;
 }
 
 template <int KernelSize>
 __device__ __forceinline__ int64_t
 weightIndex(int oc, int ic, int t, int r, int s, int C) {
-    return (
-        ((((static_cast<int64_t>(oc) * C + ic) * KernelSize + t) * KernelSize + r) * KernelSize) +
-        s);
+    return (((static_cast<int64_t>(oc) * C + ic) * KernelSize + t) * KernelSize + r) * KernelSize +
+           s;
 }
 
-struct DgradSharedStorage {
-    uint64_t out_leaf_idx[kLeafVoxels];
-    uint64_t out_cluster_rows[kClusterVoxels];
-    uint64_t in_cluster_rows[kClusterVoxels];
-    float grad_out_tile[kClusterVoxels][kTileK];
-    float weight_tile[kTileC][kTileK + 1];
-    float accum_tile[kClusterVoxels][kTileC];
-};
-
-struct WgradSharedStorage {
-    uint64_t out_leaf_idx[kLeafVoxels];
-    uint64_t out_cluster_rows[kClusterVoxels];
-    uint64_t in_cluster_rows[kClusterVoxels];
-    float feat_tile[kClusterVoxels][kTileC];
-    float grad_out_tile[kClusterVoxels][kTileK];
-    float accum_tile[kTileC][kTileK];
-};
+// ============================================================================
+// dgrad kernel
+// ============================================================================
 
 template <int KernelSize, int Stride, typename BuildT>
-__global__ void
+__global__ void __launch_bounds__(kBlockThreads)
 predGatherIGemmDgradKernel(const nanovdb::NanoGrid<BuildT> *act_grid,
                            const nanovdb::NanoGrid<BuildT> *out_grid,
                            const float *__restrict__ grad_out,
-                           const float *__restrict__ weights,
+                           const float *__restrict__ W_perm,
                            float *__restrict__ grad_features,
                            int C,
                            int K) {
-    __shared__ DgradSharedStorage smem;
+    extern __shared__ char smem_buf[];
+    auto &smem = *reinterpret_cast<DgradSmem<KernelSize, Stride> *>(smem_buf);
+
+    using H                     = HaloGeom<KernelSize, Stride>;
+    constexpr int radius        = KernelSize / 2;
+    constexpr int kernel_volume = KernelSize * KernelSize * KernelSize;
 
     int const leaf_id = static_cast<int>(blockIdx.x);
     int const c_tile  = static_cast<int>(blockIdx.y);
     int const c0      = c_tile * kTileC;
-
-    if (c0 >= C) {
+    if (c0 >= C)
         return;
-    }
 
     auto const &out_leaf = out_grid->tree().template getFirstNode<0>()[leaf_id];
-
-    for (int v = threadIdx.x; v < kLeafVoxels; v += blockDim.x) {
-        smem.out_leaf_idx[v] = out_leaf.getValue(v);
-    }
+    for (int v = threadIdx.x; v < kLeafVoxels; v += kBlockThreads)
+        smem.leaf_idx[v] = out_leaf.getValue(v);
     __syncthreads();
 
-    auto const &act_tree = act_grid->tree();
+    auto const &act_tree  = act_grid->tree();
+    auto const out_origin = out_leaf.origin();
+    auto const act_origin =
+        nanovdb::Coord(out_origin[0] * Stride, out_origin[1] * Stride, out_origin[2] * Stride);
 
-    auto const out_leaf_origin = out_leaf.origin();
-    auto const act_leaf_origin = nanovdb::Coord(
-        out_leaf_origin[0] * Stride, out_leaf_origin[1] * Stride, out_leaf_origin[2] * Stride);
+    // ---- MMA / copy setup (reused across all iterations) ----
 
-    constexpr int radius = KernelSize / 2;
+    DgradMma tiled_mma;
+    auto thr_mma = tiled_mma.get_thread_slice(threadIdx.x);
+    Tensor accum = partition_fragment_C(tiled_mma, Shape<_64, _32>{});
+
+    Tensor tSA = make_tensor(make_smem_ptr(smem.sA), SmemLayoutDgradA{});
+    Tensor tSB = make_tensor(make_smem_ptr(smem.sB), SmemLayoutDgradB{});
+
+    Tensor fragA = thr_mma.partition_fragment_A(tSA);
+    Tensor fragB = thr_mma.partition_fragment_B(tSB);
+
+    auto smem_copy_A = make_tiled_copy_A(SmemCopyAtom{}, tiled_mma);
+    auto smem_thr_A  = smem_copy_A.get_thread_slice(threadIdx.x);
+    auto tCsA        = smem_thr_A.partition_S(tSA);
+    auto tCrA        = smem_thr_A.retile_D(fragA);
+
+    auto smem_copy_B = make_tiled_copy_B(SmemCopyAtom{}, tiled_mma);
+    auto smem_thr_B  = smem_copy_B.get_thread_slice(threadIdx.x);
+    auto tCsB        = smem_thr_B.partition_S(tSB);
+    auto tCrB        = smem_thr_B.retile_D(fragB);
+
+    auto epi_copy = make_tiled_copy_C(EpiCopyAtom{}, tiled_mma);
+    auto epi_thr  = epi_copy.get_slice(threadIdx.x);
+
+    // ---- main loop: cluster → kernel_offset → K-tile ----
 
     for (int cluster_id = 0; cluster_id < kClustersPerLeaf; ++cluster_id) {
-        int cx, cy, cz;
-        clusterIdToCoord(cluster_id, cx, cy, cz);
+        int bx, by, bz;
+        clusterIdToBase(cluster_id, bx, by, bz);
 
-        int const base_x = cx * kClusterX;
-        int const base_y = cy * kClusterY;
-        int const base_z = cz * kClusterZ;
-
-        // Cache the 64 output rows for this cluster once.
-        for (int n = threadIdx.x; n < kClusterVoxels; n += blockDim.x) {
+        for (int n = threadIdx.x; n < kClusterVoxels; n += kBlockThreads) {
             int lx, ly, lz;
-            clusterLinearToCoord(n, lx, ly, lz);
+            voxelIdToLocal(n, lx, ly, lz);
+            smem.out_rows[n] = smem.leaf_idx[leafLinearIndex(bx + lx, by + ly, bz + lz)];
+        }
 
-            int const x = base_x + lx;
-            int const y = base_y + ly;
-            int const z = base_z + lz;
-
-            smem.out_cluster_rows[n] = smem.out_leaf_idx[leafLinearIndex(x, y, z)];
+        auto const halo_origin =
+            act_origin.offsetBy(bx * Stride - radius, by * Stride - radius, bz * Stride - radius);
+        for (int v = threadIdx.x; v < H::kHaloVoxels; v += kBlockThreads) {
+            int hx           = v / (H::CHy * H::CHz);
+            int rem          = v % (H::CHy * H::CHz);
+            int hy           = rem / H::CHz;
+            int hz           = rem % H::CHz;
+            smem.halo_idx[v] = act_tree.getValue(halo_origin.offsetBy(hx, hy, hz));
         }
         __syncthreads();
 
-        constexpr int kernel_volume = KernelSize * KernelSize * KernelSize;
-        for (int kernel_offset = 0; kernel_offset < kernel_volume; ++kernel_offset) {
-            int t, r, s;
-            kernelOffsetToCoord<KernelSize>(kernel_offset, t, r, s);
+        for (int ko = 0; ko < kernel_volume; ++ko) {
+            int const t = ko / (KernelSize * KernelSize);
+            int const r = (ko / KernelSize) % KernelSize;
+            int const s = ko % KernelSize;
 
-            // Build the current 64-entry input row indirection vector.
-            for (int n = threadIdx.x; n < kClusterVoxels; n += blockDim.x) {
+            for (int n = threadIdx.x; n < kClusterVoxels; n += kBlockThreads) {
                 uint64_t in_row = 0;
-
-                if (smem.out_cluster_rows[n] != 0) {
+                if (smem.out_rows[n] != 0) {
                     int lx, ly, lz;
-                    clusterLinearToCoord(n, lx, ly, lz);
-
-                    int const x = base_x + lx;
-                    int const y = base_y + ly;
-                    int const z = base_z + lz;
-
-                    nanovdb::Coord probe = act_leaf_origin.offsetBy(x * Stride + (t - radius),
-                                                                    y * Stride + (r - radius),
-                                                                    z * Stride + (s - radius));
-
-                    in_row = act_tree.getValue(probe);
+                    voxelIdToLocal(n, lx, ly, lz);
+                    int hx = lx * Stride + t;
+                    int hy = ly * Stride + r;
+                    int hz = lz * Stride + s;
+                    in_row = smem.halo_idx[hx * H::CHy * H::CHz + hy * H::CHz + hz];
                 }
-
-                smem.in_cluster_rows[n] = in_row;
+                smem.in_rows[n] = in_row;
             }
             __syncthreads();
 
-            for (int idx = threadIdx.x; idx < kClusterVoxels * kTileC; idx += blockDim.x) {
-                int const n            = idx / kTileC;
-                int const ic           = idx % kTileC;
-                smem.accum_tile[n][ic] = 0.0f;
-            }
-            __syncthreads();
+            clear(accum);
+
+            int64_t const w_base = static_cast<int64_t>(ko) * K * C;
 
             for (int k0 = 0; k0 < K; k0 += kTileK) {
-                // Load one [32 x 32] weight tile W[k0:k0+32, c0:c0+32, t, r, s].
-                for (int idx = threadIdx.x; idx < kTileC * kTileK; idx += blockDim.x) {
-                    int const ic_local = idx / kTileK;
-                    int const oc_local = idx % kTileK;
-                    int const ic       = c0 + ic_local;
-                    int const oc       = k0 + oc_local;
-
-                    smem.weight_tile[ic_local][oc_local] =
-                        weights[weightIndex<KernelSize>(oc, ic, t, r, s, C)];
+                for (int idx = threadIdx.x; idx < kClusterVoxels * kTileK; idx += kBlockThreads) {
+                    int n        = idx / kTileK;
+                    int kk       = idx % kTileK;
+                    uint64_t row = smem.out_rows[n];
+                    tSA(n, kk)   = tfloat32_t(
+                        row ? grad_out[static_cast<int64_t>(row - 1) * K + k0 + kk] : 0.0f);
                 }
 
-                // Load one [64 x 32] grad-output tile for this cluster.
-                for (int idx = threadIdx.x; idx < kClusterVoxels * kTileK; idx += blockDim.x) {
-                    int const n        = idx / kTileK;
-                    int const oc_local = idx % kTileK;
-                    uint64_t const row = smem.out_cluster_rows[n];
-
-                    smem.grad_out_tile[n][oc_local] =
-                        row ? grad_out[static_cast<int64_t>(row - 1) * K + (k0 + oc_local)] : 0.0f;
+                for (int idx = threadIdx.x; idx < kTileC * kTileK; idx += kBlockThreads) {
+                    int cc = idx / kTileK;
+                    int kk = idx % kTileK;
+                    tSB(cc, kk) =
+                        tfloat32_t(W_perm[w_base + static_cast<int64_t>(k0 + kk) * C + c0 + cc]);
                 }
                 __syncthreads();
 
-                // accum[n, ic] += sum_k grad_out[n, k] * W[k, ic]
-                for (int idx = threadIdx.x; idx < kClusterVoxels * kTileC; idx += blockDim.x) {
-                    int const n        = idx / kTileC;
-                    int const ic_local = idx % kTileC;
+                copy(smem_copy_A, tCsA, tCrA);
+                copy(smem_copy_B, tCsB, tCrB);
 
-                    float acc = smem.accum_tile[n][ic_local];
-#pragma unroll
-                    for (int kk = 0; kk < kTileK; ++kk) {
-                        acc += smem.grad_out_tile[n][kk] * smem.weight_tile[ic_local][kk];
-                    }
-                    smem.accum_tile[n][ic_local] = acc;
-                }
+                CUTLASS_PRAGMA_UNROLL
+                for (int kb = 0; kb < size<2>(fragA); ++kb)
+                    cute::gemm(tiled_mma, accum, fragA(_, _, kb), fragB(_, _, kb), accum);
                 __syncthreads();
             }
 
-            // Atomic scatter-add into dX using the current 64-entry indirection vector.
-            for (int idx = threadIdx.x; idx < kClusterVoxels * kTileC; idx += blockDim.x) {
-                int const n        = idx / kTileC;
-                int const ic_local = idx % kTileC;
-                uint64_t const row = smem.in_cluster_rows[n];
+            // epilogue: stage accum → smem, scatter-add to dX
+            Tensor tSC = make_tensor(make_smem_ptr(smem.sC), Layout<Shape<_64, _32>>{});
+            auto tCrC  = epi_thr.retile_S(accum);
+            auto tCsC  = epi_thr.partition_D(tSC);
+            copy(epi_copy, tCrC, tCsC);
+            __syncthreads();
 
-                if (row != 0) {
-                    atomicAdd(&grad_features[static_cast<int64_t>(row - 1) * C + (c0 + ic_local)],
-                              smem.accum_tile[n][ic_local]);
-                }
+            for (int idx = threadIdx.x; idx < kClusterVoxels * kTileC; idx += kBlockThreads) {
+                int n        = idx / kTileC;
+                int c        = idx % kTileC;
+                uint64_t row = smem.in_rows[n];
+                if (row != 0)
+                    atomicAdd(&grad_features[static_cast<int64_t>(row - 1) * C + c0 + c],
+                              tSC(n, c));
             }
             __syncthreads();
         }
     }
 }
 
+// ============================================================================
+// wgrad kernel
+// ============================================================================
+
 template <int KernelSize, int Stride, typename BuildT>
-__global__ void
+__global__ void __launch_bounds__(kBlockThreads)
 predGatherIGemmWgradKernel(const nanovdb::NanoGrid<BuildT> *act_grid,
                            const nanovdb::NanoGrid<BuildT> *out_grid,
                            const float *__restrict__ features,
@@ -349,136 +342,137 @@ predGatherIGemmWgradKernel(const nanovdb::NanoGrid<BuildT> *act_grid,
                            float *__restrict__ grad_weights,
                            int C,
                            int K) {
-    __shared__ WgradSharedStorage smem;
+    extern __shared__ char smem_buf[];
+    auto &smem = *reinterpret_cast<WgradSmem<KernelSize, Stride> *>(smem_buf);
+
+    constexpr int radius        = KernelSize / 2;
+    constexpr int kernel_volume = KernelSize * KernelSize * KernelSize;
 
     int const leaf_id = static_cast<int>(blockIdx.x);
     int const c_tile  = static_cast<int>(blockIdx.y);
     int const k_tile  = static_cast<int>(blockIdx.z);
     int const c0      = c_tile * kTileC;
     int const k0      = k_tile * kTileK;
-
-    if (c0 >= C || k0 >= K) {
+    if (c0 >= C || k0 >= K)
         return;
-    }
 
     auto const &out_leaf = out_grid->tree().template getFirstNode<0>()[leaf_id];
-
-    for (int v = threadIdx.x; v < kLeafVoxels; v += blockDim.x) {
-        smem.out_leaf_idx[v] = out_leaf.getValue(v);
-    }
+    for (int v = threadIdx.x; v < kLeafVoxels; v += kBlockThreads)
+        smem.leaf_idx[v] = out_leaf.getValue(v);
     __syncthreads();
 
-    auto const &act_tree = act_grid->tree();
+    auto const &act_tree  = act_grid->tree();
+    auto const out_origin = out_leaf.origin();
+    auto const act_origin =
+        nanovdb::Coord(out_origin[0] * Stride, out_origin[1] * Stride, out_origin[2] * Stride);
 
-    auto const out_leaf_origin = out_leaf.origin();
-    auto const act_leaf_origin = nanovdb::Coord(
-        out_leaf_origin[0] * Stride, out_leaf_origin[1] * Stride, out_leaf_origin[2] * Stride);
+    // ---- MMA / copy setup ----
 
-    constexpr int radius        = KernelSize / 2;
-    constexpr int kernel_volume = KernelSize * KernelSize * KernelSize;
+    WgradMma tiled_mma;
+    auto thr_mma = tiled_mma.get_thread_slice(threadIdx.x);
+    Tensor accum = partition_fragment_C(tiled_mma, Shape<_32, _32>{});
 
-    for (int kernel_offset = 0; kernel_offset < kernel_volume; ++kernel_offset) {
-        int t, r, s;
-        kernelOffsetToCoord<KernelSize>(kernel_offset, t, r, s);
+    Tensor tSA = make_tensor(make_smem_ptr(smem.sA), SmemLayoutWgradA{});
+    Tensor tSB = make_tensor(make_smem_ptr(smem.sB), SmemLayoutWgradB{});
 
-        for (int idx = threadIdx.x; idx < kTileC * kTileK; idx += blockDim.x) {
-            int const ic_local                  = idx / kTileK;
-            int const oc_local                  = idx % kTileK;
-            smem.accum_tile[ic_local][oc_local] = 0.0f;
-        }
-        __syncthreads();
+    Tensor fragA = thr_mma.partition_fragment_A(tSA);
+    Tensor fragB = thr_mma.partition_fragment_B(tSB);
+
+    auto smem_copy_A = make_tiled_copy_A(SmemCopyAtom{}, tiled_mma);
+    auto smem_thr_A  = smem_copy_A.get_thread_slice(threadIdx.x);
+    auto tCsA        = smem_thr_A.partition_S(tSA);
+    auto tCrA        = smem_thr_A.retile_D(fragA);
+
+    auto smem_copy_B = make_tiled_copy_B(SmemCopyAtom{}, tiled_mma);
+    auto smem_thr_B  = smem_copy_B.get_thread_slice(threadIdx.x);
+    auto tCsB        = smem_thr_B.partition_S(tSB);
+    auto tCrB        = smem_thr_B.retile_D(fragB);
+
+    auto epi_copy = make_tiled_copy_C(EpiCopyAtom{}, tiled_mma);
+    auto epi_thr  = epi_copy.get_slice(threadIdx.x);
+
+    // ---- main loop: kernel_offset → cluster ----
+
+    for (int ko = 0; ko < kernel_volume; ++ko) {
+        int const t = ko / (KernelSize * KernelSize);
+        int const r = (ko / KernelSize) % KernelSize;
+        int const s = ko % KernelSize;
+
+        clear(accum);
 
         for (int cluster_id = 0; cluster_id < kClustersPerLeaf; ++cluster_id) {
-            int cx, cy, cz;
-            clusterIdToCoord(cluster_id, cx, cy, cz);
+            int bx, by, bz;
+            clusterIdToBase(cluster_id, bx, by, bz);
 
-            int const base_x = cx * kClusterX;
-            int const base_y = cy * kClusterY;
-            int const base_z = cz * kClusterZ;
-
-            // Cache the 64 output rows for this cluster.
-            for (int n = threadIdx.x; n < kClusterVoxels; n += blockDim.x) {
+            for (int n = threadIdx.x; n < kClusterVoxels; n += kBlockThreads) {
                 int lx, ly, lz;
-                clusterLinearToCoord(n, lx, ly, lz);
-
-                int const x = base_x + lx;
-                int const y = base_y + ly;
-                int const z = base_z + lz;
-
-                smem.out_cluster_rows[n] = smem.out_leaf_idx[leafLinearIndex(x, y, z)];
+                voxelIdToLocal(n, lx, ly, lz);
+                smem.out_rows[n] = smem.leaf_idx[leafLinearIndex(bx + lx, by + ly, bz + lz)];
             }
             __syncthreads();
 
-            // Build the 64-entry input row indirection vector for this offset.
-            for (int n = threadIdx.x; n < kClusterVoxels; n += blockDim.x) {
+            for (int n = threadIdx.x; n < kClusterVoxels; n += kBlockThreads) {
                 uint64_t in_row = 0;
-
-                if (smem.out_cluster_rows[n] != 0) {
+                if (smem.out_rows[n] != 0) {
                     int lx, ly, lz;
-                    clusterLinearToCoord(n, lx, ly, lz);
-
-                    int const x = base_x + lx;
-                    int const y = base_y + ly;
-                    int const z = base_z + lz;
-
-                    nanovdb::Coord probe = act_leaf_origin.offsetBy(x * Stride + (t - radius),
-                                                                    y * Stride + (r - radius),
-                                                                    z * Stride + (s - radius));
-
-                    in_row = act_tree.getValue(probe);
+                    voxelIdToLocal(n, lx, ly, lz);
+                    nanovdb::Coord probe = act_origin.offsetBy((bx + lx) * Stride + (t - radius),
+                                                               (by + ly) * Stride + (r - radius),
+                                                               (bz + lz) * Stride + (s - radius));
+                    in_row               = act_tree.getValue(probe);
                 }
-
-                smem.in_cluster_rows[n] = in_row;
+                smem.in_rows[n] = in_row;
             }
             __syncthreads();
 
-            for (int idx = threadIdx.x; idx < kClusterVoxels * kTileC; idx += blockDim.x) {
-                int const n        = idx / kTileC;
-                int const ic_local = idx % kTileC;
-                uint64_t const row = smem.in_cluster_rows[n];
-
-                smem.feat_tile[n][ic_local] =
-                    row ? features[static_cast<int64_t>(row - 1) * C + (c0 + ic_local)] : 0.0f;
+            // sA[M=32, K=64]: dY^T -- row = output channel, col = voxel
+            for (int idx = threadIdx.x; idx < kTileK * kClusterVoxels; idx += kBlockThreads) {
+                int kk       = idx / kClusterVoxels;
+                int n        = idx % kClusterVoxels;
+                uint64_t row = smem.out_rows[n];
+                tSA(kk, n) =
+                    tfloat32_t(row ? grad_out[static_cast<int64_t>(row - 1) * K + k0 + kk] : 0.0f);
             }
 
-            for (int idx = threadIdx.x; idx < kClusterVoxels * kTileK; idx += blockDim.x) {
-                int const n        = idx / kTileK;
-                int const oc_local = idx % kTileK;
-                uint64_t const row = smem.out_cluster_rows[n];
-
-                smem.grad_out_tile[n][oc_local] =
-                    row ? grad_out[static_cast<int64_t>(row - 1) * K + (k0 + oc_local)] : 0.0f;
+            // sB[N=32, K=64]: X -- row = input channel, col = voxel
+            for (int idx = threadIdx.x; idx < kTileC * kClusterVoxels; idx += kBlockThreads) {
+                int cc       = idx / kClusterVoxels;
+                int n        = idx % kClusterVoxels;
+                uint64_t row = smem.in_rows[n];
+                tSB(cc, n) =
+                    tfloat32_t(row ? features[static_cast<int64_t>(row - 1) * C + c0 + cc] : 0.0f);
             }
             __syncthreads();
 
-            // accum[ic, oc] += sum_n X[n, ic] * dY[n, oc]
-            for (int idx = threadIdx.x; idx < kTileC * kTileK; idx += blockDim.x) {
-                int const ic_local = idx / kTileK;
-                int const oc_local = idx % kTileK;
+            copy(smem_copy_A, tCsA, tCrA);
+            copy(smem_copy_B, tCsB, tCrB);
 
-                float acc = smem.accum_tile[ic_local][oc_local];
-#pragma unroll
-                for (int n = 0; n < kClusterVoxels; ++n) {
-                    acc += smem.feat_tile[n][ic_local] * smem.grad_out_tile[n][oc_local];
-                }
-                smem.accum_tile[ic_local][oc_local] = acc;
-            }
+            CUTLASS_PRAGMA_UNROLL
+            for (int kb = 0; kb < size<2>(fragA); ++kb)
+                cute::gemm(tiled_mma, accum, fragA(_, _, kb), fragB(_, _, kb), accum);
             __syncthreads();
         }
 
-        // Atomic reduction across leaves into dW.
-        for (int idx = threadIdx.x; idx < kTileC * kTileK; idx += blockDim.x) {
-            int const ic_local = idx / kTileK;
-            int const oc_local = idx % kTileK;
-            int const ic       = c0 + ic_local;
-            int const oc       = k0 + oc_local;
+        // epilogue: stage accum → smem, atomicAdd to dW
+        Tensor tSC = make_tensor(make_smem_ptr(smem.sC), Layout<Shape<_32, _32>>{});
+        auto tCrC  = epi_thr.retile_S(accum);
+        auto tCsC  = epi_thr.partition_D(tSC);
+        copy(epi_copy, tCrC, tCsC);
+        __syncthreads();
 
-            atomicAdd(&grad_weights[weightIndex<KernelSize>(oc, ic, t, r, s, C)],
-                      smem.accum_tile[ic_local][oc_local]);
+        for (int idx = threadIdx.x; idx < kTileK * kTileC; idx += kBlockThreads) {
+            int kk = idx / kTileC;
+            int cc = idx % kTileC;
+            atomicAdd(&grad_weights[weightIndex<KernelSize>(k0 + kk, c0 + cc, t, r, s, C)],
+                      tSC(kk, cc));
         }
         __syncthreads();
     }
 }
+
+// ============================================================================
+// Launch
+// ============================================================================
 
 template <int KernelSize, int Stride>
 std::tuple<torch::Tensor, torch::Tensor>
@@ -511,6 +505,8 @@ launchPredGatherIGemmBackward(torch::Tensor grad_output,
         return {grad_features, grad_weights};
     }
 
+    auto filter_perm = weights.permute({2, 3, 4, 0, 1}).contiguous();
+
     dim3 const block(kBlockThreads);
     dim3 const dgrad_grid(
         static_cast<unsigned int>(output_leaf_count), static_cast<unsigned int>(C / kTileC), 1u);
@@ -520,28 +516,45 @@ launchPredGatherIGemmBackward(torch::Tensor grad_output,
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    predGatherIGemmDgradKernel<KernelSize, Stride, nanovdb::ValueOnIndex>
-        <<<dgrad_grid, block, 0, stream>>>(nano_input_grid,
-                                           nano_output_grid,
-                                           grad_output.data_ptr<float>(),
-                                           weights.data_ptr<float>(),
-                                           grad_features.data_ptr<float>(),
-                                           static_cast<int>(C),
-                                           static_cast<int>(K));
+    constexpr size_t dgrad_smem_size = sizeof(DgradSmem<KernelSize, Stride>);
+    constexpr size_t wgrad_smem_size = sizeof(WgradSmem<KernelSize, Stride>);
+
+    auto dgrad_fn = predGatherIGemmDgradKernel<KernelSize, Stride, nanovdb::ValueOnIndex>;
+    auto wgrad_fn = predGatherIGemmWgradKernel<KernelSize, Stride, nanovdb::ValueOnIndex>;
+
+    if (dgrad_smem_size > 48u * 1024u)
+        cudaFuncSetAttribute(dgrad_fn,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(dgrad_smem_size));
+    if (wgrad_smem_size > 48u * 1024u)
+        cudaFuncSetAttribute(wgrad_fn,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(wgrad_smem_size));
+
+    dgrad_fn<<<dgrad_grid, block, dgrad_smem_size, stream>>>(nano_input_grid,
+                                                             nano_output_grid,
+                                                             grad_output.data_ptr<float>(),
+                                                             filter_perm.data_ptr<float>(),
+                                                             grad_features.data_ptr<float>(),
+                                                             static_cast<int>(C),
+                                                             static_cast<int>(K));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-    predGatherIGemmWgradKernel<KernelSize, Stride, nanovdb::ValueOnIndex>
-        <<<wgrad_grid, block, 0, stream>>>(nano_input_grid,
-                                           nano_output_grid,
-                                           features.data_ptr<float>(),
-                                           grad_output.data_ptr<float>(),
-                                           grad_weights.data_ptr<float>(),
-                                           static_cast<int>(C),
-                                           static_cast<int>(K));
+    wgrad_fn<<<wgrad_grid, block, wgrad_smem_size, stream>>>(nano_input_grid,
+                                                             nano_output_grid,
+                                                             features.data_ptr<float>(),
+                                                             grad_output.data_ptr<float>(),
+                                                             grad_weights.data_ptr<float>(),
+                                                             static_cast<int>(C),
+                                                             static_cast<int>(K));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     return {grad_features, grad_weights};
 }
+
+// ============================================================================
+// Preconditions
+// ============================================================================
 
 static void
 checkPredGatherIGemmBackwardPreconditions(torch::Tensor grad_output,
@@ -608,6 +621,10 @@ checkPredGatherIGemmBackwardPreconditions(torch::Tensor grad_output,
 
 } // namespace pred_gather_igemm_backward
 
+// ============================================================================
+// Public entry point
+// ============================================================================
+
 std::tuple<torch::Tensor, torch::Tensor>
 predGatherIGemmSparseConvBackward(torch::Tensor grad_output,
                                   torch::Tensor features,
@@ -621,8 +638,6 @@ predGatherIGemmSparseConvBackward(torch::Tensor grad_output,
     checkPredGatherIGemmBackwardPreconditions(
         grad_output, features, weights, feature_grid, output_grid, kernel_size, stride);
 
-    // Raw pointer kernels below assume contiguous storage in the standard fVDB
-    // layout [N, C], [N, K], [K, C, T, R, S].
     if (!features.is_contiguous())
         features = features.contiguous();
     if (!grad_output.is_contiguous())

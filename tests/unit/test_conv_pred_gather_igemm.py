@@ -366,7 +366,7 @@ class TestConvPredGatherIGemm(unittest.TestCase):
         self.assertEqual(gf_igemm.shape, gf_gs.shape)
         self.assertEqual(gw_igemm.shape, gw_gs.shape)
 
-        bw_rtol, bw_atol = 1e-3, 1e-3
+        bw_rtol, bw_atol = TF32_RTOL, TF32_ATOL
         gf_igemm_f64 = gf_igemm.cpu().to(torch.float64)
         gf_gs_f64 = gf_gs.cpu().to(torch.float64)
         gw_igemm_f64 = gw_igemm.cpu().to(torch.float64)
