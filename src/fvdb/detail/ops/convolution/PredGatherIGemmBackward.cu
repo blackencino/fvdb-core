@@ -25,6 +25,84 @@
 // The algorithm is intentionally leaf-local and dense-tile oriented, so its
 // sweet spot matches the forward kernel: leaves that are moderately to highly
 // active. It avoids any global pre-pass or compacted kernel map construction.
+//
+// ============================================================================
+// PERFORMANCE STATUS AND OPTIMIZATION ROADMAP
+// ============================================================================
+//
+// This implementation is functionally correct (validated by adjoint identity
+// tests, cross-backend comparison with GatherScatterDefault, and autograd
+// integration tests) but has severe performance problems. Benchmarks on A100
+// (Cin=64, Cout=128, kernel 3x3x3, stride 1):
+//
+//   Config              IGEMM bwd   GS bwd (no topo)  Ratio        IGEMM fwd
+//   1M dense  (75%)     153 ms      48 ms             3.2x slower  5.3 ms
+//   2M dense  (75%)     307 ms      115 ms            2.7x slower  10.2 ms
+//   4M sparse (25%)     590 ms      23 ms             25x slower   24 ms
+//   8M sparse (10%)     1141 ms     8 ms              143x slower  41 ms
+//
+// The backward is 29x slower than the forward for the 1M dense case, which
+// is physically unreasonable -- a well-written backward should be 2-3x the
+// forward cost, not 29x.
+//
+// ROOT CAUSE: Scalar FP32 GEMM
+//
+//   The GEMM inner loops (dgrad: lines ~235-246, wgrad: lines ~377-387) use
+//   scalar `for (kk)` multiply-accumulate instead of tensor core MMA. The
+//   forward uses SM80 TF32 tensor cores via CUTLASS (SM80_16x8x8_F32TF32TF32
+//   F32_TN with 2x2 tiling). GatherScatterDefault backward calls cuBLAS
+//   torch::mm which also uses tensor cores. On A100, FP32 scalar peak is
+//   ~19.5 TFLOPS while TF32 tensor core peak is ~156 TFLOPS -- an 8x
+//   theoretical gap that directly maps to the observed cost.
+//
+// SECONDARY BOTTLENECKS:
+//
+//   1. Tiny GEMM tiles: each (cluster, kernel_offset, k_tile) does a
+//      [64,32] x [32,32] GEMM = 65K FMAs. cuBLAS in GS processes the entire
+//      active-pair set (100K+ rows) per kernel offset -- much higher
+//      arithmetic intensity and utilization.
+//
+//   2. Sequential cluster x kernel_offset loop: each dgrad CTA processes
+//      8 clusters x kernel_volume offsets sequentially (e.g. 216 iterations
+//      for 3x3x3). Creates long-running CTAs with poor tail effects at low
+//      leaf occupancy.
+//
+//   3. Per-offset NanoVDB tree probes: for each kernel offset within each
+//      cluster, act_tree.getValue(probe) is called for all 64 voxels. The
+//      forward avoids this by loading the entire halo region once per
+//      cluster into shared memory.
+//
+//   4. wgrad atomic contention: grid is (leaves, C/32, K/32), so ALL leaf
+//      CTAs for the same (c_tile, k_tile, kernel_offset) atomically reduce
+//      into the same weight element. For 2048+ leaves this is severe and
+//      explains the super-linear performance degradation with leaf count.
+//
+// RECOMMENDED OPTIMIZATION TIERS:
+//
+//   Tier 1 (highest impact, ~5-8x improvement expected):
+//     Replace scalar GEMM with CuTe MMA atoms. Use SM80_16x8x8_F32TF32TF32
+//     F32_TN with 2x2 tiling (matching the forward). Requires restructuring
+//     shared memory with swizzled layouts for LDSM, loading data into MMA
+//     fragments via smem-to-register copy atoms, and replacing the for(kk)
+//     loop with cute::gemm(tiled_mma, ...). Note: this changes backward
+//     precision from FP32 to TF32, matching the forward and cuBLAS behavior.
+//
+//   Tier 2 (moderate impact):
+//     Pre-load the full halo region into shared memory once per cluster
+//     (like the forward does), then index into it for each kernel offset.
+//     Replaces kernel_volume x 64 tree traversals per cluster with one bulk
+//     load of CHx x CHy x CHz voxels (e.g. 6x6x6=216 for ks=3).
+//
+//   Tier 3 (moderate impact):
+//     Restructure wgrad to reduce atomic contention. Options: workspace
+//     buffer for per-leaf partial weight gradients with a final reduction
+//     kernel, or increase the spatial tile per wgrad CTA.
+//
+//   Tier 4 (long-term ideal, largest scope):
+//     Adapt the forward's MainloopSm80CpAsyncPredGatherB for the transposed
+//     GEMM directions. Gives pipelined cp.async loads + tensor core compute
+//     matching the forward architecture exactly.
+// ============================================================================
 
 #include <fvdb/detail/GridBatchImpl.h>
 #include <fvdb/detail/ops/convolution/PredGatherIGemmBackward.h>
