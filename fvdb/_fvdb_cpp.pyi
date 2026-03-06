@@ -96,6 +96,15 @@ def pred_gather_igemm_conv(
     kernel_size: int,
     stride: int,
 ) -> torch.Tensor: ...
+def pred_gather_igemm_conv_backward(
+    grad_output: torch.Tensor,
+    features: torch.Tensor,
+    weights: torch.Tensor,
+    feature_grid: GridBatch,
+    output_grid: GridBatch,
+    kernel_size: int,
+    stride: int,
+) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 class GaussianSplat3d:
     class ProjectionType(Enum):

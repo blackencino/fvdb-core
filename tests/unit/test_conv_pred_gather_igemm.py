@@ -7,7 +7,7 @@ Test the PredGatherIGemm (CUTLASS IGEMM) sparse convolution backend.
 The PredGatherIGemm backend has strict constraints compared to the default:
   - CUDA only (SM80+)
   - float32 only (uses TF32 tensor-core arithmetic internally)
-  - Forward pass only (no backward, no transpose)
+  - No transpose
   - Uniform kernel sizes: 3, 5, 7
   - Uniform strides: 1, 2
   - Channel counts must be multiples of 32
@@ -15,6 +15,11 @@ The PredGatherIGemm backend has strict constraints compared to the default:
 Tests compare forward-pass results against:
   - Dense PyTorch conv3d ground truth (with TF32-aware tolerances)
   - GatherScatterDefault backend output (cross-backend validation)
+
+Backward-pass tests validate grad_features and grad_weights against:
+  - GatherScatterDefault backward (cross-backend, tight FP32 tolerances)
+  - Autograd integration (end-to-end .backward() smoke)
+  - Dense ground truth (forward+backward through conv3d)
 """
 
 import unittest
@@ -69,7 +74,7 @@ def _skip_if_no_sm80() -> bool:
 
 
 class TestConvPredGatherIGemm(unittest.TestCase):
-    """Forward-only tests for the PredGatherIGemm CUTLASS IGEMM convolution backend."""
+    """Tests for the PredGatherIGemm CUTLASS IGEMM convolution backend (forward and backward)."""
 
     DEVICE = torch.device("cuda", 0)
     DTYPE = torch.float32
@@ -321,3 +326,226 @@ class TestConvPredGatherIGemm(unittest.TestCase):
             torch.allclose(igemm_f64, gs_f64, rtol=TF32_RTOL, atol=TF32_ATOL),
             f"kernel={ks} stride={st}: max diff={diff.max().item():.6f}, mean diff={diff.mean().item():.6f}",
         )
+
+    # =========================================================================
+    # Backward: cross-backend vs GatherScatterDefault
+    # =========================================================================
+
+    @parameterized.expand(KERNEL_STRIDE_COMBOS)
+    def test_backward_matches_gather_scatter_default(self, ks: int, st: int):
+        """
+        PredGatherIGemm backward gradients match GatherScatterDefault backward
+        for all supported kernel/stride combinations.
+
+        Both backends compute the backward in FP32, so tolerances are tight.
+        """
+        from fvdb import _fvdb_cpp
+
+        kernel_size = (ks, ks, ks)
+        stride = (st, st, st)
+        cin, cout = 64, 64
+
+        cluster_coords = get_cluster_edge_aligned(kernel_size, self.DEVICE)
+        grid = create_grid_from_coords(cluster_coords, self.DEVICE)
+        dst_grid = grid.conv_grid(kernel_size=kernel_size, stride=stride)
+        num_src = len(cluster_coords)
+        num_dst = dst_grid.total_voxels
+
+        torch.manual_seed(42)
+        features = torch.randn((num_src, cin), device=self.DEVICE, dtype=self.DTYPE)
+        weights = torch.randn((cout, cin, ks, ks, ks), device=self.DEVICE, dtype=self.DTYPE)
+        grad_output = torch.randn((num_dst, cout), device=self.DEVICE, dtype=self.DTYPE)
+
+        gf_igemm, gw_igemm = _fvdb_cpp.pred_gather_igemm_conv_backward(
+            grad_output, features, weights, grid._impl, dst_grid._impl, ks, st
+        )
+
+        gs_topo = _fvdb_cpp.gs_build_topology(grid._impl, dst_grid._impl, kernel_size, stride)
+        gf_gs, gw_gs = _fvdb_cpp.gs_conv_backward(grad_output, features, weights, gs_topo)
+
+        self.assertEqual(gf_igemm.shape, gf_gs.shape)
+        self.assertEqual(gw_igemm.shape, gw_gs.shape)
+
+        bw_rtol, bw_atol = 1e-3, 1e-3
+        gf_igemm_f64 = gf_igemm.cpu().to(torch.float64)
+        gf_gs_f64 = gf_gs.cpu().to(torch.float64)
+        gw_igemm_f64 = gw_igemm.cpu().to(torch.float64)
+        gw_gs_f64 = gw_gs.cpu().to(torch.float64)
+
+        self.assertTrue(
+            torch.allclose(gf_igemm_f64, gf_gs_f64, rtol=bw_rtol, atol=bw_atol),
+            f"kernel={ks} stride={st}: grad_features max diff=" f"{(gf_igemm_f64 - gf_gs_f64).abs().max().item():.6e}",
+        )
+        self.assertTrue(
+            torch.allclose(gw_igemm_f64, gw_gs_f64, rtol=bw_rtol, atol=bw_atol),
+            f"kernel={ks} stride={st}: grad_weights max diff=" f"{(gw_igemm_f64 - gw_gs_f64).abs().max().item():.6e}",
+        )
+
+    # =========================================================================
+    # Backward: autograd integration (end-to-end .backward())
+    # =========================================================================
+
+    @parameterized.expand(KERNEL_STRIDE_COMBOS)
+    def test_backward_autograd_integration(self, ks: int, st: int):
+        """
+        End-to-end autograd test: forward through ConvolutionPlan, then
+        .backward() on the output.  Checks that gradients exist, have
+        correct shapes, and contain no NaN/Inf.
+        """
+        kernel_size = (ks, ks, ks)
+        stride = (st, st, st)
+
+        cluster_coords = get_cluster_edge_aligned(kernel_size, self.DEVICE)
+        grid = create_grid_from_coords(cluster_coords, self.DEVICE)
+        dst_grid = grid.conv_grid(kernel_size=kernel_size, stride=stride)
+        num_voxels = len(cluster_coords)
+
+        torch.manual_seed(123)
+        features_data = torch.randn((num_voxels, self.CIN), device=self.DEVICE, dtype=self.DTYPE, requires_grad=True)
+        features = JaggedTensor(features_data)
+        weights = torch.randn(
+            (self.COUT, self.CIN, ks, ks, ks), device=self.DEVICE, dtype=self.DTYPE, requires_grad=True
+        )
+
+        plan = ConvolutionPlan.from_grid_batch(
+            kernel_size=kernel_size,
+            stride=stride,
+            source_grid=grid,
+            target_grid=dst_grid,
+            expert_config=IGEMM_CONFIG,
+        )
+        self.assertIsInstance(plan._backend, _PredGatherIGemmBackend)
+
+        output = plan.execute(features, weights)
+        loss = output.jdata.sum()
+        loss.backward()
+
+        self.assertIsNotNone(features_data.grad)
+        self.assertIsNotNone(weights.grad)
+        # Type narrowing for static type checkers:
+        assert features_data.grad is not None
+        assert weights.grad is not None
+        self.assertEqual(features_data.grad.shape, features_data.shape)
+        self.assertEqual(weights.grad.shape, weights.shape)
+        self.assertFalse(features_data.grad.isnan().any().item(), "grad_features contains NaN")
+        self.assertFalse(features_data.grad.isinf().any().item(), "grad_features contains Inf")
+        self.assertFalse(weights.grad.isnan().any().item(), "grad_weights contains NaN")
+        self.assertFalse(weights.grad.isinf().any().item(), "grad_weights contains Inf")
+
+    # =========================================================================
+    # Backward: vs dense ground truth (stride=1)
+    # =========================================================================
+
+    @parameterized.expand(KERNEL_ONLY_COMBOS)
+    def test_backward_vs_dense_ground_truth(self, ks: int):
+        """
+        Backward pass with stride=1 compared against dense conv3d ground truth.
+
+        Runs forward + backward on both the sparse IGEMM path and the dense
+        PyTorch conv3d path, then compares input and kernel gradients.
+        Tolerances are relaxed because the forward uses TF32, so the backward
+        starts from slightly different forward outputs.
+        """
+        kernel_size = (ks, ks, ks)
+        stride = (1, 1, 1)
+
+        cluster_coords = get_cluster_edge_aligned(kernel_size, self.DEVICE)
+        grid = create_grid_from_coords(cluster_coords, self.DEVICE)
+        dst_grid = grid.conv_grid(kernel_size=kernel_size, stride=1)
+        dst_ijks = dst_grid.ijk.jdata
+        num_voxels = len(cluster_coords)
+        num_dst = dst_grid.total_voxels
+
+        torch.manual_seed(2025)
+        features_data = torch.randn((num_voxels, self.CIN), device=self.DEVICE, dtype=self.DTYPE)
+        kernel_5d = self._make_diagonal_kernel(kernel_size)
+
+        # --- Dense path (FP32 reference) ---
+        src_ijks = grid.ijk.jdata
+        all_ijks = torch.cat([src_ijks, dst_ijks], dim=0).unique(dim=0)
+        min_coord = all_ijks.min(dim=0).values
+        max_coord = all_ijks.max(dim=0).values
+        vol_shape = tuple((max_coord - min_coord + 1).tolist())
+
+        dense_input = torch.zeros((1, self.CIN) + vol_shape, device=self.DEVICE, dtype=self.DTYPE)
+        src_local = src_ijks - min_coord.unsqueeze(0)
+        dense_input[0, :, src_local[:, 0], src_local[:, 1], src_local[:, 2]] = features_data.T
+        dense_input = dense_input.clone().requires_grad_(True)
+        dense_kernel = kernel_5d.detach().clone().requires_grad_(True)
+
+        with disable_tf32():
+            dense_output = torch.nn.functional.conv3d(input=dense_input, weight=dense_kernel, padding="same")
+
+        dense_grad = torch.randn_like(dense_output)
+        dense_output.backward(dense_grad)
+
+        # --- Sparse IGEMM path ---
+        sparse_features = features_data.clone().requires_grad_(True)
+        sparse_kernel = kernel_5d.detach().clone().requires_grad_(True)
+
+        plan = ConvolutionPlan.from_grid_batch(
+            kernel_size=kernel_size,
+            stride=1,
+            source_grid=grid,
+            target_grid=dst_grid,
+            expert_config=IGEMM_CONFIG,
+        )
+        sparse_output = plan.execute(JaggedTensor(sparse_features), sparse_kernel)
+
+        dst_local = dst_ijks - min_coord.unsqueeze(0)
+        sparse_grad = dense_grad[0, :, dst_local[:, 0], dst_local[:, 1], dst_local[:, 2]].T
+        sparse_output.jdata.backward(sparse_grad)
+
+        assert dense_input.grad is not None
+        assert sparse_features.grad is not None
+        assert dense_kernel.grad is not None
+        assert sparse_kernel.grad is not None
+
+        dense_feat_grad = dense_input.grad[0, :, src_local[:, 0], src_local[:, 1], src_local[:, 2]].T
+
+        torch.testing.assert_close(
+            sparse_features.grad,
+            dense_feat_grad,
+            rtol=TF32_RTOL,
+            atol=TF32_ATOL,
+            msg=lambda m: f"input grad mismatch (ks={ks}): {m}",
+        )
+        torch.testing.assert_close(
+            sparse_kernel.grad,
+            dense_kernel.grad,
+            rtol=TF32_RTOL,
+            atol=TF32_ATOL,
+            msg=lambda m: f"kernel grad mismatch (ks={ks}): {m}",
+        )
+
+    # =========================================================================
+    # Backward: zero grad_output edge case
+    # =========================================================================
+
+    def test_backward_zero_grad_output(self):
+        """
+        When grad_output is all zeros, both grad_features and grad_weights
+        must be all zeros.
+        """
+        from fvdb import _fvdb_cpp
+
+        ks, st = 3, 1
+        cin, cout = 32, 32
+
+        cluster_coords = get_cluster_edge_aligned((ks, ks, ks), self.DEVICE)
+        grid = create_grid_from_coords(cluster_coords, self.DEVICE)
+        dst_grid = grid.conv_grid(kernel_size=(ks, ks, ks), stride=st)
+        num_src = len(cluster_coords)
+        num_dst = dst_grid.total_voxels
+
+        torch.manual_seed(999)
+        features = torch.randn((num_src, cin), device=self.DEVICE, dtype=self.DTYPE)
+        weights = torch.randn((cout, cin, ks, ks, ks), device=self.DEVICE, dtype=self.DTYPE)
+        grad_output = torch.zeros((num_dst, cout), device=self.DEVICE, dtype=self.DTYPE)
+
+        gf, gw = _fvdb_cpp.pred_gather_igemm_conv_backward(
+            grad_output, features, weights, grid._impl, dst_grid._impl, ks, st
+        )
+
+        self.assertTrue(torch.all(gf == 0), "grad_features should be all zeros")
+        self.assertTrue(torch.all(gw == 0), "grad_weights should be all zeros")

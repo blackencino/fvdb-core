@@ -1210,4 +1210,21 @@ GridBatch::predGatherIGemmConv(torch::Tensor features,
         features, weights, *feature_grid.mImpl, *output_grid.mImpl, kernel_size, stride);
 }
 
+std::tuple<torch::Tensor, torch::Tensor>
+GridBatch::predGatherIGemmConvBackward(torch::Tensor grad_output,
+                                       torch::Tensor features,
+                                       torch::Tensor weights,
+                                       const GridBatch &feature_grid,
+                                       const GridBatch &output_grid,
+                                       int kernel_size,
+                                       int stride) {
+    return detail::ops::predGatherIGemmSparseConvBackward(grad_output,
+                                                          features,
+                                                          weights,
+                                                          *feature_grid.mImpl,
+                                                          *output_grid.mImpl,
+                                                          kernel_size,
+                                                          stride);
+}
+
 } // namespace fvdb

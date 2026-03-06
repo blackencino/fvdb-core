@@ -510,6 +510,27 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("output_grid"),
         py::arg("kernel_size"),
         py::arg("stride"));
+
+    m.def(
+        "pred_gather_igemm_conv_backward",
+        [](torch::Tensor grad_output,
+           torch::Tensor features,
+           torch::Tensor weights,
+           const fvdb::GridBatch &feature_grid,
+           const fvdb::GridBatch &output_grid,
+           int kernel_size,
+           int stride) -> std::tuple<torch::Tensor, torch::Tensor> {
+            return fvdb::GridBatch::predGatherIGemmConvBackward(
+                grad_output, features, weights, feature_grid, output_grid, kernel_size, stride);
+        },
+        "PredGatherIGemm backward sparse convolution (leaf-local, no k-map).",
+        py::arg("grad_output"),
+        py::arg("features"),
+        py::arg("weights"),
+        py::arg("feature_grid"),
+        py::arg("output_grid"),
+        py::arg("kernel_size"),
+        py::arg("stride"));
 }
 
 TORCH_LIBRARY(fvdb, m) {

@@ -9,6 +9,7 @@
 #include <fvdb/detail/GridBatchImpl.h>
 #include <fvdb/detail/ops/convolution/GatherScatterDefault.h>
 #include <fvdb/detail/ops/convolution/PredGatherIGemm.h>
+#include <fvdb/detail/ops/convolution/PredGatherIGemmBackward.h>
 #include <fvdb/detail/utils/Utils.h>
 
 #include <nanovdb/NanoVDB.h>
@@ -858,6 +859,24 @@ struct GridBatch : torch::CustomClassHolder {
                                              const GridBatch &output_grid,
                                              int kernel_size,
                                              int stride);
+
+    /// @brief Backward pass of predicated-gather IGEMM sparse convolution.
+    /// @param grad_output   Upstream gradient, shape [N_out, K], float32.
+    /// @param features      Input features (saved from forward), shape [N_in, C].
+    /// @param weights       Kernel weights, shape [K, C, ks, ks, ks], float32.
+    /// @param feature_grid  Grid batch for input voxels.
+    /// @param output_grid   Grid batch for output voxels.
+    /// @param kernel_size   Uniform spatial kernel extent (3, 5, or 7).
+    /// @param stride        Uniform convolution stride (1 or 2).
+    /// @return {grad_features [N_in, C], grad_weights [K, C, ks, ks, ks]}.
+    static std::tuple<torch::Tensor, torch::Tensor>
+    predGatherIGemmConvBackward(torch::Tensor grad_output,
+                                torch::Tensor features,
+                                torch::Tensor weights,
+                                const GridBatch &feature_grid,
+                                const GridBatch &output_grid,
+                                int kernel_size,
+                                int stride);
 
     /// @brief Perform one integration step of the TSDF fusion algorithm on a batch of sparse grids.
     ///        The TSDF fusion algorithm integrates depth and feature images (e.g. colors)

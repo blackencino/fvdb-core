@@ -8,6 +8,7 @@
 #include <fvdb/detail/GridBatchImpl.h>
 #include <fvdb/detail/ops/convolution/GatherScatterDefault.h>
 #include <fvdb/detail/ops/convolution/PredGatherIGemm.h>
+#include <fvdb/detail/ops/convolution/PredGatherIGemmBackward.h>
 
 #include <c10/cuda/CUDAStream.h>
 #include <torch/types.h>
@@ -382,8 +383,354 @@ TEST(PredGatherIGemm, MatchesGatherScatterDefaultMultipleChannels) {
 }
 
 // =============================================================================
+// Backward tests
+// =============================================================================
+
+static void
+assertNoNanInf(torch::Tensor t, char const *label) {
+    auto t_cpu = t.cpu().to(torch::kFloat64);
+    EXPECT_FALSE(t_cpu.isnan().any().item<bool>()) << label << " contains NaN";
+    EXPECT_FALSE(t_cpu.isinf().any().item<bool>()) << label << " contains Inf";
+}
+
+TEST(PredGatherIGemmBackward, SmokeShapesNoNan) {
+    if (!deviceSupportsSm80()) {
+        GTEST_SKIP() << "Requires SM80+";
+    }
+    auto device = makeDevice();
+
+    auto [inputCoords, outputCoords] = generateCoordinates(8 * 1024, 0.75f, 0.75f, 0.65f, 11111);
+
+    auto input_grid  = makeFvdbGrid(inputCoords, device);
+    auto output_grid = makeFvdbGrid(outputCoords, device);
+
+    int64_t const N_in  = input_grid->totalVoxels();
+    int64_t const N_out = output_grid->totalVoxels();
+    ASSERT_GT(N_in, 0);
+    ASSERT_GT(N_out, 0);
+
+    int64_t const Cin = 64, Cout = 128;
+
+    torch::manual_seed(777);
+    auto features    = torch::randn({N_in, Cin}, topts(device));
+    auto weights     = torch::randn({Cout, Cin, 3, 3, 3}, topts(device));
+    auto grad_output = torch::randn({N_out, Cout}, topts(device));
+
+    auto [gf, gw] = ops::predGatherIGemmSparseConvBackward(
+        grad_output, features, weights, *input_grid, *output_grid, 3, 1);
+
+    EXPECT_EQ(gf.sizes(), features.sizes());
+    EXPECT_EQ(gw.sizes(), weights.sizes());
+    EXPECT_TRUE(gf.is_floating_point());
+    EXPECT_TRUE(gw.is_floating_point());
+    assertNoNanInf(gf, "SmokeShapesNoNan grad_features");
+    assertNoNanInf(gw, "SmokeShapesNoNan grad_weights");
+}
+
+TEST(PredGatherIGemmBackward, MatchesGatherScatterDefault) {
+    if (!deviceSupportsSm80()) {
+        GTEST_SKIP() << "Requires SM80+";
+    }
+    auto device = makeDevice();
+
+    auto [inputCoords, outputCoords] = generateCoordinates(16 * 1024, 0.75f, 0.75f, 0.65f);
+
+    auto input_grid  = makeFvdbGrid(inputCoords, device);
+    auto output_grid = makeFvdbGrid(outputCoords, device);
+
+    int64_t const N_in  = input_grid->totalVoxels();
+    int64_t const N_out = output_grid->totalVoxels();
+    ASSERT_GT(N_in, 0);
+    ASSERT_GT(N_out, 0);
+
+    int64_t const Cin = 64, Cout = 128;
+
+    struct GeomConfig {
+        int kernel_size, stride;
+    };
+    GeomConfig geom_configs[] = {{3, 1}, {3, 2}, {5, 1}, {5, 2}, {7, 1}, {7, 2}};
+
+    for (const auto &gc: geom_configs) {
+        torch::manual_seed(8888);
+
+        auto features     = torch::randn({N_in, Cin}, topts(device));
+        auto fvdb_weights = torch::randn(
+            {Cout, Cin, gc.kernel_size, gc.kernel_size, gc.kernel_size}, topts(device));
+
+        nanovdb::Coord ks(gc.kernel_size, gc.kernel_size, gc.kernel_size);
+        nanovdb::Coord st(gc.stride, gc.stride, gc.stride);
+        auto dst_grid = (gc.stride == 1) ? input_grid : input_grid->convolutionOutput(ks, st);
+        auto topo     = ops::gatherScatterDefaultSparseConvTopology(*input_grid, *dst_grid, ks, st);
+
+        int64_t const N_dst = dst_grid->totalVoxels();
+        auto grad_output    = torch::randn({N_dst, Cout}, topts(device));
+
+        auto [gf_igemm, gw_igemm] = ops::predGatherIGemmSparseConvBackward(
+            grad_output, features, fvdb_weights, *input_grid, *dst_grid, gc.kernel_size, gc.stride);
+
+        auto [gf_gs, gw_gs] =
+            ops::gatherScatterDefaultSparseConvBackward(grad_output, features, fvdb_weights, topo);
+
+        ASSERT_EQ(gf_igemm.sizes(), gf_gs.sizes())
+            << "kernel=" << gc.kernel_size << " stride=" << gc.stride;
+        ASSERT_EQ(gw_igemm.sizes(), gw_gs.sizes())
+            << "kernel=" << gc.kernel_size << " stride=" << gc.stride;
+
+        auto gf_igemm_f64 = gf_igemm.cpu().to(torch::kFloat64);
+        auto gf_gs_f64    = gf_gs.cpu().to(torch::kFloat64);
+        auto gw_igemm_f64 = gw_igemm.cpu().to(torch::kFloat64);
+        auto gw_gs_f64    = gw_gs.cpu().to(torch::kFloat64);
+
+        auto gf_diff = (gf_igemm_f64 - gf_gs_f64).abs();
+        auto gw_diff = (gw_igemm_f64 - gw_gs_f64).abs();
+
+        EXPECT_TRUE(torch::allclose(gf_igemm_f64, gf_gs_f64, /*rtol=*/1e-3, /*atol=*/1e-3))
+            << "kernel=" << gc.kernel_size << " stride=" << gc.stride
+            << ": grad_features max diff=" << gf_diff.max().item<double>()
+            << ", mean diff=" << gf_diff.mean().item<double>();
+
+        EXPECT_TRUE(torch::allclose(gw_igemm_f64, gw_gs_f64, /*rtol=*/1e-3, /*atol=*/1e-3))
+            << "kernel=" << gc.kernel_size << " stride=" << gc.stride
+            << ": grad_weights max diff=" << gw_diff.max().item<double>()
+            << ", mean diff=" << gw_diff.mean().item<double>();
+    }
+}
+
+TEST(PredGatherIGemmBackward, MatchesMultipleChannels) {
+    if (!deviceSupportsSm80()) {
+        GTEST_SKIP() << "Requires SM80+";
+    }
+    auto device = makeDevice();
+
+    auto [inputCoords, outputCoords] = generateCoordinates(8 * 1024, 0.75f, 0.75f, 0.65f, 54321);
+
+    auto input_grid  = makeFvdbGrid(inputCoords, device);
+    auto output_grid = makeFvdbGrid(outputCoords, device);
+
+    int64_t const N_in  = input_grid->totalVoxels();
+    int64_t const N_out = output_grid->totalVoxels();
+    ASSERT_GT(N_in, 0);
+    ASSERT_GT(N_out, 0);
+
+    struct ChannelConfig {
+        int64_t cin, cout;
+    };
+    ChannelConfig channel_configs[] = {
+        {32, 32},
+        {32, 64},
+        {64, 64},
+        {128, 64},
+        {64, 128},
+        {128, 128},
+    };
+
+    struct GeomConfig {
+        int kernel_size, stride;
+    };
+    GeomConfig geom_configs[] = {{3, 1}, {3, 2}, {5, 1}, {5, 2}, {7, 1}, {7, 2}};
+
+    for (const auto &gc: geom_configs) {
+        nanovdb::Coord ks(gc.kernel_size, gc.kernel_size, gc.kernel_size);
+        nanovdb::Coord st(gc.stride, gc.stride, gc.stride);
+        auto dst_grid = (gc.stride == 1) ? input_grid : input_grid->convolutionOutput(ks, st);
+        auto topo     = ops::gatherScatterDefaultSparseConvTopology(*input_grid, *dst_grid, ks, st);
+        int64_t const N_dst = dst_grid->totalVoxels();
+
+        for (const auto &cfg: channel_configs) {
+            torch::manual_seed(42);
+
+            auto features     = torch::randn({N_in, cfg.cin}, topts(device));
+            auto fvdb_weights = torch::randn(
+                {cfg.cout, cfg.cin, gc.kernel_size, gc.kernel_size, gc.kernel_size}, topts(device));
+            auto grad_output = torch::randn({N_dst, cfg.cout}, topts(device));
+
+            auto [gf_igemm, gw_igemm] = ops::predGatherIGemmSparseConvBackward(grad_output,
+                                                                               features,
+                                                                               fvdb_weights,
+                                                                               *input_grid,
+                                                                               *dst_grid,
+                                                                               gc.kernel_size,
+                                                                               gc.stride);
+
+            auto [gf_gs, gw_gs] = ops::gatherScatterDefaultSparseConvBackward(
+                grad_output, features, fvdb_weights, topo);
+
+            ASSERT_EQ(gf_igemm.sizes(), gf_gs.sizes())
+                << "kernel=" << gc.kernel_size << " stride=" << gc.stride << " C=" << cfg.cin
+                << " K=" << cfg.cout;
+
+            auto gf_igemm_f64 = gf_igemm.cpu().to(torch::kFloat64);
+            auto gf_gs_f64    = gf_gs.cpu().to(torch::kFloat64);
+            auto gw_igemm_f64 = gw_igemm.cpu().to(torch::kFloat64);
+            auto gw_gs_f64    = gw_gs.cpu().to(torch::kFloat64);
+
+            EXPECT_TRUE(torch::allclose(gf_igemm_f64, gf_gs_f64, /*rtol=*/1e-3, /*atol=*/1e-3))
+                << "kernel=" << gc.kernel_size << " stride=" << gc.stride << " C=" << cfg.cin
+                << " K=" << cfg.cout << ": grad_features max diff="
+                << (gf_igemm_f64 - gf_gs_f64).abs().max().item<double>();
+
+            EXPECT_TRUE(torch::allclose(gw_igemm_f64, gw_gs_f64, /*rtol=*/1e-3, /*atol=*/1e-3))
+                << "kernel=" << gc.kernel_size << " stride=" << gc.stride << " C=" << cfg.cin
+                << " K=" << cfg.cout << ": grad_weights max diff="
+                << (gw_igemm_f64 - gw_gs_f64).abs().max().item<double>();
+        }
+    }
+}
+
+TEST(PredGatherIGemmBackward, AdjointIdentity) {
+    if (!deviceSupportsSm80()) {
+        GTEST_SKIP() << "Requires SM80+";
+    }
+    auto device = makeDevice();
+
+    auto [inputCoords, outputCoords] = generateCoordinates(8 * 1024, 0.75f, 0.75f, 0.65f, 99999);
+
+    auto input_grid  = makeFvdbGrid(inputCoords, device);
+    auto output_grid = makeFvdbGrid(outputCoords, device);
+
+    int64_t const N_in  = input_grid->totalVoxels();
+    int64_t const N_out = output_grid->totalVoxels();
+    ASSERT_GT(N_in, 0);
+    ASSERT_GT(N_out, 0);
+
+    int64_t const Cin = 32, Cout = 64;
+
+    struct GeomConfig {
+        int kernel_size, stride;
+    };
+    GeomConfig geom_configs[] = {{3, 1}, {3, 2}, {5, 1}};
+
+    for (const auto &gc: geom_configs) {
+        nanovdb::Coord ks(gc.kernel_size, gc.kernel_size, gc.kernel_size);
+        nanovdb::Coord st(gc.stride, gc.stride, gc.stride);
+        auto dst_grid       = (gc.stride == 1) ? input_grid : input_grid->convolutionOutput(ks, st);
+        int64_t const N_dst = dst_grid->totalVoxels();
+
+        torch::manual_seed(50);
+        auto x  = torch::randn({N_in, Cin}, topts(device));
+        auto W  = torch::randn({Cout, Cin, gc.kernel_size, gc.kernel_size, gc.kernel_size},
+                              topts(device));
+        auto gy = torch::randn({N_dst, Cout}, topts(device));
+
+        auto y =
+            ops::predGatherIGemmSparseConv(x, W, *input_grid, *dst_grid, gc.kernel_size, gc.stride);
+
+        auto [gx, gW] = ops::predGatherIGemmSparseConvBackward(
+            gy, x, W, *input_grid, *dst_grid, gc.kernel_size, gc.stride);
+
+        auto x_d  = x.cpu().to(torch::kFloat64).flatten();
+        auto W_d  = W.cpu().to(torch::kFloat64).flatten();
+        auto gy_d = gy.cpu().to(torch::kFloat64).flatten();
+        auto y_d  = y.cpu().to(torch::kFloat64).flatten();
+        auto gx_d = gx.cpu().to(torch::kFloat64).flatten();
+        auto gW_d = gW.cpu().to(torch::kFloat64).flatten();
+
+        double lhs      = torch::dot(gy_d, y_d).item<double>();
+        double rhs_feat = torch::dot(gx_d, x_d).item<double>();
+        double rhs_wt   = torch::dot(gW_d, W_d).item<double>();
+
+        double scale_feat = std::max(std::abs(lhs), std::abs(rhs_feat));
+        double scale_wt   = std::max(std::abs(lhs), std::abs(rhs_wt));
+
+        // TF32 forward means looser tolerance than the GatherScatterDefault adjoint test.
+        double tol = 5e-3;
+
+        EXPECT_NEAR(lhs, rhs_feat, tol * scale_feat + tol)
+            << "kernel=" << gc.kernel_size << " stride=" << gc.stride
+            << ": feature adjoint identity violated";
+        EXPECT_NEAR(lhs, rhs_wt, tol * scale_wt + tol)
+            << "kernel=" << gc.kernel_size << " stride=" << gc.stride
+            << ": weight adjoint identity violated";
+    }
+}
+
+// =============================================================================
 // Speed comparison
 // =============================================================================
+
+static void
+runBackwardBenchmark(const BenchConfig &cfg, torch::Device device) {
+    auto [inputCoords, outputCoords] =
+        generateCoordinates(cfg.ambient_voxels, cfg.input_occ, cfg.output_occ, cfg.overlap);
+
+    auto input_grid  = makeFvdbGrid(inputCoords, device);
+    auto output_grid = makeFvdbGrid(outputCoords, device);
+
+    const int64_t N_in  = input_grid->totalVoxels();
+    const int64_t N_out = output_grid->totalVoxels();
+    ASSERT_GT(N_in, 0);
+    ASSERT_GT(N_out, 0);
+
+    const int64_t Cin = 64, Cout = 128;
+    torch::manual_seed(9999);
+
+    auto features     = torch::randn({N_in, Cin}, topts(device));
+    auto fvdb_weights = torch::randn({Cout, Cin, 3, 3, 3}, topts(device));
+    auto grad_output  = torch::randn({N_out, Cout}, topts(device));
+
+    uint32_t leafCount = output_grid->numLeavesAt(0);
+
+    nanovdb::Coord ks(3, 3, 3);
+    nanovdb::Coord stride(1, 1, 1);
+
+    std::cout << "  [" << cfg.label << "] N_in=" << N_in << "  N_out=" << N_out
+              << "  leaves=" << leafCount << "  leaf_occ=" << (100.f * N_out / (leafCount * 512))
+              << "%" << std::endl;
+
+    constexpr int kWarmup = 2;
+    constexpr int kIters  = 5;
+    CudaTimer timer;
+
+    // --- PredGatherIGemmBackward ---
+    for (int i = 0; i < kWarmup; ++i)
+        ops::predGatherIGemmSparseConvBackward(
+            grad_output, features, fvdb_weights, *input_grid, *output_grid, 3, 1);
+    timer.recordStart();
+    for (int i = 0; i < kIters; ++i)
+        ops::predGatherIGemmSparseConvBackward(
+            grad_output, features, fvdb_weights, *input_grid, *output_grid, 3, 1);
+    float igemm_ms = timer.recordStopMs() / kIters;
+
+    // --- GatherScatterDefault backward (with topology build) ---
+    for (int i = 0; i < kWarmup; ++i) {
+        auto t = ops::gatherScatterDefaultSparseConvTopology(*input_grid, *output_grid, ks, stride);
+        ops::gatherScatterDefaultSparseConvBackward(grad_output, features, fvdb_weights, t);
+    }
+    timer.recordStart();
+    for (int i = 0; i < kIters; ++i) {
+        auto t = ops::gatherScatterDefaultSparseConvTopology(*input_grid, *output_grid, ks, stride);
+        ops::gatherScatterDefaultSparseConvBackward(grad_output, features, fvdb_weights, t);
+    }
+    float gs_with_topo_ms = timer.recordStopMs() / kIters;
+
+    // --- GatherScatterDefault backward (topology pre-computed) ---
+    auto topo = ops::gatherScatterDefaultSparseConvTopology(*input_grid, *output_grid, ks, stride);
+    for (int i = 0; i < kWarmup; ++i)
+        ops::gatherScatterDefaultSparseConvBackward(grad_output, features, fvdb_weights, topo);
+    timer.recordStart();
+    for (int i = 0; i < kIters; ++i)
+        ops::gatherScatterDefaultSparseConvBackward(grad_output, features, fvdb_weights, topo);
+    float gs_no_topo_ms = timer.recordStopMs() / kIters;
+
+    std::cout << "    PredGatherIGemmBackward: " << igemm_ms << " ms"
+              << "  |  GS+topo: " << gs_with_topo_ms << " ms"
+              << "  |  GS only: " << gs_no_topo_ms << " ms" << std::endl;
+
+    // -- Correctness sanity check --
+    auto [gf_igemm, gw_igemm] = ops::predGatherIGemmSparseConvBackward(
+        grad_output, features, fvdb_weights, *input_grid, *output_grid, 3, 1);
+    auto [gf_gs, gw_gs] =
+        ops::gatherScatterDefaultSparseConvBackward(grad_output, features, fvdb_weights, topo);
+
+    auto gf_igemm_f64 = gf_igemm.cpu().to(torch::kFloat64);
+    auto gf_gs_f64    = gf_gs.cpu().to(torch::kFloat64);
+    auto gf_diff      = (gf_igemm_f64 - gf_gs_f64).abs();
+
+    EXPECT_TRUE(torch::allclose(gf_igemm_f64, gf_gs_f64, /*rtol=*/1e-3, /*atol=*/1e-3))
+        << cfg.label
+        << " grad_features correctness failed, max diff=" << gf_diff.max().item<double>()
+        << ", mean diff=" << gf_diff.mean().item<double>();
+}
 
 TEST(PredGatherIGemm, SpeedComparison) {
     if (!deviceSupportsSm80()) {
@@ -403,4 +750,24 @@ TEST(PredGatherIGemm, SpeedComparison) {
     std::cout << "SpeedComparison (Cin=64, Cout=128, kernel 3x3x3):" << std::endl;
     for (const auto &cfg: configs)
         runBenchmark(cfg, device);
+}
+
+TEST(PredGatherIGemmBackward, SpeedComparison) {
+    if (!deviceSupportsSm80()) {
+        GTEST_SKIP() << "Requires SM80+";
+    }
+    auto device = makeDevice();
+
+    // clang-format off
+    BenchConfig configs[] = {
+        {"1M dense",     1024 * 1024,     0.75f, 0.75f, 0.65f},
+        {"2M dense",     2 * 1024 * 1024, 0.75f, 0.75f, 0.65f},
+        {"4M sparse-25", 4 * 1024 * 1024, 0.25f, 0.25f, 0.20f},
+        {"8M sparse-10", 8 * 1024 * 1024, 0.10f, 0.10f, 0.08f},
+    };
+    // clang-format on
+
+    std::cout << "BackwardSpeedComparison (Cin=64, Cout=128, kernel 3x3x3):" << std::endl;
+    for (const auto &cfg: configs)
+        runBackwardBenchmark(cfg, device);
 }

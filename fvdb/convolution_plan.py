@@ -66,10 +66,7 @@ class _GatherScatterConvFn(torch.autograd.Function):
 
 
 class _PredGatherIGemmConvFn(torch.autograd.Function):
-    """Autograd wrapper for the PredGatherIGemm CUTLASS IGEMM convolution.
-
-    Forward uses the IGEMM kernel; backward falls back to GatherScatterDefault.
-    """
+    """Autograd wrapper for the PredGatherIGemm CUTLASS IGEMM convolution."""
 
     @staticmethod
     def forward(  # type: ignore[override]
@@ -78,21 +75,25 @@ class _PredGatherIGemmConvFn(torch.autograd.Function):
         weights: torch.Tensor,
         feature_grid: _fvdb_cpp.GridBatch,
         output_grid: _fvdb_cpp.GridBatch,
-        gs_topo: _fvdb_cpp.GatherScatterDefaultTopology,
         kernel_size: int,
         stride: int,
     ) -> torch.Tensor:
         output = _fvdb_cpp.pred_gather_igemm_conv(features, weights, feature_grid, output_grid, kernel_size, stride)
         ctx.save_for_backward(features, weights)
-        ctx.gs_topo = gs_topo
+        ctx.feature_grid = feature_grid
+        ctx.output_grid = output_grid
+        ctx.kernel_size = kernel_size
+        ctx.stride = stride
         return output
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, None, None, None, None, None]:  # type: ignore[override]
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, None, None, None, None]:  # type: ignore[override]
         features, weights = ctx.saved_tensors
         grad_output = grad_output.contiguous()
-        grad_feat, grad_w = _fvdb_cpp.gs_conv_backward(grad_output, features, weights, ctx.gs_topo)
-        return grad_feat, grad_w, None, None, None, None, None
+        grad_feat, grad_w = _fvdb_cpp.pred_gather_igemm_conv_backward(
+            grad_output, features, weights, ctx.feature_grid, ctx.output_grid, ctx.kernel_size, ctx.stride
+        )
+        return grad_feat, grad_w, None, None, None, None
 
 
 # ============================================================
@@ -123,12 +124,8 @@ class _GatherScatterBackend:
 
 @dataclass(frozen=True)
 class _PredGatherIGemmBackend:
-    """CUTLASS IGEMM convolution with predicated gather (SM80+, forward only).
+    """CUTLASS IGEMM convolution with predicated gather (SM80+)."""
 
-    The GatherScatterDefault topology is precomputed for backward pass fallback.
-    """
-
-    gs_topology: _fvdb_cpp.GatherScatterDefaultTopology
     kernel_size: int
     stride: int
 
@@ -652,7 +649,6 @@ class ConvolutionPlan:
                 weights,
                 self._source_grid._impl,
                 self._target_grid._impl,
-                backend.gs_topology,
                 backend.kernel_size,
                 backend.stride,
             )
@@ -782,7 +778,7 @@ class ConvolutionPlan:
                 topo = _fvdb_cpp.gs_build_topology(source_grid._impl, target_grid._impl, kernel_size, stride)
             return _GatherScatterBackend(topology=topo)
 
-        # PredGatherIGemm — CUTLASS IGEMM on SM80+, forward only
+        # PredGatherIGemm — CUTLASS IGEMM on SM80+
         if backend_name == "pred_gather_igemm":
             if transposed:
                 raise ValueError("PredGatherIGemm backend does not support transposed convolution.")
@@ -795,8 +791,7 @@ class ConvolutionPlan:
             for cin, cout in channel_pairs:
                 if cin % 32 != 0 or cout % 32 != 0:
                     raise ValueError(f"PredGatherIGemm requires channel counts divisible by 32, got ({cin}, {cout}).")
-            gs_topo = _fvdb_cpp.gs_build_topology(source_grid._impl, target_grid._impl, kernel_size, stride)
-            return _PredGatherIGemmBackend(gs_topology=gs_topo, kernel_size=int(ks_vals[0]), stride=int(st_vals[0]))
+            return _PredGatherIGemmBackend(kernel_size=int(ks_vals[0]), stride=int(st_vals[0]))
 
         raise ValueError(f"Unknown backend: {backend_name!r}")
 
