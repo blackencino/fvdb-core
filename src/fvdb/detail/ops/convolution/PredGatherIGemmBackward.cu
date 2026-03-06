@@ -58,6 +58,46 @@
 
 #include <tuple>
 
+// ============================================================================
+// CuTe upcast overloads for composed gather layouts (cp.async pipelining)
+// ============================================================================
+
+namespace cute {
+
+template <int N, int I, class Shape, class Stride>
+CUTE_HOST_DEVICE constexpr auto
+upcast(Shape const &shape, Stride const &stride) {
+    if constexpr (is_tuple<Shape>::value) {
+        return transform_layout(
+            shape, stride, [](auto const &s, auto const &d) { return upcast<N, I>(s, d); });
+    } else if constexpr (is_scaled_basis<Stride>::value) {
+        if constexpr (Stride::mode() == I) {
+            return make_layout(ceil_div(shape, Int<N>{}), ceil_div(stride, Int<N>{}));
+        } else {
+            return make_layout(shape, stride);
+        }
+    } else {
+        return upcast<N>(shape, stride);
+    }
+    CUTE_GCC_UNREACHABLE;
+}
+
+template <int N, class OuterShape, class OuterStride, class Offset, class Shape, class Stride>
+CUTE_HOST_DEVICE constexpr auto
+upcast(
+    ComposedLayout<Layout<OuterShape, OuterStride>, Offset, Layout<Shape, Stride>> const &layout) {
+    auto idx =
+        find_if(layout.layout_a().stride(), [](auto x) { return is_constant<1, decltype(x)>{}; });
+    constexpr int I = decltype(idx)::value;
+    auto outer      = upcast<N>(layout.layout_a());
+    auto offset =
+        as_arithmetic_tuple(replace<I>(layout.offset(), upcast<N>(get<I>(layout.offset()))));
+    auto inner = upcast<N, I>(layout.layout_b().shape(), layout.layout_b().stride());
+    return composition(outer, offset, inner);
+}
+
+} // namespace cute
+
 namespace fvdb {
 namespace detail {
 namespace ops {
@@ -113,6 +153,13 @@ using SmemLayoutDgradB = decltype(tile_to_shape(SmemLayoutAtom{}, make_shape(_32
 using SmemLayoutWgradA = decltype(tile_to_shape(SmemLayoutAtom{}, make_shape(_32{}, _64{})));
 using SmemLayoutWgradB = decltype(tile_to_shape(SmemLayoutAtom{}, make_shape(_32{}, _64{})));
 
+constexpr int kDgradStages = 3;
+
+using SmemLayoutDgradA_Staged =
+    decltype(tile_to_shape(SmemLayoutAtom{}, make_shape(_64{}, _32{}, Int<kDgradStages>{})));
+using SmemLayoutDgradB_Staged =
+    decltype(tile_to_shape(SmemLayoutAtom{}, make_shape(_32{}, _32{}, Int<kDgradStages>{})));
+
 // ============================================================================
 // Shared storage (dynamic smem)
 // ============================================================================
@@ -121,8 +168,8 @@ template <int KernelSize, int Stride> struct alignas(128) DgradSmem {
     using H = HaloGeom<KernelSize, Stride>;
     union {
         struct {
-            tfloat32_t sA[cosize_v<SmemLayoutDgradA>];
-            tfloat32_t sB[cosize_v<SmemLayoutDgradB>];
+            tfloat32_t sA[cosize_v<SmemLayoutDgradA_Staged>];
+            tfloat32_t sB[cosize_v<SmemLayoutDgradB_Staged>];
         };
         float sC[kClusterVoxels * kTileC];
     };
@@ -130,6 +177,7 @@ template <int KernelSize, int Stride> struct alignas(128) DgradSmem {
     uint64_t halo_idx[H::kHaloVoxels];
     uint64_t out_rows[kClusterVoxels];
     uint64_t in_rows[kClusterVoxels];
+    bool out_pred[kClusterVoxels];
 };
 
 template <int KernelSize, int Stride> struct alignas(128) WgradSmem {
@@ -177,6 +225,79 @@ weightIndex(int oc, int ic, int t, int r, int s, int C) {
 }
 
 // ============================================================================
+// Gather layout utilities for cp.async pipelining
+// ============================================================================
+
+template <class Index, int Offset = 0> struct IndexedGather {
+    CUTE_HOST_DEVICE constexpr IndexedGather(Index const *indices = {}) : indices_(indices) {}
+
+    template <typename I>
+    CUTE_HOST_DEVICE constexpr Index
+    operator()(I i) const {
+        return indices_[i] + Index(Offset);
+    }
+
+    CUTE_HOST_DEVICE friend void
+    print(IndexedGather const &) {
+        cute::print("Indexed");
+    }
+
+    Index const *indices_;
+};
+
+template <class Func, class StrideT> struct CustomStride {
+    CUTE_HOST_DEVICE constexpr CustomStride(Func const &func, StrideT const &stride)
+        : func_(func), stride_(stride) {}
+
+    template <class I>
+    CUTE_HOST_DEVICE constexpr friend auto
+    operator*(I i, CustomStride const &s) {
+        return s.func_(i) * s.stride_;
+    }
+
+    template <class I>
+    CUTE_HOST_DEVICE constexpr friend auto
+    operator*(CustomStride const &s, I i) {
+        return s.func_(i) * s.stride_;
+    }
+
+    CUTE_HOST_DEVICE friend void
+    print(CustomStride const &s) {
+        cute::print("Custom{");
+        print(s.func_);
+        cute::print(",");
+        print(s.stride_);
+        cute::print("}");
+    }
+
+    template <class Div>
+    CUTE_HOST_DEVICE constexpr friend auto
+    safe_div(CustomStride const &s, Div const &div) {
+        return CustomStride<Func, decltype(safe_div(s.stride_, div))>(s.func_,
+                                                                      safe_div(s.stride_, div));
+    }
+
+    template <class Shape>
+    CUTE_HOST_DEVICE constexpr friend auto
+    make_layout(Shape const &shape, CustomStride const &stride) {
+        return Layout<Shape, CustomStride>(shape, stride);
+    }
+
+    Func func_;
+    StrideT stride_;
+};
+
+using GmemTiledCopyDgradA = decltype(make_tiled_copy(
+    Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS_ZFILL<uint128_t>, tfloat32_t>{},
+    Layout<Shape<_16, _8>, Stride<_8, _1>>{},
+    Layout<Shape<_1, _4>>{}));
+
+using GmemTiledCopyDgradB = decltype(make_tiled_copy(
+    Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, tfloat32_t>{},
+    Layout<Shape<_16, _8>, Stride<_8, _1>>{},
+    Layout<Shape<_1, _4>>{}));
+
+// ============================================================================
 // dgrad kernel
 // ============================================================================
 
@@ -218,26 +339,36 @@ predGatherIGemmDgradKernel(const nanovdb::NanoGrid<BuildT> *act_grid,
     auto thr_mma = tiled_mma.get_thread_slice(threadIdx.x);
     Tensor accum = partition_fragment_C(tiled_mma, Shape<_64, _32>{});
 
-    Tensor tSA = make_tensor(make_smem_ptr(smem.sA), SmemLayoutDgradA{});
-    Tensor tSB = make_tensor(make_smem_ptr(smem.sB), SmemLayoutDgradB{});
+    Tensor tSA = make_tensor(make_smem_ptr(smem.sA), SmemLayoutDgradA_Staged{});
+    Tensor tSB = make_tensor(make_smem_ptr(smem.sB), SmemLayoutDgradB_Staged{});
 
-    Tensor fragA = thr_mma.partition_fragment_A(tSA);
-    Tensor fragB = thr_mma.partition_fragment_B(tSB);
+    Tensor fragA = thr_mma.partition_fragment_A(tSA(_, _, 0));
+    Tensor fragB = thr_mma.partition_fragment_B(tSB(_, _, 0));
 
     auto smem_copy_A = make_tiled_copy_A(SmemCopyAtom{}, tiled_mma);
     auto smem_thr_A  = smem_copy_A.get_thread_slice(threadIdx.x);
     auto tCsA        = smem_thr_A.partition_S(tSA);
-    auto tCrA        = smem_thr_A.retile_D(fragA);
+    auto tCrA_view   = smem_thr_A.retile_D(fragA);
 
     auto smem_copy_B = make_tiled_copy_B(SmemCopyAtom{}, tiled_mma);
     auto smem_thr_B  = smem_copy_B.get_thread_slice(threadIdx.x);
     auto tCsB        = smem_thr_B.partition_S(tSB);
-    auto tCrB        = smem_thr_B.retile_D(fragB);
+    auto tCrB_view   = smem_thr_B.retile_D(fragB);
 
     auto epi_copy = make_tiled_copy_C(EpiCopyAtom{}, tiled_mma);
     auto epi_thr  = epi_copy.get_slice(threadIdx.x);
 
-    // ---- main loop: cluster → kernel_offset → K-tile ----
+    GmemTiledCopyDgradA gmem_copy_A;
+    GmemTiledCopyDgradB gmem_copy_B;
+    auto gmem_thr_A = gmem_copy_A.get_slice(threadIdx.x);
+    auto gmem_thr_B = gmem_copy_B.get_slice(threadIdx.x);
+
+    auto tAsA = gmem_thr_A.partition_D(tSA);
+    auto tBsB = gmem_thr_B.partition_D(tSB);
+
+    auto K_BLOCK_MAX = size<2>(fragA);
+
+    // ---- main loop: cluster → kernel_offset → pipelined K-tiles ----
 
     for (int cluster_id = 0; cluster_id < kClustersPerLeaf; ++cluster_id) {
         int bx, by, bz;
@@ -258,7 +389,41 @@ predGatherIGemmDgradKernel(const nanovdb::NanoGrid<BuildT> *act_grid,
             int hz           = rem % H::CHz;
             smem.halo_idx[v] = act_tree.getValue(halo_origin.offsetBy(hx, hy, hz));
         }
+
+        for (int n = threadIdx.x; n < kClusterVoxels; n += kBlockThreads)
+            smem.out_pred[n] = (smem.out_rows[n] != 0);
         __syncthreads();
+
+        // Gathered gmem tensor for grad_out: address(n,k) = (out_rows[n]-1)*K + k
+        auto gA_inner = make_layout(
+            make_shape(Int<kClusterVoxels>{}, K),
+            make_stride(E<0>{}, E<1>{}));
+        auto gA_outer = make_layout(
+            make_shape(_1{}, _1{}),
+            make_stride(
+                CustomStride{IndexedGather<uint64_t, -1>{smem.out_rows}, K},
+                _1{}));
+        auto gA_full = make_tensor(
+            make_gmem_ptr(grad_out),
+            composition(gA_outer, make_arithmetic_tuple(_0{}, _0{}), gA_inner));
+        auto gA = local_tile(
+            gA_full,
+            make_shape(Int<kClusterVoxels>{}, Int<kTileK>{}),
+            make_coord(_0{}, _));
+
+        // Predicate tensor (stride _0 in K: pred depends only on voxel index)
+        auto sP_full = make_tensor(
+            make_smem_ptr(smem.out_pred),
+            make_layout(
+                make_shape(Int<kClusterVoxels>{}, K),
+                make_stride(_1{}, _0{})));
+        auto sP = local_tile(
+            sP_full,
+            make_shape(Int<kClusterVoxels>{}, Int<kTileK>{}),
+            make_coord(_0{}, _));
+
+        auto tAgA = gmem_thr_A.partition_S(gA);
+        auto tAsP = gmem_thr_A.partition_S(sP);
 
         for (int ko = 0; ko < kernel_volume; ++ko) {
             int const t = ko / (KernelSize * KernelSize);
@@ -279,35 +444,84 @@ predGatherIGemmDgradKernel(const nanovdb::NanoGrid<BuildT> *act_grid,
             }
             __syncthreads();
 
+            // Contiguous gmem tensor for weights (permutation [T,R,S,C,K]: K contiguous)
+            int64_t const w_base = static_cast<int64_t>(ko) * C * K;
+            auto gB_full = make_tensor(
+                make_gmem_ptr(W_perm + w_base + static_cast<int64_t>(c0) * K),
+                make_layout(make_shape(Int<kTileC>{}, K), make_stride(K, _1{})));
+            auto gB = local_tile(
+                gB_full,
+                make_shape(Int<kTileC>{}, Int<kTileK>{}),
+                make_coord(_0{}, _));
+            auto tBgB = gmem_thr_B.partition_S(gB);
+
             clear(accum);
 
-            int64_t const w_base = static_cast<int64_t>(ko) * K * C;
+            int k_tile_count = K / kTileK;
+            int k_tile       = 0;
 
-            for (int k0 = 0; k0 < K; k0 += kTileK) {
-                for (int idx = threadIdx.x; idx < kClusterVoxels * kTileK; idx += kBlockThreads) {
-                    int n        = idx / kTileK;
-                    int kk       = idx % kTileK;
-                    uint64_t row = smem.out_rows[n];
-                    tSA(n, kk)   = tfloat32_t(
-                        row ? grad_out[static_cast<int64_t>(row - 1) * K + k0 + kk] : 0.0f);
-                }
-
-                for (int idx = threadIdx.x; idx < kTileC * kTileK; idx += kBlockThreads) {
-                    int cc = idx / kTileK;
-                    int kk = idx % kTileK;
-                    tSB(cc, kk) =
-                        tfloat32_t(W_perm[w_base + static_cast<int64_t>(k0 + kk) * C + c0 + cc]);
-                }
-                __syncthreads();
-
-                copy(smem_copy_A, tCsA, tCrA);
-                copy(smem_copy_B, tCsB, tCrB);
-
-                CUTLASS_PRAGMA_UNROLL
-                for (int kb = 0; kb < size<2>(fragA); ++kb)
-                    cute::gemm(tiled_mma, accum, fragA(_, _, kb), fragB(_, _, kb), accum);
-                __syncthreads();
+            // ---- Prologue: fill Stages-1 pipeline stages ----
+            CUTLASS_PRAGMA_UNROLL
+            for (int k_pipe = 0; k_pipe < kDgradStages - 1; ++k_pipe) {
+                copy_if(gmem_copy_A, tAsP(_, _, _, k_tile), tAgA(_, _, _, k_tile),
+                        tAsA(_, _, _, k_pipe));
+                copy(gmem_copy_B, tBgB(_, _, _, k_tile), tBsB(_, _, _, k_pipe));
+                cp_async_fence();
+                --k_tile_count;
+                if (k_tile_count > 0)
+                    ++k_tile;
             }
+
+            // ---- Pipelined mainloop ----
+            int smem_pipe_read  = 0;
+            int smem_pipe_write = kDgradStages - 1;
+
+            auto tCsA_p = tCsA(_, _, _, smem_pipe_read);
+            auto tCsB_p = tCsB(_, _, _, smem_pipe_read);
+
+            if (K_BLOCK_MAX > 1) {
+                cp_async_wait<kDgradStages - 2>();
+                __syncthreads();
+                copy(smem_copy_A, tCsA_p(_, _, Int<0>{}), tCrA_view(_, _, Int<0>{}));
+                copy(smem_copy_B, tCsB_p(_, _, Int<0>{}), tCrB_view(_, _, Int<0>{}));
+            }
+
+            CUTLASS_PRAGMA_NO_UNROLL
+            while (k_tile_count > -(kDgradStages - 1)) {
+                for_each(make_int_sequence<K_BLOCK_MAX>{}, [&](auto k_block) {
+                    if (k_block == K_BLOCK_MAX - 1) {
+                        tCsA_p = tCsA(_, _, _, smem_pipe_read);
+                        tCsB_p = tCsB(_, _, _, smem_pipe_read);
+                        cp_async_wait<kDgradStages - 2>();
+                        __syncthreads();
+                    }
+
+                    auto k_block_next = (k_block + Int<1>{}) % K_BLOCK_MAX;
+                    copy(smem_copy_A, tCsA_p(_, _, k_block_next), tCrA_view(_, _, k_block_next));
+                    copy(smem_copy_B, tCsB_p(_, _, k_block_next), tCrB_view(_, _, k_block_next));
+
+                    if (k_block == 0) {
+                        copy_if(gmem_copy_A, tAsP(_, _, _, k_tile), tAgA(_, _, _, k_tile),
+                                tAsA(_, _, _, smem_pipe_write));
+                        copy(gmem_copy_B, tBgB(_, _, _, k_tile), tBsB(_, _, _, smem_pipe_write));
+                        cp_async_fence();
+
+                        --k_tile_count;
+                        if (k_tile_count > 0)
+                            ++k_tile;
+
+                        smem_pipe_write = smem_pipe_read;
+                        ++smem_pipe_read;
+                        smem_pipe_read =
+                            (smem_pipe_read == kDgradStages) ? 0 : smem_pipe_read;
+                    }
+
+                    cute::gemm(tiled_mma, accum, fragA(_, _, k_block), fragB(_, _, k_block), accum);
+                });
+            }
+
+            cp_async_wait<0>();
+            __syncthreads();
 
             // epilogue: stage accum → smem, scatter-add to dX
             Tensor tSC = make_tensor(make_smem_ptr(smem.sC), Layout<Shape<_64, _32>>{});
@@ -505,7 +719,7 @@ launchPredGatherIGemmBackward(torch::Tensor grad_output,
         return {grad_features, grad_weights};
     }
 
-    auto filter_perm = weights.permute({2, 3, 4, 0, 1}).contiguous();
+    auto filter_perm = weights.permute({2, 3, 4, 1, 0}).contiguous();
 
     dim3 const block(kBlockThreads);
     dim3 const dgrad_grid(
