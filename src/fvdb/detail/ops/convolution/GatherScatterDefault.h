@@ -114,12 +114,16 @@ torch::Tensor gatherScatterDefaultSparseConv(torch::Tensor features,
 /// @param features     Input features used in the forward pass.
 /// @param weights      Kernel weights used in the forward pass.
 /// @param topo         Precomputed compacted topology (direction=Forward).
+/// @param needs_dgrad  If true, compute grad_features; otherwise return empty tensor.
+/// @param needs_wgrad  If true, compute grad_weights; otherwise return empty tensor.
 /// @return Tuple of (grad_features, grad_weights).
 std::tuple<torch::Tensor, torch::Tensor>
 gatherScatterDefaultSparseConvBackward(torch::Tensor grad_output,
                                        torch::Tensor features,
                                        torch::Tensor weights,
-                                       GatherScatterDefaultTopology const &topo);
+                                       GatherScatterDefaultTopology const &topo,
+                                       bool needs_dgrad = true,
+                                       bool needs_wgrad = true);
 
 /// @brief Forward pass of transposed sparse convolution.
 /// @param features  Input features, shape [featureTotalVoxels, C_in].
@@ -135,12 +139,16 @@ torch::Tensor gatherScatterDefaultSparseConvTranspose(torch::Tensor features,
 /// @param features     Input features used in the forward pass.
 /// @param weights      Kernel weights used in the forward pass.
 /// @param topo         Precomputed compacted topology (direction=Transposed).
+/// @param needs_dgrad  If true, compute grad_features; otherwise return empty tensor.
+/// @param needs_wgrad  If true, compute grad_weights; otherwise return empty tensor.
 /// @return Tuple of (grad_features, grad_weights).
 std::tuple<torch::Tensor, torch::Tensor>
 gatherScatterDefaultSparseConvTransposeBackward(torch::Tensor grad_output,
                                                 torch::Tensor features,
                                                 torch::Tensor weights,
-                                                GatherScatterDefaultTopology const &topo);
+                                                GatherScatterDefaultTopology const &topo,
+                                                bool needs_dgrad = true,
+                                                bool needs_wgrad = true);
 
 } // namespace ops
 } // namespace detail

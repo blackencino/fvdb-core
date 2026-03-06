@@ -681,15 +681,20 @@ runBackwardBenchmark(const BenchConfig &cfg, torch::Device device) {
     constexpr int kIters  = 5;
     CudaTimer timer;
 
-    // --- PredGatherIGemmBackward ---
-    for (int i = 0; i < kWarmup; ++i)
-        ops::predGatherIGemmSparseConvBackward(
-            grad_output, features, fvdb_weights, *input_grid, *output_grid, 3, 1);
-    timer.recordStart();
-    for (int i = 0; i < kIters; ++i)
-        ops::predGatherIGemmSparseConvBackward(
-            grad_output, features, fvdb_weights, *input_grid, *output_grid, 3, 1);
-    float igemm_ms = timer.recordStopMs() / kIters;
+    auto time_igemm = [&](bool dgrad, bool wgrad) {
+        for (int i = 0; i < kWarmup; ++i)
+            ops::predGatherIGemmSparseConvBackward(
+                grad_output, features, fvdb_weights, *input_grid, *output_grid, 3, 1, dgrad, wgrad);
+        timer.recordStart();
+        for (int i = 0; i < kIters; ++i)
+            ops::predGatherIGemmSparseConvBackward(
+                grad_output, features, fvdb_weights, *input_grid, *output_grid, 3, 1, dgrad, wgrad);
+        return timer.recordStopMs() / kIters;
+    };
+
+    float igemm_both_ms  = time_igemm(true, true);
+    float igemm_dgrad_ms = time_igemm(true, false);
+    float igemm_wgrad_ms = time_igemm(false, true);
 
     // --- GatherScatterDefault backward (with topology build) ---
     for (int i = 0; i < kWarmup; ++i) {
@@ -703,18 +708,28 @@ runBackwardBenchmark(const BenchConfig &cfg, torch::Device device) {
     }
     float gs_with_topo_ms = timer.recordStopMs() / kIters;
 
-    // --- GatherScatterDefault backward (topology pre-computed) ---
+    // --- GatherScatterDefault backward (topology pre-computed, dgrad/wgrad split) ---
     auto topo = ops::gatherScatterDefaultSparseConvTopology(*input_grid, *output_grid, ks, stride);
-    for (int i = 0; i < kWarmup; ++i)
-        ops::gatherScatterDefaultSparseConvBackward(grad_output, features, fvdb_weights, topo);
-    timer.recordStart();
-    for (int i = 0; i < kIters; ++i)
-        ops::gatherScatterDefaultSparseConvBackward(grad_output, features, fvdb_weights, topo);
-    float gs_no_topo_ms = timer.recordStopMs() / kIters;
 
-    std::cout << "    PredGatherIGemmBackward: " << igemm_ms << " ms"
-              << "  |  GS+topo: " << gs_with_topo_ms << " ms"
-              << "  |  GS only: " << gs_no_topo_ms << " ms" << std::endl;
+    auto time_gs = [&](bool dgrad, bool wgrad) {
+        for (int i = 0; i < kWarmup; ++i)
+            ops::gatherScatterDefaultSparseConvBackward(
+                grad_output, features, fvdb_weights, topo, dgrad, wgrad);
+        timer.recordStart();
+        for (int i = 0; i < kIters; ++i)
+            ops::gatherScatterDefaultSparseConvBackward(
+                grad_output, features, fvdb_weights, topo, dgrad, wgrad);
+        return timer.recordStopMs() / kIters;
+    };
+
+    float gs_both_ms  = time_gs(true, true);
+    float gs_dgrad_ms = time_gs(true, false);
+    float gs_wgrad_ms = time_gs(false, true);
+
+    std::cout << "    IGEMM  both=" << igemm_both_ms << "  dgrad=" << igemm_dgrad_ms
+              << "  wgrad=" << igemm_wgrad_ms << " ms" << std::endl;
+    std::cout << "    GS     both=" << gs_both_ms << "  dgrad=" << gs_dgrad_ms
+              << "  wgrad=" << gs_wgrad_ms << "  +topo=" << gs_with_topo_ms << " ms" << std::endl;
 
     // -- Correctness sanity check --
     auto [gf_igemm, gw_igemm] = ops::predGatherIGemmSparseConvBackward(

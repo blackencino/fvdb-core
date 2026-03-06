@@ -55,14 +55,20 @@ class _GatherScatterConvFn(torch.autograd.Function):
         return output
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, None, None]:  # type: ignore[override]
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor | None, torch.Tensor | None, None, None]:  # type: ignore[override]
         features, weights = ctx.saved_tensors
         grad_output = grad_output.contiguous()
+        needs_dgrad = ctx.needs_input_grad[0]
+        needs_wgrad = ctx.needs_input_grad[1]
         if ctx.transposed:
-            grad_feat, grad_w = _fvdb_cpp.gs_conv_transpose_backward(grad_output, features, weights, ctx.topo)
+            grad_feat, grad_w = _fvdb_cpp.gs_conv_transpose_backward(
+                grad_output, features, weights, ctx.topo, needs_dgrad, needs_wgrad
+            )
         else:
-            grad_feat, grad_w = _fvdb_cpp.gs_conv_backward(grad_output, features, weights, ctx.topo)
-        return grad_feat, grad_w, None, None
+            grad_feat, grad_w = _fvdb_cpp.gs_conv_backward(
+                grad_output, features, weights, ctx.topo, needs_dgrad, needs_wgrad
+            )
+        return grad_feat if needs_dgrad else None, grad_w if needs_wgrad else None, None, None
 
 
 class _PredGatherIGemmConvFn(torch.autograd.Function):
@@ -87,13 +93,30 @@ class _PredGatherIGemmConvFn(torch.autograd.Function):
         return output
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, None, None, None, None]:  # type: ignore[override]
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor | None, torch.Tensor | None, None, None, None, None]:  # type: ignore[override]
         features, weights = ctx.saved_tensors
         grad_output = grad_output.contiguous()
+        needs_dgrad = ctx.needs_input_grad[0]
+        needs_wgrad = ctx.needs_input_grad[1]
         grad_feat, grad_w = _fvdb_cpp.pred_gather_igemm_conv_backward(
-            grad_output, features, weights, ctx.feature_grid, ctx.output_grid, ctx.kernel_size, ctx.stride
+            grad_output,
+            features,
+            weights,
+            ctx.feature_grid,
+            ctx.output_grid,
+            ctx.kernel_size,
+            ctx.stride,
+            needs_dgrad,
+            needs_wgrad,
         )
-        return grad_feat, grad_w, None, None, None, None
+        return (
+            grad_feat if needs_dgrad else None,
+            grad_w if needs_wgrad else None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 # ============================================================

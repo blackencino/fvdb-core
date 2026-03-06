@@ -297,15 +297,15 @@ template <class Func, class StrideT> struct CustomStride {
     StrideT stride_;
 };
 
-using GmemTiledCopyDgradA = decltype(make_tiled_copy(
-    Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS_ZFILL<uint128_t>, tfloat32_t>{},
-    Layout<Shape<_16, _8>, Stride<_8, _1>>{},
-    Layout<Shape<_1, _4>>{}));
+using GmemTiledCopyDgradA =
+    decltype(make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS_ZFILL<uint128_t>, tfloat32_t>{},
+                             Layout<Shape<_16, _8>, Stride<_8, _1>>{},
+                             Layout<Shape<_1, _4>>{}));
 
-using GmemTiledCopyDgradB = decltype(make_tiled_copy(
-    Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, tfloat32_t>{},
-    Layout<Shape<_16, _8>, Stride<_8, _1>>{},
-    Layout<Shape<_1, _4>>{}));
+using GmemTiledCopyDgradB =
+    decltype(make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, tfloat32_t>{},
+                             Layout<Shape<_16, _8>, Stride<_8, _1>>{},
+                             Layout<Shape<_1, _4>>{}));
 
 // ============================================================================
 // dgrad kernel
@@ -410,32 +410,23 @@ predGatherIGemmDgradKernel(const nanovdb::NanoGrid<BuildT> *act_grid,
         __syncthreads();
 
         // Gathered gmem tensor for grad_out: address(n,k) = (out_rows[n]-1)*K + k
-        auto gA_inner = make_layout(
-            make_shape(Int<kClusterVoxels>{}, K),
-            make_stride(E<0>{}, E<1>{}));
+        auto gA_inner =
+            make_layout(make_shape(Int<kClusterVoxels>{}, K), make_stride(E<0>{}, E<1>{}));
         auto gA_outer = make_layout(
             make_shape(_1{}, _1{}),
-            make_stride(
-                CustomStride{IndexedGather<uint64_t, -1>{smem.out_rows}, K},
-                _1{}));
-        auto gA_full = make_tensor(
-            make_gmem_ptr(grad_out),
-            composition(gA_outer, make_arithmetic_tuple(_0{}, _0{}), gA_inner));
+            make_stride(CustomStride{IndexedGather<uint64_t, -1>{smem.out_rows}, K}, _1{}));
+        auto gA_full =
+            make_tensor(make_gmem_ptr(grad_out),
+                        composition(gA_outer, make_arithmetic_tuple(_0{}, _0{}), gA_inner));
         auto gA = local_tile(
-            gA_full,
-            make_shape(Int<kClusterVoxels>{}, Int<kTileK>{}),
-            make_coord(_0{}, _));
+            gA_full, make_shape(Int<kClusterVoxels>{}, Int<kTileK>{}), make_coord(_0{}, _));
 
         // Predicate tensor (stride _0 in K: pred depends only on voxel index)
-        auto sP_full = make_tensor(
-            make_smem_ptr(smem.out_pred),
-            make_layout(
-                make_shape(Int<kClusterVoxels>{}, K),
-                make_stride(_1{}, _0{})));
+        auto sP_full =
+            make_tensor(make_smem_ptr(smem.out_pred),
+                        make_layout(make_shape(Int<kClusterVoxels>{}, K), make_stride(_1{}, _0{})));
         auto sP = local_tile(
-            sP_full,
-            make_shape(Int<kClusterVoxels>{}, Int<kTileK>{}),
-            make_coord(_0{}, _));
+            sP_full, make_shape(Int<kClusterVoxels>{}, Int<kTileK>{}), make_coord(_0{}, _));
 
         auto tAgA = gmem_thr_A.partition_S(gA);
         auto tAsP = gmem_thr_A.partition_S(sP);
@@ -461,13 +452,11 @@ predGatherIGemmDgradKernel(const nanovdb::NanoGrid<BuildT> *act_grid,
 
             // Contiguous gmem tensor for weights (permutation [T,R,S,C,K]: K contiguous)
             int64_t const w_base = static_cast<int64_t>(ko) * C * K;
-            auto gB_full = make_tensor(
-                make_gmem_ptr(W_perm + w_base + static_cast<int64_t>(c0) * K),
-                make_layout(make_shape(Int<kTileC>{}, K), make_stride(K, _1{})));
-            auto gB = local_tile(
-                gB_full,
-                make_shape(Int<kTileC>{}, Int<kTileK>{}),
-                make_coord(_0{}, _));
+            auto gB_full =
+                make_tensor(make_gmem_ptr(W_perm + w_base + static_cast<int64_t>(c0) * K),
+                            make_layout(make_shape(Int<kTileC>{}, K), make_stride(K, _1{})));
+            auto gB =
+                local_tile(gB_full, make_shape(Int<kTileC>{}, Int<kTileK>{}), make_coord(_0{}, _));
             auto tBgB = gmem_thr_B.partition_S(gB);
 
             clear(accum);
@@ -478,7 +467,9 @@ predGatherIGemmDgradKernel(const nanovdb::NanoGrid<BuildT> *act_grid,
             // ---- Prologue: fill Stages-1 pipeline stages ----
             CUTLASS_PRAGMA_UNROLL
             for (int k_pipe = 0; k_pipe < kDgradStages - 1; ++k_pipe) {
-                copy_if(gmem_copy_A, tAsP(_, _, _, k_tile), tAgA(_, _, _, k_tile),
+                copy_if(gmem_copy_A,
+                        tAsP(_, _, _, k_tile),
+                        tAgA(_, _, _, k_tile),
                         tAsA(_, _, _, k_pipe));
                 copy(gmem_copy_B, tBgB(_, _, _, k_tile), tBsB(_, _, _, k_pipe));
                 cp_async_fence();
@@ -516,7 +507,9 @@ predGatherIGemmDgradKernel(const nanovdb::NanoGrid<BuildT> *act_grid,
                     copy(smem_copy_B, tCsB_p(_, _, k_block_next), tCrB_view(_, _, k_block_next));
 
                     if (k_block == 0) {
-                        copy_if(gmem_copy_A, tAsP(_, _, _, k_tile), tAgA(_, _, _, k_tile),
+                        copy_if(gmem_copy_A,
+                                tAsP(_, _, _, k_tile),
+                                tAgA(_, _, _, k_tile),
                                 tAsA(_, _, _, smem_pipe_write));
                         copy(gmem_copy_B, tBgB(_, _, _, k_tile), tBsB(_, _, _, smem_pipe_write));
                         cp_async_fence();
@@ -527,8 +520,7 @@ predGatherIGemmDgradKernel(const nanovdb::NanoGrid<BuildT> *act_grid,
 
                         smem_pipe_write = smem_pipe_read;
                         ++smem_pipe_read;
-                        smem_pipe_read =
-                            (smem_pipe_read == kDgradStages) ? 0 : smem_pipe_read;
+                        smem_pipe_read = (smem_pipe_read == kDgradStages) ? 0 : smem_pipe_read;
                     }
 
                     cute::gemm(tiled_mma, accum, fragA(_, _, k_block), fragB(_, _, k_block), accum);
@@ -714,7 +706,9 @@ launchPredGatherIGemmBackward(torch::Tensor grad_output,
                               torch::Tensor features,
                               torch::Tensor weights,
                               GridBatchImpl const &feature_grid,
-                              GridBatchImpl const &output_grid) {
+                              GridBatchImpl const &output_grid,
+                              bool needs_dgrad,
+                              bool needs_wgrad) {
     auto *nano_input_grid =
         feature_grid.nanoGridHandle().template deviceGrid<nanovdb::ValueOnIndex>();
     auto *nano_output_grid =
@@ -730,8 +724,8 @@ launchPredGatherIGemmBackward(torch::Tensor grad_output,
 
     auto opts = torch::dtype(torch::kFloat32).device(features.device());
 
-    auto grad_features = torch::zeros({N_in, C}, opts);
-    auto grad_weights  = torch::zeros_like(weights);
+    auto grad_features = needs_dgrad ? torch::zeros({N_in, C}, opts) : torch::Tensor();
+    auto grad_weights  = needs_wgrad ? torch::zeros_like(weights) : torch::Tensor();
 
     uint32_t const output_leaf_count = output_grid.numLeavesAt(0);
 
@@ -739,49 +733,56 @@ launchPredGatherIGemmBackward(torch::Tensor grad_output,
         return {grad_features, grad_weights};
     }
 
-    auto filter_perm = weights.permute({2, 3, 4, 1, 0}).contiguous();
-
     dim3 const block(kBlockThreads);
-    dim3 const dgrad_grid(
-        static_cast<unsigned int>(output_leaf_count), static_cast<unsigned int>(C / kTileC), 1u);
-    dim3 const wgrad_grid(static_cast<unsigned int>(output_leaf_count),
-                          static_cast<unsigned int>(C / kTileC),
-                          static_cast<unsigned int>(K / kTileK));
-
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    constexpr size_t dgrad_smem_size = sizeof(DgradSmem<KernelSize, Stride>);
-    constexpr size_t wgrad_smem_size = sizeof(WgradSmem<KernelSize, Stride>);
+    if (needs_dgrad) {
+        auto filter_perm = weights.permute({2, 3, 4, 1, 0}).contiguous();
 
-    auto dgrad_fn = predGatherIGemmDgradKernel<KernelSize, Stride, nanovdb::ValueOnIndex>;
-    auto wgrad_fn = predGatherIGemmWgradKernel<KernelSize, Stride, nanovdb::ValueOnIndex>;
+        dim3 const dgrad_grid(static_cast<unsigned int>(output_leaf_count),
+                              static_cast<unsigned int>(C / kTileC),
+                              1u);
 
-    if (dgrad_smem_size > 48u * 1024u)
-        cudaFuncSetAttribute(dgrad_fn,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             static_cast<int>(dgrad_smem_size));
-    if (wgrad_smem_size > 48u * 1024u)
-        cudaFuncSetAttribute(wgrad_fn,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             static_cast<int>(wgrad_smem_size));
+        constexpr size_t dgrad_smem_size = sizeof(DgradSmem<KernelSize, Stride>);
+        auto dgrad_fn = predGatherIGemmDgradKernel<KernelSize, Stride, nanovdb::ValueOnIndex>;
 
-    dgrad_fn<<<dgrad_grid, block, dgrad_smem_size, stream>>>(nano_input_grid,
-                                                             nano_output_grid,
-                                                             grad_output.data_ptr<float>(),
-                                                             filter_perm.data_ptr<float>(),
-                                                             grad_features.data_ptr<float>(),
-                                                             static_cast<int>(C),
-                                                             static_cast<int>(K));
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+        if (dgrad_smem_size > 48u * 1024u)
+            cudaFuncSetAttribute(dgrad_fn,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 static_cast<int>(dgrad_smem_size));
 
-    wgrad_fn<<<wgrad_grid, block, wgrad_smem_size, stream>>>(nano_input_grid,
-                                                             nano_output_grid,
-                                                             features.data_ptr<float>(),
-                                                             grad_output.data_ptr<float>(),
-                                                             grad_weights.data_ptr<float>(),
-                                                             static_cast<int>(C),
-                                                             static_cast<int>(K));
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+        dgrad_fn<<<dgrad_grid, block, dgrad_smem_size, stream>>>(nano_input_grid,
+                                                                 nano_output_grid,
+                                                                 grad_output.data_ptr<float>(),
+                                                                 filter_perm.data_ptr<float>(),
+                                                                 grad_features.data_ptr<float>(),
+                                                                 static_cast<int>(C),
+                                                                 static_cast<int>(K));
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+
+    if (needs_wgrad) {
+        dim3 const wgrad_grid(static_cast<unsigned int>(output_leaf_count),
+                              static_cast<unsigned int>(C / kTileC),
+                              static_cast<unsigned int>(K / kTileK));
+
+        constexpr size_t wgrad_smem_size = sizeof(WgradSmem<KernelSize, Stride>);
+        auto wgrad_fn = predGatherIGemmWgradKernel<KernelSize, Stride, nanovdb::ValueOnIndex>;
+
+        if (wgrad_smem_size > 48u * 1024u)
+            cudaFuncSetAttribute(wgrad_fn,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 static_cast<int>(wgrad_smem_size));
+
+        wgrad_fn<<<wgrad_grid, block, wgrad_smem_size, stream>>>(nano_input_grid,
+                                                                 nano_output_grid,
+                                                                 features.data_ptr<float>(),
+                                                                 grad_output.data_ptr<float>(),
+                                                                 grad_weights.data_ptr<float>(),
+                                                                 static_cast<int>(C),
+                                                                 static_cast<int>(K));
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
 
     return {grad_features, grad_weights};
 }
@@ -866,7 +867,9 @@ predGatherIGemmSparseConvBackward(torch::Tensor grad_output,
                                   GridBatchImpl const &feature_grid,
                                   GridBatchImpl const &output_grid,
                                   int kernel_size,
-                                  int stride) {
+                                  int stride,
+                                  bool needs_dgrad,
+                                  bool needs_wgrad) {
     using namespace pred_gather_igemm_backward;
 
     checkPredGatherIGemmBackwardPreconditions(
@@ -883,33 +886,63 @@ predGatherIGemmSparseConvBackward(torch::Tensor grad_output,
     case 3:
         switch (stride) {
         case 1:
-            return launchPredGatherIGemmBackward<3, 1>(
-                grad_output, features, weights, feature_grid, output_grid);
+            return launchPredGatherIGemmBackward<3, 1>(grad_output,
+                                                       features,
+                                                       weights,
+                                                       feature_grid,
+                                                       output_grid,
+                                                       needs_dgrad,
+                                                       needs_wgrad);
         case 2:
-            return launchPredGatherIGemmBackward<3, 2>(
-                grad_output, features, weights, feature_grid, output_grid);
+            return launchPredGatherIGemmBackward<3, 2>(grad_output,
+                                                       features,
+                                                       weights,
+                                                       feature_grid,
+                                                       output_grid,
+                                                       needs_dgrad,
+                                                       needs_wgrad);
         default: break;
         }
         break;
     case 5:
         switch (stride) {
         case 1:
-            return launchPredGatherIGemmBackward<5, 1>(
-                grad_output, features, weights, feature_grid, output_grid);
+            return launchPredGatherIGemmBackward<5, 1>(grad_output,
+                                                       features,
+                                                       weights,
+                                                       feature_grid,
+                                                       output_grid,
+                                                       needs_dgrad,
+                                                       needs_wgrad);
         case 2:
-            return launchPredGatherIGemmBackward<5, 2>(
-                grad_output, features, weights, feature_grid, output_grid);
+            return launchPredGatherIGemmBackward<5, 2>(grad_output,
+                                                       features,
+                                                       weights,
+                                                       feature_grid,
+                                                       output_grid,
+                                                       needs_dgrad,
+                                                       needs_wgrad);
         default: break;
         }
         break;
     case 7:
         switch (stride) {
         case 1:
-            return launchPredGatherIGemmBackward<7, 1>(
-                grad_output, features, weights, feature_grid, output_grid);
+            return launchPredGatherIGemmBackward<7, 1>(grad_output,
+                                                       features,
+                                                       weights,
+                                                       feature_grid,
+                                                       output_grid,
+                                                       needs_dgrad,
+                                                       needs_wgrad);
         case 2:
-            return launchPredGatherIGemmBackward<7, 2>(
-                grad_output, features, weights, feature_grid, output_grid);
+            return launchPredGatherIGemmBackward<7, 2>(grad_output,
+                                                       features,
+                                                       weights,
+                                                       feature_grid,
+                                                       output_grid,
+                                                       needs_dgrad,
+                                                       needs_wgrad);
         default: break;
         }
         break;

@@ -435,15 +435,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         [](torch::Tensor grad_output,
            torch::Tensor features,
            torch::Tensor weights,
-           const GSDTopo &topo) -> std::tuple<torch::Tensor, torch::Tensor> {
+           const GSDTopo &topo,
+           bool needs_dgrad,
+           bool needs_wgrad) -> std::tuple<torch::Tensor, torch::Tensor> {
             return fvdb::detail::ops::gatherScatterDefaultSparseConvBackward(
-                grad_output, features, weights, topo);
+                grad_output, features, weights, topo, needs_dgrad, needs_wgrad);
         },
         "Gather-scatter default backward sparse convolution using precomputed topology.",
         py::arg("grad_output"),
         py::arg("features"),
         py::arg("weights"),
-        py::arg("topology"));
+        py::arg("topology"),
+        py::arg("needs_dgrad") = true,
+        py::arg("needs_wgrad") = true);
 
     // --- Transposed topology + conv ---
 
@@ -478,15 +482,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         [](torch::Tensor grad_output,
            torch::Tensor features,
            torch::Tensor weights,
-           const GSDTopo &topo) -> std::tuple<torch::Tensor, torch::Tensor> {
+           const GSDTopo &topo,
+           bool needs_dgrad,
+           bool needs_wgrad) -> std::tuple<torch::Tensor, torch::Tensor> {
             return fvdb::detail::ops::gatherScatterDefaultSparseConvTransposeBackward(
-                grad_output, features, weights, topo);
+                grad_output, features, weights, topo, needs_dgrad, needs_wgrad);
         },
         "Gather-scatter default transposed backward sparse convolution.",
         py::arg("grad_output"),
         py::arg("features"),
         py::arg("weights"),
-        py::arg("topology"));
+        py::arg("topology"),
+        py::arg("needs_dgrad") = true,
+        py::arg("needs_wgrad") = true);
 
     // -----------------------------------------------------------------------
     // PredGatherIGemm convolution (CUTLASS IGEMM, SM80+)
@@ -519,9 +527,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            const fvdb::GridBatch &feature_grid,
            const fvdb::GridBatch &output_grid,
            int kernel_size,
-           int stride) -> std::tuple<torch::Tensor, torch::Tensor> {
-            return fvdb::GridBatch::predGatherIGemmConvBackward(
-                grad_output, features, weights, feature_grid, output_grid, kernel_size, stride);
+           int stride,
+           bool needs_dgrad,
+           bool needs_wgrad) -> std::tuple<torch::Tensor, torch::Tensor> {
+            return fvdb::GridBatch::predGatherIGemmConvBackward(grad_output,
+                                                                features,
+                                                                weights,
+                                                                feature_grid,
+                                                                output_grid,
+                                                                kernel_size,
+                                                                stride,
+                                                                needs_dgrad,
+                                                                needs_wgrad);
         },
         "PredGatherIGemm backward sparse convolution (leaf-local, no k-map).",
         py::arg("grad_output"),
@@ -530,7 +547,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("feature_grid"),
         py::arg("output_grid"),
         py::arg("kernel_size"),
-        py::arg("stride"));
+        py::arg("stride"),
+        py::arg("needs_dgrad") = true,
+        py::arg("needs_wgrad") = true);
 }
 
 TORCH_LIBRARY(fvdb, m) {

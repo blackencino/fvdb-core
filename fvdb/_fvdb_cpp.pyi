@@ -66,6 +66,8 @@ def gs_conv_backward(
     features: torch.Tensor,
     weights: torch.Tensor,
     topology: GatherScatterDefaultTopology,
+    needs_dgrad: bool = True,
+    needs_wgrad: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 # Transposed topology + conv
@@ -85,6 +87,8 @@ def gs_conv_transpose_backward(
     features: torch.Tensor,
     weights: torch.Tensor,
     topology: GatherScatterDefaultTopology,
+    needs_dgrad: bool = True,
+    needs_wgrad: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 # PredGatherIGemm convolution (SM80 CUTLASS IGEMM)
@@ -104,6 +108,8 @@ def pred_gather_igemm_conv_backward(
     output_grid: GridBatch,
     kernel_size: int,
     stride: int,
+    needs_dgrad: bool = True,
+    needs_wgrad: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 class GaussianSplat3d:

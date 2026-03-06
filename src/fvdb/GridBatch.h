@@ -868,6 +868,8 @@ struct GridBatch : torch::CustomClassHolder {
     /// @param output_grid   Grid batch for output voxels.
     /// @param kernel_size   Uniform spatial kernel extent (3, 5, or 7).
     /// @param stride        Uniform convolution stride (1 or 2).
+    /// @param needs_dgrad   If true, compute grad_features; otherwise return empty tensor.
+    /// @param needs_wgrad   If true, compute grad_weights; otherwise return empty tensor.
     /// @return {grad_features [N_in, C], grad_weights [K, C, ks, ks, ks]}.
     static std::tuple<torch::Tensor, torch::Tensor>
     predGatherIGemmConvBackward(torch::Tensor grad_output,
@@ -876,7 +878,9 @@ struct GridBatch : torch::CustomClassHolder {
                                 const GridBatch &feature_grid,
                                 const GridBatch &output_grid,
                                 int kernel_size,
-                                int stride);
+                                int stride,
+                                bool needs_dgrad = true,
+                                bool needs_wgrad = true);
 
     /// @brief Perform one integration step of the TSDF fusion algorithm on a batch of sparse grids.
     ///        The TSDF fusion algorithm integrates depth and feature images (e.g. colors)

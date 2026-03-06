@@ -509,7 +509,9 @@ struct gs_default_conv_backward_op {
        torch::Tensor grad_output,
        torch::Tensor features,
        torch::Tensor weights,
-       GatherScatterDefaultTopology const &topo) {
+       GatherScatterDefaultTopology const &topo,
+       bool needs_dgrad,
+       bool needs_wgrad) {
         constexpr auto dev = tag_get<torch::DeviceType>(Tag{});
 
         auto guard = make_device_guard(tag<dev>{}, features);
@@ -526,24 +528,29 @@ struct gs_default_conv_backward_op {
             W = W.to(features.scalar_type());
         }
 
-        auto grad_features = torch::zeros({F, C_in}, features.options());
-
-        auto grad_W_flat = torch::zeros({K, C_in, C_out}, features.options());
+        auto grad_features =
+            needs_dgrad ? torch::zeros({F, C_in}, features.options()) : torch::Tensor();
+        auto grad_W_flat =
+            needs_wgrad ? torch::zeros({K, C_in, C_out}, features.options()) : torch::Tensor();
 
         if (O == 0 || K == 0 || TP == 0) {
             auto ks           = topo.kernelSize;
-            auto grad_weights = grad_W_flat.reshape({ks[0], ks[1], ks[2], C_in, C_out})
-                                    .permute({4, 3, 0, 1, 2})
-                                    .contiguous();
+            auto grad_weights = needs_wgrad
+                                    ? grad_W_flat.reshape({ks[0], ks[1], ks[2], C_in, C_out})
+                                          .permute({4, 3, 0, 1, 2})
+                                          .contiguous()
+                                    : torch::Tensor();
             return {grad_features, grad_weights};
         }
 
         auto off_acc = topo.offsets.accessor<int64_t, 1>();
 
         int64_t const max_n = maxPairsPerOffset(topo.offsets, K);
-        auto feat_buf       = torch::empty({max_n, C_in}, features.options());
-        auto grad_buf       = torch::empty({max_n, C_out}, features.options());
-        auto grad_feat_buf  = torch::empty({max_n, C_in}, features.options());
+        auto feat_buf =
+            needs_wgrad ? torch::empty({max_n, C_in}, features.options()) : torch::Tensor();
+        auto grad_buf = torch::empty({max_n, C_out}, features.options());
+        auto grad_feat_buf =
+            needs_dgrad ? torch::empty({max_n, C_in}, features.options()) : torch::Tensor();
 
         for (int64_t k = 0; k < K; ++k) {
             int64_t const start = off_acc[k];
@@ -555,34 +562,43 @@ struct gs_default_conv_backward_op {
 
             auto gi_k = topo.gatherIndices.slice(0, start, end);
             auto si_k = topo.scatterIndices.slice(0, start, end);
-            auto fb_k = feat_buf.slice(0, 0, n_k);
             auto gb_k = grad_buf.slice(0, 0, n_k);
-            auto gf_k = grad_feat_buf.slice(0, 0, n_k);
 
-            gsDefaultGather(tg, features, fb_k, gi_k, n_k, C_in);
             gsDefaultGather(tg, grad_output, gb_k, si_k, n_k, C_out);
 
-            mmOutSafe(gf_k, gb_k, W[k].t());
-            gsDefaultScatterAdd(tg, gf_k, grad_features, gi_k, n_k, C_in);
+            if (needs_dgrad) {
+                auto gf_k = grad_feat_buf.slice(0, 0, n_k);
+                mmOutSafe(gf_k, gb_k, W[k].t());
+                gsDefaultScatterAdd(tg, gf_k, grad_features, gi_k, n_k, C_in);
+            }
 
-            auto gw_k = grad_W_flat[k];
-            mmOutSafe(gw_k, fb_k.t(), gb_k);
+            if (needs_wgrad) {
+                auto fb_k = feat_buf.slice(0, 0, n_k);
+                gsDefaultGather(tg, features, fb_k, gi_k, n_k, C_in);
+                auto gw_k = grad_W_flat[k];
+                mmOutSafe(gw_k, fb_k.t(), gb_k);
+            }
         }
 
         auto ks           = topo.kernelSize;
-        auto grad_weights = grad_W_flat.reshape({ks[0], ks[1], ks[2], C_in, C_out})
-                                .permute({4, 3, 0, 1, 2})
-                                .contiguous();
+        auto grad_weights = needs_wgrad ? grad_W_flat.reshape({ks[0], ks[1], ks[2], C_in, C_out})
+                                              .permute({4, 3, 0, 1, 2})
+                                              .contiguous()
+                                        : torch::Tensor();
 
         return {grad_features, grad_weights};
     }
 
     using space      = axes<torch_full_device_axis, torch_full_float_stype_axis>;
     using subspaces  = coverage<space>;
-    using dispatcher = dispatch_table<
-        space,
-        std::tuple<torch::Tensor, torch::Tensor>(
-            torch::Tensor, torch::Tensor, torch::Tensor, GatherScatterDefaultTopology const &)>;
+    using dispatcher = dispatch_table<space,
+                                      std::tuple<torch::Tensor, torch::Tensor>(
+                                          torch::Tensor,
+                                          torch::Tensor,
+                                          torch::Tensor,
+                                          GatherScatterDefaultTopology const &,
+                                          bool,
+                                          bool)>;
 };
 
 // =============================================================================
@@ -597,7 +613,9 @@ struct gs_default_conv_transpose_backward_op {
        torch::Tensor grad_output,
        torch::Tensor features,
        torch::Tensor weights,
-       GatherScatterDefaultTopology const &topo) {
+       GatherScatterDefaultTopology const &topo,
+       bool needs_dgrad,
+       bool needs_wgrad) {
         constexpr auto dev = tag_get<torch::DeviceType>(Tag{});
 
         auto guard = make_device_guard(tag<dev>{}, features);
@@ -614,23 +632,29 @@ struct gs_default_conv_transpose_backward_op {
             W = W.to(features.scalar_type());
         }
 
-        auto grad_features = torch::zeros({F, C_in}, features.options());
-        auto grad_W_flat   = torch::zeros({K, C_in, C_out}, features.options());
+        auto grad_features =
+            needs_dgrad ? torch::zeros({F, C_in}, features.options()) : torch::Tensor();
+        auto grad_W_flat =
+            needs_wgrad ? torch::zeros({K, C_in, C_out}, features.options()) : torch::Tensor();
 
         if (O == 0 || K == 0 || TP == 0) {
             auto ks           = topo.kernelSize;
-            auto grad_weights = grad_W_flat.reshape({ks[0], ks[1], ks[2], C_in, C_out})
-                                    .permute({4, 3, 0, 1, 2})
-                                    .contiguous();
+            auto grad_weights = needs_wgrad
+                                    ? grad_W_flat.reshape({ks[0], ks[1], ks[2], C_in, C_out})
+                                          .permute({4, 3, 0, 1, 2})
+                                          .contiguous()
+                                    : torch::Tensor();
             return {grad_features, grad_weights};
         }
 
         auto off_acc = topo.offsets.accessor<int64_t, 1>();
 
         int64_t const max_n = maxPairsPerOffset(topo.offsets, K);
-        auto feat_buf       = torch::empty({max_n, C_in}, features.options());
-        auto grad_buf       = torch::empty({max_n, C_out}, features.options());
-        auto grad_feat_buf  = torch::empty({max_n, C_in}, features.options());
+        auto feat_buf =
+            needs_wgrad ? torch::empty({max_n, C_in}, features.options()) : torch::Tensor();
+        auto grad_buf = torch::empty({max_n, C_out}, features.options());
+        auto grad_feat_buf =
+            needs_dgrad ? torch::empty({max_n, C_in}, features.options()) : torch::Tensor();
 
         for (int64_t k = 0; k < K; ++k) {
             int64_t const start = off_acc[k];
@@ -642,34 +666,43 @@ struct gs_default_conv_transpose_backward_op {
 
             auto gi_k = topo.gatherIndices.slice(0, start, end);
             auto si_k = topo.scatterIndices.slice(0, start, end);
-            auto fb_k = feat_buf.slice(0, 0, n_k);
             auto gb_k = grad_buf.slice(0, 0, n_k);
-            auto gf_k = grad_feat_buf.slice(0, 0, n_k);
 
-            gsDefaultGather(tg, features, fb_k, gi_k, n_k, C_in);
             gsDefaultGather(tg, grad_output, gb_k, si_k, n_k, C_out);
 
-            mmOutSafe(gf_k, gb_k, W[k].t());
-            gsDefaultScatterAdd(tg, gf_k, grad_features, gi_k, n_k, C_in);
+            if (needs_dgrad) {
+                auto gf_k = grad_feat_buf.slice(0, 0, n_k);
+                mmOutSafe(gf_k, gb_k, W[k].t());
+                gsDefaultScatterAdd(tg, gf_k, grad_features, gi_k, n_k, C_in);
+            }
 
-            auto gw_k = grad_W_flat[k];
-            mmOutSafe(gw_k, fb_k.t(), gb_k);
+            if (needs_wgrad) {
+                auto fb_k = feat_buf.slice(0, 0, n_k);
+                gsDefaultGather(tg, features, fb_k, gi_k, n_k, C_in);
+                auto gw_k = grad_W_flat[k];
+                mmOutSafe(gw_k, fb_k.t(), gb_k);
+            }
         }
 
         auto ks           = topo.kernelSize;
-        auto grad_weights = grad_W_flat.reshape({ks[0], ks[1], ks[2], C_in, C_out})
-                                .permute({4, 3, 0, 1, 2})
-                                .contiguous();
+        auto grad_weights = needs_wgrad ? grad_W_flat.reshape({ks[0], ks[1], ks[2], C_in, C_out})
+                                              .permute({4, 3, 0, 1, 2})
+                                              .contiguous()
+                                        : torch::Tensor();
 
         return {grad_features, grad_weights};
     }
 
     using space      = axes<torch_full_device_axis, torch_full_float_stype_axis>;
     using subspaces  = coverage<space>;
-    using dispatcher = dispatch_table<
-        space,
-        std::tuple<torch::Tensor, torch::Tensor>(
-            torch::Tensor, torch::Tensor, torch::Tensor, GatherScatterDefaultTopology const &)>;
+    using dispatcher = dispatch_table<space,
+                                      std::tuple<torch::Tensor, torch::Tensor>(
+                                          torch::Tensor,
+                                          torch::Tensor,
+                                          torch::Tensor,
+                                          GatherScatterDefaultTopology const &,
+                                          bool,
+                                          bool)>;
 };
 
 // =============================================================================
@@ -699,7 +732,9 @@ std::tuple<torch::Tensor, torch::Tensor>
 gatherScatterDefaultSparseConvBackward(torch::Tensor grad_output,
                                        torch::Tensor features,
                                        torch::Tensor weights,
-                                       GatherScatterDefaultTopology const &topo) {
+                                       GatherScatterDefaultTopology const &topo,
+                                       bool needs_dgrad,
+                                       bool needs_wgrad) {
     checkConvPreconditions(features, weights, topo, "gatherScatterDefaultSparseConvBackward");
     TORCH_CHECK(topo.direction == ConvDirection::Forward,
                 "gatherScatterDefaultSparseConvBackward requires topology with direction=Forward");
@@ -718,7 +753,8 @@ gatherScatterDefaultSparseConvBackward(torch::Tensor grad_output,
         "gather_scatter_default_sparse_conv_backward");
 
     auto const dev = features.device().type();
-    return table.select(dispatch_set{dev, working_st})(grad_output, features, weights, topo);
+    return table.select(dispatch_set{dev, working_st})(
+        grad_output, features, weights, topo, needs_dgrad, needs_wgrad);
 }
 
 torch::Tensor
@@ -745,7 +781,9 @@ std::tuple<torch::Tensor, torch::Tensor>
 gatherScatterDefaultSparseConvTransposeBackward(torch::Tensor grad_output,
                                                 torch::Tensor features,
                                                 torch::Tensor weights,
-                                                GatherScatterDefaultTopology const &topo) {
+                                                GatherScatterDefaultTopology const &topo,
+                                                bool needs_dgrad,
+                                                bool needs_wgrad) {
     checkConvPreconditions(
         features, weights, topo, "gatherScatterDefaultSparseConvTransposeBackward");
     TORCH_CHECK(topo.direction == ConvDirection::Transposed,
@@ -765,7 +803,8 @@ gatherScatterDefaultSparseConvTransposeBackward(torch::Tensor grad_output,
         "gather_scatter_default_sparse_conv_transpose_backward");
 
     auto const dev = features.device().type();
-    return table.select(dispatch_set{dev, working_st})(grad_output, features, weights, topo);
+    return table.select(dispatch_set{dev, working_st})(
+        grad_output, features, weights, topo, needs_dgrad, needs_wgrad);
 }
 
 } // namespace ops

@@ -1217,14 +1217,18 @@ GridBatch::predGatherIGemmConvBackward(torch::Tensor grad_output,
                                        const GridBatch &feature_grid,
                                        const GridBatch &output_grid,
                                        int kernel_size,
-                                       int stride) {
+                                       int stride,
+                                       bool needs_dgrad,
+                                       bool needs_wgrad) {
     return detail::ops::predGatherIGemmSparseConvBackward(grad_output,
                                                           features,
                                                           weights,
                                                           *feature_grid.mImpl,
                                                           *output_grid.mImpl,
                                                           kernel_size,
-                                                          stride);
+                                                          stride,
+                                                          needs_dgrad,
+                                                          needs_wgrad);
 }
 
 } // namespace fvdb
